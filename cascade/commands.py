@@ -39,6 +39,11 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("context", "/context [clear]", "Show or clear uploaded context"),
     CommandDef("login", "/login [provider]", "Sync provider auth from installed CLIs"),
     CommandDef("config", "/config reload", "Reload config from disk"),
+    CommandDef("clear", "/clear", "Clear chat history from screen"),
+    CommandDef("compact", "/compact", "Compact conversation memory now"),
+    CommandDef("history", "/history [limit]", "List recent chat sessions"),
+    CommandDef("resume", "/resume <id>", "Resume a previous session"),
+    CommandDef("export", "/export [id]", "Export session messages to a file"),
     CommandDef("mark", "/mark [label]", "Insert a bookmark separator"),
     CommandDef("time", "/time", "Show current time"),
     CommandDef("help", "/help", "Show available commands"),
@@ -91,6 +96,11 @@ class CommandHandler:
             "context": self._cmd_context,
             "login": self._cmd_login,
             "config": self._cmd_config,
+            "clear": self._cmd_clear,
+            "compact": self._cmd_compact,
+            "history": self._cmd_history,
+            "resume": self._cmd_resume,
+            "export": self._cmd_export,
             "mark": self._cmd_mark,
             "time": self._cmd_time,
         }.get(cmd)
@@ -117,14 +127,17 @@ class CommandHandler:
             self.app.notify(text)
 
     def _get_shannon(self):
-        """Lazy-init Shannon integration."""
+        """Lazy-init Shannon integration via entry point discovery."""
         if self._shannon is None:
-            from .integrations.shannon import ShannonIntegration
+            from .integrations import get_integration
+            cls = get_integration("shannon")
+            if cls is None:
+                return None
             cli_app = getattr(self.app, "cli_app", None)
             cfg = {}
             if cli_app:
                 cfg = cli_app.config.get_integrations_config().get("shannon", {})
-            self._shannon = ShannonIntegration(
+            self._shannon = cls(
                 config_path=cfg.get("path", ""),
                 print_fn=self._post_system,
             )
@@ -409,6 +422,12 @@ class CommandHandler:
             return
 
         shannon = self._get_shannon()
+        if shannon is None:
+            self._post_system(
+                "Shannon integration not available. "
+                "Install it with: pip install cascade-cli  (it registers via entry points)"
+            )
+            return
         subcmd = args[0].lower()
 
         if subcmd == "stop":
@@ -676,6 +695,153 @@ class CommandHandler:
             parts.append(f"Removed: {', '.join(sorted(removed))}")
         parts.append(f"Active providers: {', '.join(sorted(new_providers))}")
         self._post_system("\n".join(parts))
+
+    # ------------------------------------------------------------------
+    # Clear / Compact
+    # ------------------------------------------------------------------
+
+    def _cmd_clear(self, args: list[str]) -> None:
+        """Clear the chat display (state/history preserved)."""
+        try:
+            from .widgets.message import ChatHistory
+            chat = self.app.screen.query_one(ChatHistory)
+            chat.remove_children()
+        except Exception:
+            pass
+        self.app.notify("Chat cleared (history preserved)")
+
+    def _cmd_compact(self, args: list[str]) -> None:
+        """Force a cross-model memory compaction now."""
+        screen = self.app.screen
+        if hasattr(screen, "_trigger_summary_compaction"):
+            screen._trigger_summary_compaction(reason="manual", force=True)
+            self.app.notify("Memory compaction started")
+        else:
+            self.app.notify("Compaction not available on this screen")
+
+    # ------------------------------------------------------------------
+    # History / Resume / Export
+    # ------------------------------------------------------------------
+
+    def _cmd_history(self, args: list[str]) -> None:
+        """List recent chat sessions."""
+        limit = 10
+        if args:
+            try:
+                limit = int(args[0])
+            except ValueError:
+                pass
+
+        sessions = self.app.db.list_sessions(limit=limit)
+        if not sessions:
+            self._post_system("No sessions found.")
+            return
+
+        lines = ["Recent sessions:"]
+        for s in sessions:
+            title = s.get("title", "(untitled)")[:40] or "(untitled)"
+            created = s.get("created_at", "")[:16]
+            sid = s["id"]
+            lines.append(f"  {sid}  {created}  {title}")
+        lines.append("")
+        lines.append("Use /resume <id> to continue a session.")
+        self._post_system("\n".join(lines))
+
+    def _cmd_resume(self, args: list[str]) -> None:
+        """Resume a previous session by loading its messages."""
+        if not args:
+            self._post_system("Usage: /resume <session_id>")
+            return
+
+        session_id = args[0]
+        session = self.app.db.get_session(session_id)
+        if session is None:
+            self._post_system(f"Session '{session_id}' not found.")
+            return
+
+        messages = self.app.db.get_session_messages(session_id)
+        if not messages:
+            self._post_system(f"Session '{session_id}' has no messages.")
+            return
+
+        # Adopt this session as the current one
+        self.app._db_session = session
+
+        # Load messages into state
+        provider = session.get("provider", "assistant")
+        for msg in messages:
+            role = "you" if msg["role"] == "user" else provider
+            self.app.state.add_message(
+                role, msg["content"], tokens=msg.get("token_count", 0),
+            )
+
+        # Mount message widgets in chat history
+        try:
+            from .widgets.message import ChatHistory, MessageWidget
+
+            chat = self.app.screen.query_one(ChatHistory)
+            for msg in messages:
+                if msg["role"] == "user":
+                    content = msg["content"]
+                    line_count = content.count("\n") + 1
+                    display = (
+                        f"[pasted content 1 + {line_count - 1} lines]"
+                        if line_count >= 2
+                        else content
+                    )
+                    chat.mount(MessageWidget("you", display))
+                else:
+                    chat.mount(MessageWidget(provider, msg["content"]))
+            chat.scroll_end(animate=False)
+        except Exception:
+            pass
+
+        title = session.get("title", "(untitled)")
+        self._post_system(
+            f"Resumed session: {title} ({len(messages)} messages)"
+        )
+
+    def _cmd_export(self, args: list[str]) -> None:
+        """Export session messages to a Markdown file."""
+        if not args:
+            session = self.app._db_session
+            if session is None:
+                self._post_system("No active session. Use /export <session_id>.")
+                return
+            session_id = session["id"]
+        else:
+            session_id = args[0]
+
+        session = self.app.db.get_session(session_id)
+        if session is None:
+            self._post_system(f"Session '{session_id}' not found.")
+            return
+
+        messages = self.app.db.get_session_messages(session_id)
+        if not messages:
+            self._post_system(f"No messages found for session {session_id}.")
+            return
+
+        title = session.get("title", "untitled")
+        provider = session.get("provider", "assistant")
+        model = session.get("model", "")
+        model_label = model or provider
+        out_path = Path.cwd() / f"cascade-session-{session_id}.md"
+
+        lines = [f"# Cascade Session: {title}", f"Model: {model_label}", ""]
+        for msg in messages:
+            if msg["role"] == "user":
+                role = "USER"
+            else:
+                role = model_label
+            ts = msg.get("timestamp", "")[:19]
+            lines.append(f"## {role} ({ts})")
+            lines.append("")
+            lines.append(msg["content"])
+            lines.append("")
+
+        out_path.write_text("\n".join(lines), encoding="utf-8")
+        self._post_system(f"Exported {len(messages)} messages to {out_path}")
 
     def _cmd_mark(self, args: list[str]) -> None:
         label = " ".join(args) if args else datetime.datetime.now().strftime("%I:%M %p")

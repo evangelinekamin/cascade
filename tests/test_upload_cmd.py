@@ -267,10 +267,13 @@ class TestLoginCommand:
         handler._cmd_login(["bad-provider"])
         assert "Usage: /login <gemini|claude|openai>" in posted[-1]
 
+    @patch("cascade.commands.Path")
     @patch("cascade.auth.detect_gemini")
-    def test_login_missing_credential(self, mock_gemini):
+    def test_login_missing_credential(self, mock_gemini, mock_path):
         handler, cli_app, posted = self._make_handler()
         mock_gemini.return_value = None
+        # Prevent filesystem access to ~/.gemini/oauth_creds.json
+        mock_path.home.return_value.__truediv__ = lambda *a: MagicMock(is_file=lambda: False)
 
         handler._cmd_login(["gemini"])
         assert "No gemini CLI credentials found." in posted[-1]

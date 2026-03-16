@@ -48,8 +48,18 @@ def test_stream_cli_parses_assistant_messages_and_usage():
                 ProviderConfig(api_key="ya29.test-token", model="gemini-3.1-pro-preview")
             )
 
-    with patch("cascade.providers.gemini.subprocess.Popen", _FakePopen):
-        chunks = list(provider.stream("Say hello"))
+    with patch("cascade.providers._cli_proxy.subprocess.Popen", _FakePopen):
+        chunks = list(provider.stream_single("Say hello"))
 
     assert chunks == ["Hel", "lo"]
     assert provider.last_usage == (10, 4)
+
+
+def test_gemini_has_use_oauth_cli_attribute():
+    """_use_oauth_cli should be consistent with _use_bearer for ya29 tokens."""
+    with patch("cascade.providers.gemini.shutil.which", return_value="/usr/bin/gemini"):
+        provider = GeminiProvider(
+            ProviderConfig(api_key="ya29.test-token", model="gemini-3.1-pro-preview")
+        )
+    assert provider._use_oauth_cli is True
+    assert provider._use_oauth_cli == provider._use_bearer

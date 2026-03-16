@@ -3,12 +3,12 @@
 import json
 import os
 import shutil
-import subprocess
 from typing import Optional, Iterator, TYPE_CHECKING
 import httpx
-from .base import BaseProvider, ProviderConfig, ToolEventCallback
-from .registry import register_provider
+from .base import BaseProvider, ProviderConfig, Message, ToolEventCallback
+from ._cli_proxy import CLIProxyConfig, CodexEventHandler, stream_cli_proxy
 from ._openai_tools import openai_ask_with_tools
+from .registry import register_provider
 
 if TYPE_CHECKING:
     from ..tools.schema import ToolDef
@@ -17,8 +17,6 @@ if TYPE_CHECKING:
 @register_provider("openai")
 class OpenAIProvider(BaseProvider):
     """OpenAI API provider - supports custom base_url for Azure/proxies."""
-
-    _ACTIVITY_PREFIX = "[[cascade_activity]] "
 
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
@@ -51,181 +49,43 @@ class OpenAIProvider(BaseProvider):
             "Content-Type": "application/json",
         }
 
-    def _activity(self, message: str) -> Optional[str]:
-        """Encode a status line into a chunk the TUI can detect."""
-        if not self._emit_activity:
-            return None
-        return f"{self._ACTIVITY_PREFIX}{message}"
-
-    def _build_cli_prompt(self, prompt: str, system: Optional[str]) -> str:
-        """Build a single prompt string for Codex CLI mode."""
-        if not system:
-            return prompt
-        return (
-            "System instructions:\n"
-            f"{system}\n\n"
-            "User request:\n"
-            f"{prompt}"
-        )
-
-    def _extract_codex_text(self, item: dict) -> str:
-        """Extract assistant text from a Codex JSON event item."""
-        text = item.get("text")
-        if isinstance(text, str) and text:
-            return text
-
-        content = item.get("content")
-        if isinstance(content, list):
-            parts = []
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "output_text":
-                    chunk = block.get("text")
-                    if isinstance(chunk, str):
-                        parts.append(chunk)
-            if parts:
-                return "".join(parts)
-        return ""
-
     def _stream_via_cli(
         self,
-        prompt: str,
+        messages: list[Message],
         system: Optional[str] = None,
     ) -> Iterator[str]:
-        """Stream assistant text by proxying through `codex exec --json`."""
+        """Stream assistant text by proxying through ``codex exec --json``."""
         if not self._codex_bin:
             yield "Error: codex CLI not found in PATH for OAuth mode."
             return
 
-        full_prompt = self._build_cli_prompt(prompt, system)
-        cmd = [
-            self._codex_bin,
-            "exec",
-            "--json",
-            "--cd",
-            os.getcwd(),
-        ]
+        full_prompt = self._condense_for_cli(messages)
+        if system:
+            condensed = self._condense_system_for_cli(system)
+            if condensed:
+                full_prompt = f"System instructions:\n{condensed}\n\n{full_prompt}"
+
+        cmd = [self._codex_bin, "exec", "--json", "--cd", os.getcwd()]
         if self.config.model:
             cmd.extend(["--model", self.config.model])
         cmd.append(full_prompt)
 
-        env = os.environ.copy()
-        env.setdefault("NO_BROWSER", "true")
+        handler = CodexEventHandler()
+        cfg = CLIProxyConfig(binary=self._codex_bin, cli_name="codex", cmd_args=cmd)
+        yield from stream_cli_proxy(cfg, handler, self._emit_activity)
+        if handler.last_usage:
+            self._last_usage = handler.last_usage
 
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                env=env,
-            )
-        except Exception as e:
-            yield f"Error: {e}"
-            return
-
-        saw_text = False
-        status_lines: list[str] = []
-        start_msg = self._activity(f"starting codex cli in {os.getcwd()}")
-        if start_msg:
-            yield start_msg
-
-        assert proc.stdout is not None
-        for raw_line in proc.stdout:
-            line = raw_line.strip()
-            if not line:
-                continue
-
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                status_lines.append(line)
-                status = self._activity(line)
-                if status:
-                    yield status
-                continue
-
-            ev_type = event.get("type")
-            if ev_type == "thread.started":
-                thread_id = event.get("thread_id")
-                if isinstance(thread_id, str) and thread_id:
-                    status = self._activity(f"thread: {thread_id[:12]}...")
-                    if status:
-                        yield status
-                continue
-
-            if ev_type == "turn.started":
-                status = self._activity("turn started")
-                if status:
-                    yield status
-                continue
-
-            if ev_type == "error":
-                msg = event.get("message")
-                if isinstance(msg, str) and msg:
-                    status_lines.append(msg)
-                    status = self._activity(msg)
-                    if status:
-                        yield status
-                continue
-
-            if ev_type == "item.completed":
-                item = event.get("item", {})
-                item_type = item.get("type")
-                if item_type == "agent_message":
-                    text = self._extract_codex_text(item)
-                    if text:
-                        saw_text = True
-                        yield text
-                elif item_type == "reasoning":
-                    reason = item.get("text")
-                    if isinstance(reason, str) and reason:
-                        status = self._activity(reason)
-                        if status:
-                            yield status
-                elif item_type == "error":
-                    msg = item.get("message")
-                    if isinstance(msg, str) and msg:
-                        status_lines.append(msg)
-                        status = self._activity(msg)
-                        if status:
-                            yield status
-                continue
-
-            if ev_type == "turn.completed":
-                usage = event.get("usage", {})
-                in_t = usage.get("input_tokens")
-                out_t = usage.get("output_tokens")
-                if isinstance(in_t, int) and isinstance(out_t, int):
-                    self._last_usage = (in_t, out_t)
-                status = self._activity("turn completed")
-                if status:
-                    yield status
-                continue
-
-        proc.wait()
-        if proc.returncode != 0 and not saw_text:
-            message = status_lines[-1] if status_lines else f"codex exited with code {proc.returncode}"
-            yield f"Error: {message}"
-        elif not saw_text and status_lines:
-            yield f"Error: {status_lines[-1]}"
-
-    def ask(self, prompt: str, system: Optional[str] = None) -> str:
+    def ask(self, messages: list[Message], system: Optional[str] = None) -> str:
         """Get a complete response from OpenAI."""
-        chunks = []
-        for chunk in self.stream(prompt, system):
-            if isinstance(chunk, str) and chunk.startswith(self._ACTIVITY_PREFIX):
-                continue
-            chunks.append(chunk)
-        return "".join(chunks)
+        return "".join(self.stream(messages, system))
 
-    def stream(self, prompt: str, system: Optional[str] = None) -> Iterator[str]:
+    def stream(self, messages: list[Message], system: Optional[str] = None) -> Iterator[str]:
         """Stream tokens from OpenAI."""
         self._last_usage = None
+        self._last_activity = None
         if self._use_cli_proxy:
-            yield from self._stream_via_cli(prompt, system)
+            yield from self._filter_activity(self._stream_via_cli(messages, system))
             return
         if self._use_oauth_cli and not self._use_cli_proxy:
             if not self._codex_bin:
@@ -240,14 +100,17 @@ class OpenAIProvider(BaseProvider):
         try:
             url = f"{self.base_url}/chat/completions"
 
-            messages = []
+            api_messages = []
             if system:
-                messages.append({"role": "system", "content": system})
-            messages.append({"role": "user", "content": prompt})
+                api_messages.append({"role": "system", "content": system})
+            api_messages.extend(
+                {"role": m["role"], "content": m["content"]}
+                for m in messages
+            )
 
             payload = {
                 "model": self.config.model,
-                "messages": messages,
+                "messages": api_messages,
                 "stream": True,
                 "stream_options": {"include_usage": True},
                 "temperature": self.config.temperature,
@@ -284,7 +147,7 @@ class OpenAIProvider(BaseProvider):
 
     def ask_with_tools(
         self,
-        prompt: str,
+        messages: list[Message],
         tools: dict[str, "ToolDef"],
         system: Optional[str] = None,
         max_rounds: int = 5,
@@ -292,8 +155,7 @@ class OpenAIProvider(BaseProvider):
     ) -> tuple[str, list[dict]]:
         """OpenAI-native tool calling."""
         if self._use_cli_proxy:
-            # Codex CLI OAuth mode is proxied as plain text chat.
-            return self.ask(prompt, system), []
+            return self.ask(messages, system), []
 
         return openai_ask_with_tools(
             client=self.client,
@@ -302,7 +164,7 @@ class OpenAIProvider(BaseProvider):
             model=self.config.model,
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
-            prompt=prompt,
+            messages=messages,
             tools=tools,
             system=system,
             max_rounds=max_rounds,
@@ -311,7 +173,7 @@ class OpenAIProvider(BaseProvider):
 
     def compare(self, prompt: str, system: Optional[str] = None) -> dict:
         """Generate comparison data."""
-        response = self.ask(prompt, system)
+        response = self.ask_single(prompt, system)
         return {
             "provider": self.name,
             "model": self.config.model,

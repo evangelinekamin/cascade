@@ -7,7 +7,7 @@ tool definitions and handle tool_use/tool_result round trips.
 from unittest.mock import patch, MagicMock
 
 
-from cascade.providers.base import BaseProvider, ProviderConfig
+from cascade.providers.base import BaseProvider, ProviderConfig, Message
 from cascade.tools.schema import callable_to_tool_def
 
 
@@ -31,21 +31,26 @@ def _make_config():
     )
 
 
+def _msgs(prompt: str) -> list[Message]:
+    """Build a single-message list from a prompt string."""
+    return [{"role": "user", "content": prompt}]
+
+
 class TestBaseProviderToolCalling:
     """Test the default ask_with_tools fallback."""
 
     def test_default_falls_back_to_ask(self):
         """BaseProvider.ask_with_tools should fall back to ask()."""
         class StubProvider(BaseProvider):
-            def ask(self, prompt, system=None):
-                return f"echo: {prompt}"
-            def stream(self, prompt, system=None):
-                yield self.ask(prompt, system)
+            def ask(self, messages, system=None):
+                return f"echo: {messages[-1]['content']}"
+            def stream(self, messages, system=None):
+                yield self.ask(messages, system)
             def compare(self, prompt, system=None):
                 return {}
 
         prov = StubProvider(_make_config())
-        result, log = prov.ask_with_tools("hello", _make_tools())
+        result, log = prov.ask_with_tools(_msgs("hello"), _make_tools())
         assert result == "echo: hello"
         assert log == []
 
@@ -70,7 +75,7 @@ class TestClaudeToolCalling:
         mock_response.raise_for_status = MagicMock()
 
         with patch.object(prov.client, "post", return_value=mock_response) as mock_post:
-            result, log = prov.ask_with_tools("test", tools)
+            result, log = prov.ask_with_tools(_msgs("test"), tools)
 
             # Verify the payload
             call_kwargs = mock_post.call_args
@@ -118,7 +123,7 @@ class TestClaudeToolCalling:
             prov.client, "post",
             side_effect=[tool_use_response, final_response],
         ):
-            result, log = prov.ask_with_tools("echo hello", tools)
+            result, log = prov.ask_with_tools(_msgs("echo hello"), tools)
 
         assert result == "The echo returned: hello"
         assert len(log) == 1
@@ -148,7 +153,7 @@ class TestGeminiToolCalling:
         mock_response.raise_for_status = MagicMock()
 
         with patch.object(prov.client, "post", return_value=mock_response) as mock_post:
-            result, log = prov.ask_with_tools("test", tools)
+            result, log = prov.ask_with_tools(_msgs("test"), tools)
 
             call_kwargs = mock_post.call_args
             payload = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
@@ -195,7 +200,7 @@ class TestGeminiToolCalling:
             prov.client, "post",
             side_effect=[fc_response, final_response],
         ):
-            result, log = prov.ask_with_tools("echo ping", tools)
+            result, log = prov.ask_with_tools(_msgs("echo ping"), tools)
 
         assert result == "Echo said: ping"
         assert len(log) == 1
@@ -223,7 +228,7 @@ class TestOpenAIToolCalling:
         mock_response.raise_for_status = MagicMock()
 
         with patch.object(prov.client, "post", return_value=mock_response) as mock_post:
-            result, log = prov.ask_with_tools("test", tools)
+            result, log = prov.ask_with_tools(_msgs("test"), tools)
 
             call_kwargs = mock_post.call_args
             payload = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
@@ -255,5 +260,5 @@ class TestOpenRouterToolCalling:
         mock_response.raise_for_status = MagicMock()
 
         with patch.object(prov.client, "post", return_value=mock_response):
-            result, log = prov.ask_with_tools("test", tools)
+            result, log = prov.ask_with_tools(_msgs("test"), tools)
             assert result == "OK"

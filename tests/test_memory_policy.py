@@ -1,10 +1,10 @@
 """Tests for cross-model memory policy helpers."""
 
-from cascade.cli import CascadeApp
+from cascade.cli import CascadeCore
 
 
-def _make_app(policy: str = "summary") -> CascadeApp:
-    app = CascadeApp.__new__(CascadeApp)
+def _make_app(policy: str = "summary") -> CascadeCore:
+    app = CascadeCore.__new__(CascadeCore)
     app.memory_config = {
         "cross_model_memory": policy,
         "summary_turn_interval": 2,

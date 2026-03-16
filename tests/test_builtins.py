@@ -35,7 +35,7 @@ class TestCmdVerify:
     def test_runs_configured_commands(self, mock_run):
         mock_run.return_value = ("all good", 0)
         app = MagicMock()
-        app.get_provider.return_value.ask.return_value = "All PASS"
+        app.get_provider.return_value.ask_single.return_value = "All PASS"
         app.prompt_pipeline.build.return_value = None
 
         config = {"lint": "ruff check .", "test": "pytest"}
@@ -48,7 +48,7 @@ class TestCmdVerify:
     def test_skips_empty_commands(self, mock_run):
         mock_run.return_value = ("ok", 0)
         app = MagicMock()
-        app.get_provider.return_value.ask.return_value = "summary"
+        app.get_provider.return_value.ask_single.return_value = "summary"
         app.prompt_pipeline.build.return_value = None
 
         config = {"lint": "ruff check .", "build": "", "test": ""}
@@ -76,19 +76,19 @@ class TestCmdReview:
     def test_sends_diff_to_provider(self, mock_run):
         mock_run.return_value = ("+ new line\n- old line", 0)
         app = MagicMock()
-        app.get_provider.return_value.ask.return_value = "LGTM"
+        app.get_provider.return_value.ask_single.return_value = "LGTM"
         app.prompt_pipeline.build.return_value = None
 
         result = cmd_review(app)
         assert result == "LGTM"
-        call_args = app.get_provider.return_value.ask.call_args
+        call_args = app.get_provider.return_value.ask_single.call_args
         assert "+ new line" in call_args[0][0]
 
     @patch("cascade.agents.builtins._run_cmd")
     def test_with_base_ref(self, mock_run):
         mock_run.return_value = ("diff output", 0)
         app = MagicMock()
-        app.get_provider.return_value.ask.return_value = "ok"
+        app.get_provider.return_value.ask_single.return_value = "ok"
         app.prompt_pipeline.build.return_value = None
 
         cmd_review(app, base_ref="main")

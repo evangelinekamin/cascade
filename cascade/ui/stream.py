@@ -25,7 +25,7 @@ class StreamRenderer:
 
     Usage:
         renderer = StreamRenderer(theme, console)
-        for chunk in provider.stream(prompt, system):
+        for chunk in provider.stream_single(prompt, system):
             renderer.feed(chunk)
         renderer.finish()
     """

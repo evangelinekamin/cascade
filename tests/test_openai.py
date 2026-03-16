@@ -104,8 +104,8 @@ def test_stream_cli_parses_agent_message_and_usage():
                 ProviderConfig(api_key="eyJ.a.b", model="gpt-5.3-codex")
             )
 
-    with patch("cascade.providers.openai_provider.subprocess.Popen", _FakePopen):
-        chunks = list(provider.stream("Reply with OK"))
+    with patch("cascade.providers._cli_proxy.subprocess.Popen", _FakePopen):
+        chunks = list(provider.stream_single("Reply with OK"))
 
     assert chunks == ["OK"]
     assert provider.last_usage == (9, 2)
@@ -118,5 +118,5 @@ def test_oauth_token_without_codex_binary_returns_clear_error():
             ProviderConfig(api_key="eyJ.a.b", model="gpt-5.3-codex")
         )
 
-    chunks = list(provider.stream("hello"))
+    chunks = list(provider.stream_single("hello"))
     assert chunks == ["Error: Codex OAuth token detected, but codex CLI is not in PATH."]

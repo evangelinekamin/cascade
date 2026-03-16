@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 # Standard priorities for well-known layers
 PRIORITY_DEFAULT = 10
+PRIORITY_MODE = 15
 PRIORITY_DESIGN = 20
 PRIORITY_PROJECT_SYSTEM = 30
 PRIORITY_PROJECT_CONTEXT = 40

@@ -1,0 +1,30 @@
+services:
+  gemini:
+    build:
+      context: ./gemini
+      dockerfile: Dockerfile
+    volumes:
+      - ${CASCADE_TOKENS:-~/.config/cascade/tokens}:/home/cascade/.config/cascade/tokens:ro
+      - ${CASCADE_PROJECT:-./}:/workspace:rw
+    network_mode: bridge
+    restart: "no"
+
+  claude:
+    build:
+      context: ./claude
+      dockerfile: Dockerfile
+    volumes:
+      - ${CASCADE_TOKENS:-~/.config/cascade/tokens}:/home/cascade/.config/cascade/tokens:ro
+      - ${CASCADE_PROJECT:-./}:/workspace:rw
+    network_mode: bridge
+    restart: "no"
+
+  codex:
+    build:
+      context: ./codex
+      dockerfile: Dockerfile
+    volumes:
+      - ${CASCADE_TOKENS:-~/.config/cascade/tokens}:/home/cascade/.config/cascade/tokens:ro
+      - ${CASCADE_PROJECT:-./}:/workspace:rw
+    network_mode: bridge
+    restart: "no"

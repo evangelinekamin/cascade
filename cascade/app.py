@@ -1,4 +1,4 @@
-"""Textual App subclass that wraps the existing CascadeApp from cli.py.
+"""Textual App subclass that wraps the existing CascadeCore from cli.py.
 
 Gets providers, config, hooks, tools for free via the CLI app.
 """

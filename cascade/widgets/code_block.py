@@ -35,32 +35,34 @@ class CodeBlock(Static):
         self._language = language
         self._provider = provider
 
-    def render(self) -> Panel:
-        accent = get_accent(self._provider)
+    def render(self) -> Panel | Text:
+        try:
+            accent = get_accent(self._provider)
 
-        syntax = Syntax(
-            self._code,
-            self._language,
-            theme="monokai",
-            line_numbers=True,
-            word_wrap=False,
-            background_color=PALETTE.code_bg,
-        )
+            syntax = Syntax(
+                self._code or "",
+                self._language or "text",
+                theme="monokai",
+                line_numbers=True,
+                word_wrap=False,
+                background_color=PALETTE.code_bg,
+            )
 
-        # Title: language label left, "copy" right
-        title = Text()
-        title.append(f" {self._language.upper()} ", style=f"bold {accent}")
+            title = Text()
+            title.append(f" {(self._language or 'text').upper()} ", style=f"bold {accent}")
 
-        subtitle = Text(" copy ", style=f"dim {PALETTE.text_dim}")
+            subtitle = Text(" copy ", style=f"dim {PALETTE.text_dim}")
 
-        return Panel(
-            syntax,
-            title=title,
-            title_align="left",
-            subtitle=subtitle,
-            subtitle_align="right",
-            border_style=PALETTE.border,
-            background=PALETTE.code_bg,
-            padding=(0, 1),
-            expand=True,
-        )
+            return Panel(
+                syntax,
+                title=title,
+                title_align="left",
+                subtitle=subtitle,
+                subtitle_align="right",
+                border_style=PALETTE.border,
+                background=PALETTE.code_bg,
+                padding=(0, 1),
+                expand=True,
+            )
+        except Exception:
+            return Text(self._code or "")

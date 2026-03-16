@@ -12,6 +12,7 @@ import httpx
 from .base import ToolEvent, ToolEventCallback
 
 if TYPE_CHECKING:
+    from .base import Message
     from ..tools.schema import ToolDef
 
 
@@ -22,7 +23,7 @@ def openai_ask_with_tools(
     model: str,
     temperature: float,
     max_tokens: Optional[int],
-    prompt: str,
+    messages: list["Message"],
     tools: dict[str, "ToolDef"],
     system: Optional[str] = None,
     max_rounds: int = 5,
@@ -37,7 +38,7 @@ def openai_ask_with_tools(
         model: Model identifier.
         temperature: Sampling temperature.
         max_tokens: Max response tokens.
-        prompt: User message.
+        messages: Conversation history as Message dicts.
         tools: Mapping of tool_name -> ToolDef.
         system: Optional system prompt.
         max_rounds: Maximum tool-calling round trips.
@@ -62,17 +63,21 @@ def openai_ask_with_tools(
         for td in tools.values()
     ]
 
-    messages = []
+    api_messages = []
     if system:
-        messages.append({"role": "system", "content": system})
-    messages.append({"role": "user", "content": prompt})
+        api_messages.append({"role": "system", "content": system})
+    api_messages.extend(
+        {"role": m["role"], "content": m["content"]}
+        for m in messages
+    )
 
     tool_log = []
+    content = ""
 
     for round_num in range(max_rounds):
         payload = {
             "model": model,
-            "messages": messages,
+            "messages": api_messages,
             "temperature": temperature,
             "tools": tool_defs,
         }
@@ -100,7 +105,7 @@ def openai_ask_with_tools(
             return content, tool_log
 
         # Append the assistant message (must include tool_calls)
-        messages.append(message)
+        api_messages.append(message)
 
         # Execute each tool call
         for tc in tool_calls:
@@ -137,7 +142,7 @@ def openai_ask_with_tools(
                     tool_output=result,
                 ))
 
-            messages.append({
+            api_messages.append({
                 "role": "tool",
                 "tool_call_id": tc["id"],
                 "content": result,

@@ -1,4 +1,4 @@
-"""AgentRunner -- executes an AgentDef against a CascadeApp's providers."""
+"""AgentRunner -- executes an AgentDef against a CascadeCore's providers."""
 
 from contextlib import contextmanager
 from typing import Iterator, Optional, TYPE_CHECKING
@@ -6,19 +6,19 @@ from typing import Iterator, Optional, TYPE_CHECKING
 from ..prompts.layers import PRIORITY_USER_OVERRIDE
 
 if TYPE_CHECKING:
-    from ..cli import CascadeApp
+    from ..cli import CascadeCore
     from .schema import AgentDef
 
 
 class AgentRunner:
-    """Borrows a CascadeApp for a single agent interaction.
+    """Borrows a CascadeCore for a single agent interaction.
 
     Temporarily overrides model, temperature, system prompt, and tool set
     for the duration of the call, then restores everything -- even on
     exception.
     """
 
-    def __init__(self, app: "CascadeApp") -> None:
+    def __init__(self, app: "CascadeCore") -> None:
         self._app = app
 
     # ------------------------------------------------------------------
@@ -38,9 +38,10 @@ class AgentRunner:
             tools = self._filter_tools(agent)
 
             if tools:
-                response, _log = prov.ask_with_tools(prompt, tools, system=system)
+                messages = [{"role": "user", "content": prompt}]
+                response, _log = prov.ask_with_tools(messages, tools, system=system)
             else:
-                response = prov.ask(prompt, system)
+                response = prov.ask_single(prompt, system)
 
         return response
 
@@ -60,7 +61,7 @@ class AgentRunner:
         try:
             prov = self._resolve_provider(agent)
             system = self._build_system(agent, extra_context)
-            for chunk in prov.stream(prompt, system):
+            for chunk in prov.stream_single(prompt, system):
                 yield chunk
         finally:
             cm.__exit__(None, None, None)

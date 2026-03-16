@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from .wordid import generate_word_id
+
 
 _DEFAULT_DB_PATH = "~/.config/cascade/history.db"
 
@@ -54,6 +56,18 @@ class HistoryDB:
                 ON sessions(updated_at DESC);
         """)
 
+    def _unique_word_id(self, max_attempts: int = 20) -> str:
+        """Generate a word-based ID that doesn't collide with existing sessions."""
+        for _ in range(max_attempts):
+            candidate = generate_word_id()
+            exists = self._conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (candidate,)
+            ).fetchone()
+            if not exists:
+                return candidate
+        # Extremely unlikely fallback
+        return f"{generate_word_id()}-{uuid.uuid4().hex[:4]}"
+
     # -- sessions --
 
     def create_session(
@@ -65,7 +79,7 @@ class HistoryDB:
     ) -> dict:
         """Create a new conversation session. Returns the session dict."""
         now = datetime.now(timezone.utc).isoformat()
-        session_id = uuid.uuid4().hex[:12]
+        session_id = self._unique_word_id()
         row = {
             "id": session_id,
             "title": title,
@@ -92,13 +106,20 @@ class HistoryDB:
         return [self._row_to_session(r) for r in rows]
 
     def get_session(self, session_id: str) -> Optional[dict]:
-        """Get a single session by id."""
+        """Get a single session by exact id or unique prefix match."""
         row = self._conn.execute(
             "SELECT * FROM sessions WHERE id = ?", (session_id,)
         ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_session(row)
+        if row is not None:
+            return self._row_to_session(row)
+        # Try prefix match (e.g. "purple" matches "purple-banana")
+        rows = self._conn.execute(
+            "SELECT * FROM sessions WHERE id LIKE ? ORDER BY updated_at DESC LIMIT 2",
+            (f"{session_id}%",),
+        ).fetchall()
+        if len(rows) == 1:
+            return self._row_to_session(rows[0])
+        return None
 
     def search_sessions(self, query: str, limit: int = 20) -> list[dict]:
         """Search sessions by title or message content."""

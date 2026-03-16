@@ -3,9 +3,8 @@
 import time
 import uuid
 
-from .cli import CascadeApp
+from .cli import CascadeCore
 from .history import HistoryDB
-from .integrations.shannon import ShannonIntegration
 from .ui.theme import console, CYAN, VIOLET
 from .utils.time import formatted_time, get_timezone
 
@@ -13,7 +12,7 @@ from .utils.time import formatted_time, get_timezone
 class CascadeREPL:
     """Interactive REPL interface for Cascade."""
 
-    def __init__(self, app: CascadeApp):
+    def __init__(self, app: CascadeCore):
         self.app = app
         self.current_provider = app.config.get_default_provider()
         self.db = HistoryDB()
@@ -25,8 +24,8 @@ class CascadeREPL:
         self._input_tokens = 0
         self._output_tokens = 0
 
-        shannon_cfg = app.config.get_integrations_config().get("shannon", {})
-        self._shannon = ShannonIntegration(config_path=shannon_cfg.get("path", ""))
+        self._shannon = None
+        self._shannon_cfg = app.config.get_integrations_config().get("shannon", {})
 
     def _ensure_session(self) -> None:
         """Create a session if one isn't active."""
@@ -211,6 +210,16 @@ class CascadeREPL:
 
         return True
 
+    def _get_shannon(self):
+        """Lazy-init Shannon integration via entry point discovery."""
+        if self._shannon is None:
+            from .integrations import get_integration
+            cls = get_integration("shannon")
+            if cls is None:
+                return None
+            self._shannon = cls(config_path=self._shannon_cfg.get("path", ""))
+        return self._shannon
+
     def _handle_shannon(self, arg: str) -> None:
         """Dispatch /shannon subcommands."""
         parts = arg.strip().split(None, 1)
@@ -222,18 +231,27 @@ class CascadeREPL:
             )
             return
 
+        shannon = self._get_shannon()
+        if shannon is None:
+            console.print(
+                "Shannon integration not available. "
+                "Install it with: pip install cascade-cli",
+                style="dim red",
+            )
+            return
+
         subcmd = parts[0].lower()
         if subcmd == "stop":
-            self._shannon.cmd_stop()
+            shannon.cmd_stop()
         elif subcmd == "logs":
             workflow_id = parts[1].strip() if len(parts) > 1 else ""
-            self._shannon.cmd_logs(workflow_id)
+            shannon.cmd_logs(workflow_id)
         elif subcmd == "workspaces":
-            self._shannon.cmd_workspaces()
+            shannon.cmd_workspaces()
         elif subcmd.startswith("http://") or subcmd.startswith("https://"):
             url = subcmd
             repo = parts[1].strip() if len(parts) > 1 else ""
-            self._shannon.cmd_start(url, repo)
+            shannon.cmd_start(url, repo)
         else:
             console.print(f"Unknown shannon subcommand: {subcmd}", style="dim red")
 
@@ -310,15 +328,15 @@ class CascadeREPL:
 def main():
     """Entry point for `cascade` command.
 
-    Creates the CLI CascadeApp (providers, config, hooks, tools),
+    Creates the CLI CascadeCore (providers, config, hooks, tools),
     wraps it in a Textual CascadeTUI, and runs the fullscreen app.
     """
-    from .cli import CascadeApp as CLIApp
+    from .cli import CascadeCore as CLIApp
     from .app import CascadeTUI
 
     cli_app = CLIApp()
     tui = CascadeTUI(cli_app=cli_app)
-    tui.run()
+    tui.run(mouse=False)
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ from .agents.workflow import load_workflows_from_dict, WorkflowRunner
 from .context.memory import ContextBuilder
 
 
-class CascadeApp:
+class CascadeCore:
     """Main Cascade application."""
 
     def __init__(self):
@@ -297,16 +297,20 @@ class CascadeApp:
             "provider": prov.name,
         })
 
+        # Build messages list (CLI mode uses single-turn by default;
+        # conversation context is already in the system prompt pipeline)
+        messages = [{"role": "user", "content": prompt}]
+
         # Ask with or without tools
         tool_log = []
         if self.tool_registry and not stream:
             response, tool_log = prov.ask_with_tools(
-                prompt, self.tool_registry, system=final_system,
+                messages, self.tool_registry, system=final_system,
             )
         elif stream:
-            response = stream_response(prov.stream(prompt, final_system), prov.name)
+            response = stream_response(prov.stream(messages, final_system), prov.name)
         else:
-            response = prov.ask(prompt, final_system)
+            response = prov.ask(messages, final_system)
 
         # Capture response metadata from provider
         usage = prov.last_usage or (0, 0)
@@ -380,7 +384,7 @@ class CascadeApp:
                 if not prompt.strip():
                     continue
 
-                response = prov.ask(prompt)
+                response = prov.ask_single(prompt)
                 render_response(response, provider=prov.name)
                 messages.append({"prompt": prompt, "response": response})
         except KeyboardInterrupt:
@@ -396,7 +400,7 @@ class CascadeApp:
         full_prompt = f"{analysis_prompt}\n\n```\n{content}\n```"
 
         prov = self.get_provider(provider)
-        response = prov.ask(full_prompt)
+        response = prov.ask_single(full_prompt)
         render_response(response, provider=prov.name)
 
         return response
@@ -405,11 +409,11 @@ class CascadeApp:
 # Global app instance
 _app = None
 
-def get_app() -> CascadeApp:
+def get_app() -> CascadeCore:
     """Get or create the app instance."""
     global _app
     if _app is None:
-        _app = CascadeApp()
+        _app = CascadeCore()
     return _app
 
 
@@ -457,18 +461,13 @@ def compare(prompt, providers):
         sys.exit(1)
 
 
-    @cli.command()
-    @click.option("--provider", "-p", help="Provider to use")
-    def chat(provider):
-        """Start interactive chat mode (TUI)."""
-        from .app import CascadeApp
-        
-        app = CascadeApp()
-        # Set provider in state if provided
-        if provider:
-            app.state.active_provider = provider
-        
-        app.run()
+@cli.command()
+@click.option("--provider", "-p", help="Provider to use")
+def chat(provider):
+    """Start interactive chat mode (TUI)."""
+    from .repl import main as tui_main
+    tui_main()
+
 
 @cli.command()
 @click.argument("file_path")

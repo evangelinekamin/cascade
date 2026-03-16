@@ -33,7 +33,8 @@ class OdometerCounter(Static):
 
     def on_mount(self) -> None:
         if self._target > 0:
-            self._timer = self.set_interval(1 / 30, self._step)
+            # ~8fps for a satisfying mechanical tick-up effect
+            self._timer = self.set_interval(1 / 8, self._step)
 
     def _step(self) -> None:
         if not self._animating:

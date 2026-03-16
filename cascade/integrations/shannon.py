@@ -13,9 +13,6 @@ import threading
 from pathlib import Path
 from typing import Optional, Callable
 
-from ..ui.theme import console
-
-
 _DEFAULT_PATHS = [
     Path("/home/evangeline/Projects/shannon"),
     Path.home() / "shannon",
@@ -33,7 +30,7 @@ class ShannonIntegration:
         self._config_path = config_path
         self._process: Optional[subprocess.Popen] = None
         self._stream_thread: Optional[threading.Thread] = None
-        self._print = print_fn or (lambda msg: console.print(msg, style="dim"))
+        self._print = print_fn or print
 
     @property
     def running(self) -> bool:

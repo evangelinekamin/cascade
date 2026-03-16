@@ -3,14 +3,14 @@
 __version__ = "0.3.0"
 __author__ = "Eve"
 
-from .cli import cli, get_app, CascadeApp
+from .cli import cli, get_app, CascadeCore
 from .config import ConfigManager
 from .providers.base import BaseProvider, ProviderConfig
 
 __all__ = [
     "cli",
     "get_app",
-    "CascadeApp",
+    "CascadeCore",
     "BaseProvider",
     "ProviderConfig",
     "ConfigManager",

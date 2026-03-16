@@ -51,6 +51,9 @@ dev = [
 cascade = "cascade.repl:main"
 cascade-cli = "cascade.cli:cli"
 
+[project.entry-points."cascade.integrations"]
+shannon = "cascade.integrations.shannon:ShannonIntegration"
+
 [tool.setuptools.packages.find]
 include = ["cascade*"]
 

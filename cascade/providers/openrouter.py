@@ -3,7 +3,7 @@
 import json
 from typing import Optional, Iterator, TYPE_CHECKING
 import httpx
-from .base import BaseProvider, ProviderConfig, ToolEventCallback
+from .base import BaseProvider, ProviderConfig, Message, ToolEventCallback
 from .registry import register_provider
 from ._openai_tools import openai_ask_with_tools
 
@@ -27,24 +27,27 @@ class OpenRouterProvider(BaseProvider):
             "HTTP-Referer": "https://github.com/cascade-cli",
         }
 
-    def ask(self, prompt: str, system: Optional[str] = None) -> str:
+    def ask(self, messages: list[Message], system: Optional[str] = None) -> str:
         """Get a complete response from OpenRouter."""
-        return "".join(self.stream(prompt, system))
+        return "".join(self.stream(messages, system))
 
-    def stream(self, prompt: str, system: Optional[str] = None) -> Iterator[str]:
+    def stream(self, messages: list[Message], system: Optional[str] = None) -> Iterator[str]:
         """Stream tokens from OpenRouter."""
         self._last_usage = None
         try:
             url = f"{self.base_url}/chat/completions"
 
-            messages = []
+            api_messages = []
             if system:
-                messages.append({"role": "system", "content": system})
-            messages.append({"role": "user", "content": prompt})
+                api_messages.append({"role": "system", "content": system})
+            api_messages.extend(
+                {"role": m["role"], "content": m["content"]}
+                for m in messages
+            )
 
             payload = {
                 "model": self.config.model,
-                "messages": messages,
+                "messages": api_messages,
                 "stream": True,
                 "stream_options": {"include_usage": True},
                 "temperature": self.config.temperature,
@@ -81,7 +84,7 @@ class OpenRouterProvider(BaseProvider):
 
     def ask_with_tools(
         self,
-        prompt: str,
+        messages: list[Message],
         tools: dict[str, "ToolDef"],
         system: Optional[str] = None,
         max_rounds: int = 5,
@@ -95,7 +98,7 @@ class OpenRouterProvider(BaseProvider):
             model=self.config.model,
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
-            prompt=prompt,
+            messages=messages,
             tools=tools,
             system=system,
             max_rounds=max_rounds,
@@ -104,7 +107,7 @@ class OpenRouterProvider(BaseProvider):
 
     def compare(self, prompt: str, system: Optional[str] = None) -> dict:
         """Generate comparison data."""
-        response = self.ask(prompt, system)
+        response = self.ask_single(prompt, system)
         return {
             "provider": self.name,
             "model": self.config.model,

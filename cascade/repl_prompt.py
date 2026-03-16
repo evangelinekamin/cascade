@@ -13,7 +13,7 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
-from .cli import CascadeApp
+from .cli import CascadeCore
 from .context.memory import ContextBuilder
 from .history import HistoryDB
 from .hooks import HookEvent
@@ -127,7 +127,7 @@ class SessionStats:
 class CascadePromptREPL:
     """Full-featured REPL with gutter rendering, mode cycling, and floating input."""
 
-    def __init__(self, app: CascadeApp, auth_info: str = ""):
+    def __init__(self, app: CascadeCore, auth_info: str = ""):
         self.app = app
         self.db = HistoryDB()
         self.session = None
@@ -137,10 +137,9 @@ class CascadePromptREPL:
         self.stats = SessionStats()
         self.mode = ModeState()
 
-        # Shannon integration
-        from .integrations.shannon import ShannonIntegration
-        shannon_cfg = app.config.get_integrations_config().get("shannon", {})
-        self._shannon = ShannonIntegration(config_path=shannon_cfg.get("path", ""))
+        # Shannon integration (lazy via entry points)
+        self._shannon = None
+        self._shannon_cfg = app.config.get_integrations_config().get("shannon", {})
 
         # Key bindings
         self._kb = KeyBindings()
@@ -554,6 +553,16 @@ class CascadePromptREPL:
         url = self._upload_server.start()
         console.print(f"Upload server started at {url}", style=f"bold {DEFAULT_THEME.palette.inline_code}")
 
+    def _get_shannon(self):
+        """Lazy-init Shannon integration via entry point discovery."""
+        if self._shannon is None:
+            from .integrations import get_integration
+            cls = get_integration("shannon")
+            if cls is None:
+                return None
+            self._shannon = cls(config_path=self._shannon_cfg.get("path", ""))
+        return self._shannon
+
     def _handle_shannon(self, arg: str) -> None:
         parts = arg.strip().split(None, 1)
         if not parts:
@@ -564,18 +573,27 @@ class CascadePromptREPL:
             )
             return
 
+        shannon = self._get_shannon()
+        if shannon is None:
+            console.print(
+                "Shannon integration not available. "
+                "Reinstall cascade-cli or check entry points.",
+                style="dim red",
+            )
+            return
+
         subcmd = parts[0].lower()
         if subcmd == "stop":
-            self._shannon.cmd_stop()
+            shannon.cmd_stop()
         elif subcmd == "logs":
             workflow_id = parts[1].strip() if len(parts) > 1 else ""
-            self._shannon.cmd_logs(workflow_id)
+            shannon.cmd_logs(workflow_id)
         elif subcmd == "workspaces":
-            self._shannon.cmd_workspaces()
+            shannon.cmd_workspaces()
         elif subcmd.startswith("http://") or subcmd.startswith("https://"):
             url = subcmd
             repo = parts[1].strip() if len(parts) > 1 else ""
-            self._shannon.cmd_start(url, repo)
+            shannon.cmd_start(url, repo)
         else:
             console.print(f"Unknown shannon subcommand: {subcmd}", style="dim red")
 
@@ -631,7 +649,7 @@ class CascadePromptREPL:
         renderer = StreamRenderer(theme, console)
         full_text = ""
         try:
-            for chunk in prov.stream(prompt, final_system):
+            for chunk in prov.stream_single(prompt, final_system):
                 if spinner._running:
                     spinner.stop()
                 full_text += chunk

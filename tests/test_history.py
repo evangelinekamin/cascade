@@ -20,7 +20,7 @@ def test_create_session(db):
     assert session["provider"] == "gemini"
     assert session["model"] == "gemini-2.0-flash"
     assert session["title"] == "Test"
-    assert len(session["id"]) == 12
+    assert "-" in session["id"]  # word-based ID like "amber-petal"
 
 
 def test_list_sessions(db):

@@ -8,7 +8,7 @@ import shlex
 from typing import Optional, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..cli import CascadeApp
+    from ..cli import CascadeCore
 
 
 def _run_cmd(cmd: str, timeout: int = 120) -> tuple[str, int]:
@@ -60,7 +60,7 @@ failures or warnings that need attention.
 
 
 def cmd_verify(
-    app: "CascadeApp",
+    app: "CascadeCore",
     config: dict,
     print_fn: Optional[Callable[[str], None]] = None,
 ) -> str:
@@ -94,11 +94,11 @@ def cmd_verify(
 
     prov = app.get_provider()
     system = app.prompt_pipeline.build() or None
-    return prov.ask(prompt, system)
+    return prov.ask_single(prompt, system)
 
 
 def cmd_review(
-    app: "CascadeApp",
+    app: "CascadeCore",
     base_ref: str = "",
     print_fn: Optional[Callable[[str], None]] = None,
 ) -> str:
@@ -119,11 +119,11 @@ def cmd_review(
     prompt = _REVIEW_PROMPT.format(diff=diff_output)
     prov = app.get_provider()
     system = app.prompt_pipeline.build() or None
-    return prov.ask(prompt, system)
+    return prov.ask_single(prompt, system)
 
 
 def cmd_checkpoint(
-    app: "CascadeApp",
+    app: "CascadeCore",
     label: str = "checkpoint",
     test_cmd: str = "",
     print_fn: Optional[Callable[[str], None]] = None,

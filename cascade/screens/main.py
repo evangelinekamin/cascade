@@ -33,13 +33,13 @@ def summarize_user_prompt(prompt: str) -> str:
 class MainScreen(Screen):
     """The core chat interface."""
 
-    _ACTIVITY_PREFIX = "[[cascade_activity]] "
-
     BINDINGS = [
         ("shift+tab", "cycle_mode", "Cycle Mode"),
         ("ctrl+c", "exit_app", "Exit"),
         ("ctrl+d", "exit_app", "Exit"),
         ("escape", "blur_input", "Focus Chat"),
+        ("pageup", "scroll_up", "Scroll Up"),
+        ("pagedown", "scroll_down", "Scroll Down"),
     ]
 
     def __init__(
@@ -97,9 +97,19 @@ class MainScreen(Screen):
     # ------------------------------------------------------------------
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        prompt = event.value.strip()
+        # Multiline paste: ChatInput stores the full text in _pending_paste
+        inp = event.input
+        if hasattr(inp, "_pending_paste") and inp._pending_paste is not None:
+            prompt = inp._pending_paste.strip()
+            inp._pending_paste = None
+        else:
+            prompt = event.value.strip()
         if not prompt:
             return
+
+        # Record in input history for up-arrow recall
+        if hasattr(inp, "record"):
+            inp.record(prompt)
 
         # Clear input
         event.input.value = ""
@@ -167,21 +177,24 @@ class MainScreen(Screen):
         return True
 
     def _build_system_prompt(self, cli_app, prompt: str, provider_name: str) -> str | None:
-        """Build the final system prompt from the pipeline."""
+        """Build the final system prompt from the pipeline.
+
+        Injects mode-specific directive and upload context.
+        Conversation history is passed directly via messages, not here.
+        """
         pipeline = cli_app.prompt_pipeline
-        from ..prompts.layers import PRIORITY_REPL_CONTEXT
+        from ..prompts.layers import PRIORITY_MODE, PRIORITY_REPL_CONTEXT
+        from ..prompts.default import get_mode_directive
+
+        # Inject mode-specific directive
+        directive = get_mode_directive(self._mode)
+        if directive:
+            pipeline = pipeline.add_layer("mode_directive", directive, PRIORITY_MODE)
 
         if cli_app.context_builder.source_count > 0:
             upload_ctx = cli_app.context_builder.build()
             pipeline = pipeline.add_layer(
                 "upload_context", upload_ctx, PRIORITY_REPL_CONTEXT,
-            )
-        history_ctx = self._build_history_context(
-            current_prompt=prompt, provider_name=provider_name,
-        )
-        if history_ctx:
-            pipeline = pipeline.add_layer(
-                "conversation_history", history_ctx, PRIORITY_REPL_CONTEXT,
             )
         return pipeline.build() or None
 
@@ -199,8 +212,24 @@ class MainScreen(Screen):
             )
             return
 
-        # Build system prompt
+        # Build system prompt (no longer includes conversation history)
         final_system = self._build_system_prompt(cli_app, prompt, provider_name)
+
+        # Build conversation history from state
+        from ..conversation import state_messages_to_provider, needs_compaction, compact_messages
+        messages = state_messages_to_provider(
+            messages=list(self.app.state.messages),
+            target_provider=provider_name,
+            policy=self._memory_policy,
+            cross_model_summary=self._cross_model_summary,
+        )
+
+        # Auto-compact if approaching context window limit
+        if messages and needs_compaction(messages, provider_name):
+            try:
+                messages = compact_messages(messages, prov, keep_recent=6)
+            except Exception:
+                pass  # compaction failure is non-fatal; send uncompacted
 
         # Run hooks
         from ..hooks import HookEvent
@@ -219,24 +248,27 @@ class MainScreen(Screen):
 
         if use_tools:
             self._tool_worker(
-                cli_app, prov, prompt, provider_name, final_system, tool_registry,
+                cli_app, prov, messages, provider_name, final_system, tool_registry,
             )
         else:
-            self._stream_worker(cli_app, prov, prompt, provider_name, final_system)
+            self._stream_worker(cli_app, prov, messages, provider_name, final_system)
 
-    def _stream_worker(self, cli_app, prov, prompt, provider_name, final_system):
+    def _stream_worker(self, cli_app, prov, messages, provider_name, final_system):
         """Streaming path -- token-by-token output."""
         from ..hooks import HookEvent
 
         full_response = []
+        last_seen_activity = None
+        # Extract the user prompt for record_turn (last user message)
+        prompt = messages[-1]["content"] if messages else ""
         try:
-            for chunk in prov.stream(prompt, final_system):
-                if chunk.startswith(self._ACTIVITY_PREFIX):
-                    activity = chunk[len(self._ACTIVITY_PREFIX):].strip()
-                    self.app.call_from_thread(self._on_stream_activity, activity)
-                    continue
+            for chunk in prov.stream(messages, final_system):
                 full_response.append(chunk)
                 self.app.call_from_thread(self._on_stream_chunk, chunk)
+                # Activity is now filtered in the provider layer; poll last_activity
+                if prov.last_activity and prov.last_activity != last_seen_activity:
+                    last_seen_activity = prov.last_activity
+                    self.app.call_from_thread(self._on_stream_activity, last_seen_activity)
 
             response_text = "".join(full_response)
             if hasattr(cli_app, "record_turn"):
@@ -256,16 +288,19 @@ class MainScreen(Screen):
         except Exception as e:
             self.app.call_from_thread(self._on_stream_error, str(e))
 
-    def _tool_worker(self, cli_app, prov, prompt, provider_name, final_system, tools):
+    def _tool_worker(self, cli_app, prov, messages, provider_name, final_system, tools):
         """Tool-calling path -- non-streaming with tool progress events."""
         from ..hooks import HookEvent
+
+        # Extract the user prompt for record_turn (last user message)
+        prompt = messages[-1]["content"] if messages else ""
 
         def on_tool_event(event: ToolEvent) -> None:
             self.app.call_from_thread(self._on_tool_event, event)
 
         try:
             response_text, tool_log = prov.ask_with_tools(
-                prompt,
+                messages,
                 tools,
                 system=final_system,
                 on_tool_event=on_tool_event,
@@ -443,7 +478,7 @@ class MainScreen(Screen):
                         max_tokens=900,
                     )
                 )
-                summary = summary_provider.ask(prompt, system=system).strip()
+                summary = summary_provider.ask_single(prompt, system=system).strip()
                 if hasattr(summary_provider, "client"):
                     try:
                         summary_provider.client.close()
@@ -541,7 +576,7 @@ class MainScreen(Screen):
         total = input_tokens + output_tokens
         self.app.state.add_message(provider, full_text, tokens=total)
         self.app.state.update_tokens(provider, input_tokens, output_tokens)
-        self.app.record_message("assistant", full_text, token_count=total)
+        self.app.record_message(provider, full_text, token_count=total)
 
         # Update status bar
         try:
@@ -576,7 +611,7 @@ class MainScreen(Screen):
         total = input_tokens + output_tokens
         self.app.state.add_message(provider, full_text, tokens=total)
         self.app.state.update_tokens(provider, input_tokens, output_tokens)
-        self.app.record_message("assistant", full_text, token_count=total)
+        self.app.record_message(provider, full_text, token_count=total)
 
         # Update status bar
         try:
@@ -672,5 +707,17 @@ class MainScreen(Screen):
         try:
             self.query_one("#main_input").blur()
             self.query_one(ChatHistory).focus()
+        except Exception:
+            pass
+
+    def action_scroll_up(self) -> None:
+        try:
+            self.query_one(ChatHistory).scroll_page_up(animate=False)
+        except Exception:
+            pass
+
+    def action_scroll_down(self) -> None:
+        try:
+            self.query_one(ChatHistory).scroll_page_down(animate=False)
         except Exception:
             pass

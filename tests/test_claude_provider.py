@@ -48,8 +48,8 @@ def test_stream_cli_parses_deltas_and_usage():
                 ProviderConfig(api_key="sk-ant-oat01-test-token", model="claude-opus-4-6")
             )
 
-    with patch("cascade.providers.claude.subprocess.Popen", _FakePopen):
-        chunks = list(provider.stream("Say hello"))
+    with patch("cascade.providers._cli_proxy.subprocess.Popen", _FakePopen):
+        chunks = list(provider.stream_single("Say hello"))
 
     assert chunks == ["Hel", "lo"]
     assert provider.last_usage == (11, 3)
@@ -62,5 +62,5 @@ def test_oauth_token_without_claude_binary_returns_clear_error():
             ProviderConfig(api_key="sk-ant-oat01-test-token", model="claude-opus-4-6")
         )
 
-    chunks = list(provider.stream("hello"))
+    chunks = list(provider.stream_single("hello"))
     assert chunks == ["Error: Claude OAuth token detected, but claude CLI is not in PATH."]

@@ -45,6 +45,79 @@ Conventions:
 - Many small files over few large files
 - Write clear, self-documenting code; add comments only where logic is non-obvious"""
 
+# ---------------------------------------------------------------------------
+# Mode-specific directives
+# ---------------------------------------------------------------------------
+
+MODE_DIRECTIVES: dict[str, str] = {
+    "design": """\
+You are in DESIGN mode. Your role is architect and design thinker.
+
+Focus on:
+- System architecture, component relationships, and data flow
+- API surface design, interface contracts, and module boundaries
+- UX patterns, interaction flows, and information architecture
+- Trade-off analysis: weigh options before recommending one
+- Visual structure: diagrams, schemas, and hierarchies
+
+Do NOT:
+- Write or edit implementation code directly
+- Run commands or modify files
+- Jump to implementation details prematurely
+
+Instead of code, produce:
+- Design documents with clear rationale
+- Interface/contract definitions (types, schemas, protocols)
+- Architecture diagrams described in text or ASCII
+- Prioritized decision matrices when multiple approaches exist
+- Questions that surface hidden requirements
+
+You may write design documents (.md files) when asked, but always present the
+full content for the user to review and approve before saving. Never auto-write
+files without explicit confirmation.""",
+
+    "plan": """\
+You are in PLAN mode. Your role is strategic planner and technical lead.
+
+Focus on:
+- Breaking complex tasks into ordered, concrete steps
+- Identifying dependencies, risks, and blockers upfront
+- Writing implementation plans with file-level specificity
+- Reasoning through edge cases before committing to an approach
+- Estimating scope and suggesting phasing when tasks are large
+
+You may write code when:
+- Sketching an interface or type definition to clarify a plan
+- Demonstrating a specific pattern or approach
+- The user explicitly asks for implementation
+
+Default to planning over doing. State your approach, get confirmation, then execute.""",
+
+    "build": """\
+You are in BUILD mode. Your role is quality engineer and reviewer.
+
+Focus on:
+- Writing and running tests (unit, integration, E2E)
+- Code review: correctness, security, performance, maintainability
+- Finding edge cases, race conditions, and failure modes
+- Verifying existing tests still pass after changes
+- Measuring and improving test coverage
+
+Be thorough and skeptical. Question assumptions. Break things on purpose.""",
+
+    "test": """\
+You are in TEST mode. Your role is implementation engineer.
+
+Focus on:
+- Writing clean, working code that solves the stated problem
+- Following TDD: write a failing test, implement to pass, refactor
+- Editing existing files over creating new ones
+- Making minimal, focused changes -- no unrelated cleanup
+- Running tests and verifying your changes work
+
+Execute proactively. Write code, run tests, fix errors. Plan briefly, then do.""",
+}
+
 
 def _find_design_md(
     explicit_path: Optional[str] = None,
@@ -88,10 +161,16 @@ def _find_design_md(
     return None
 
 
+def get_mode_directive(mode: str) -> str:
+    """Return the system prompt directive for a given mode, or empty string."""
+    return MODE_DIRECTIVES.get(mode, "")
+
+
 def build_default_prompt(
     include_design_language: bool = True,
     design_md_path: Optional[str] = None,
     current_date: Optional[str] = None,
+    mode: Optional[str] = None,
 ) -> str:
     """Assemble the full default system prompt.
 
@@ -99,6 +178,7 @@ def build_default_prompt(
         include_design_language: Whether to search for and include design.md.
         design_md_path: Explicit path to design.md.
         current_date: Override for the current date string.
+        mode: Active mode (design, plan, build, test) for role-specific behavior.
 
     Returns:
         Complete system prompt string.
@@ -106,6 +186,13 @@ def build_default_prompt(
     date_str = current_date or datetime.now().strftime("%Y-%m-%d")
 
     sections = [DEFAULT_IDENTITY, ""]
+
+    # Mode-specific directive (before everything else so it sets the tone)
+    if mode:
+        directive = get_mode_directive(mode)
+        if directive:
+            sections.append(directive)
+            sections.append("")
 
     if include_design_language:
         design_content = _find_design_md(explicit_path=design_md_path)

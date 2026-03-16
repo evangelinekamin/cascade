@@ -6,7 +6,8 @@ State mutations post Textual Messages so widgets can watch for changes.
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, TYPE_CHECKING
 import time
-import uuid
+
+from .history.wordid import generate_word_id
 
 from textual.message import Message
 
@@ -92,7 +93,7 @@ class CascadeState:
     """
 
     def __init__(self) -> None:
-        self.session_id: str = uuid.uuid4().hex[:12]
+        self.session_id: str = generate_word_id()
         self.start_time: float = time.monotonic()
         self.active_provider: str = "gemini"
         self.mode: str = "design"

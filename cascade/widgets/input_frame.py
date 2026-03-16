@@ -7,6 +7,7 @@ Autocomplete dropdown appears when typing slash commands.
 """
 
 from rich.text import Text
+from textual import events
 from textual.widget import Widget
 from textual.app import ComposeResult
 from textual.widgets import Input, Static, Label
@@ -15,6 +16,73 @@ from textual.reactive import reactive
 from ..theme import PALETTE, MODES, get_accent
 from ..commands import get_matching_commands
 from .autocomplete import AutocompleteDropdown
+
+
+class ChatInput(Input):
+    """Input with multiline paste capture and prompt history (up/down arrow).
+
+    Multiline paste: stores full text, shows ``[pasted N chars]``.
+    History: up/down arrows navigate previous submissions.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pending_paste: str | None = None
+        self._history: list[str] = []
+        self._history_idx: int = -1
+        self._draft: str = ""
+
+    def record(self, text: str) -> None:
+        """Record a submitted prompt into history."""
+        if text and (not self._history or self._history[-1] != text):
+            self._history.append(text)
+        self._history_idx = -1
+        self._draft = ""
+
+    def _on_paste(self, event: events.Paste) -> None:
+        if not event.text:
+            event.stop()
+            return
+        if "\n" in event.text:
+            self._pending_paste = event.text.strip()
+            n = len(self._pending_paste)
+            self.value = f"[pasted {n} chars]"
+            self.cursor_position = len(self.value)
+        else:
+            self._pending_paste = None
+            # Set value directly to avoid double-insertion
+            pos = self.cursor_position
+            self.value = self.value[:pos] + event.text + self.value[pos:]
+            self.cursor_position = pos + len(event.text)
+        event.stop()
+        event.prevent_default()
+
+    async def _on_key(self, event: events.Key) -> None:
+        # Up/down arrow for prompt history navigation
+        if event.key == "up" and self._history:
+            if self._history_idx == -1:
+                self._draft = self.value
+                self._history_idx = len(self._history) - 1
+            elif self._history_idx > 0:
+                self._history_idx -= 1
+            else:
+                return
+            self.value = self._history[self._history_idx]
+            self.cursor_position = len(self.value)
+            event.stop()
+            event.prevent_default()
+        elif event.key == "down" and self._history_idx >= 0:
+            if self._history_idx < len(self._history) - 1:
+                self._history_idx += 1
+                self.value = self._history[self._history_idx]
+            else:
+                self._history_idx = -1
+                self.value = self._draft
+            self.cursor_position = len(self.value)
+            event.stop()
+            event.prevent_default()
+        else:
+            await super()._on_key(event)
 
 
 class InputFrame(Widget):
@@ -136,7 +204,7 @@ class FramedInput(Widget):
 
     def compose(self) -> ComposeResult:
         yield Label("\u276f", id="prompt_char", classes="prompt-char")
-        yield Input(placeholder="", id="main_input", classes="main-input")
+        yield ChatInput(placeholder="", id="main_input", classes="main-input")
 
     def on_mount(self) -> None:
         self._apply_accent()

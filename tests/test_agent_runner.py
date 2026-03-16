@@ -20,8 +20,10 @@ def _make_app(
     provider = MagicMock()
     provider.config = config
     provider.ask.return_value = "response"
+    provider.ask_single.return_value = "response"
     provider.ask_with_tools.return_value = ("tool response", [{"tool": "x"}])
     provider.stream.return_value = iter(["chunk1", "chunk2"])
+    provider.stream_single.return_value = iter(["chunk1", "chunk2"])
 
     app = MagicMock()
     app.providers = {provider_name: provider}
@@ -43,7 +45,7 @@ class TestAgentRunner:
 
         result = runner.run(agent, "hello")
         assert result == "response"
-        prov.ask.assert_called_once()
+        prov.ask_single.assert_called_once()
 
     def test_run_with_tools(self):
         tools = {"read_file": MagicMock(), "write_file": MagicMock()}
@@ -63,7 +65,7 @@ class TestAgentRunner:
 
         result = runner.run(agent, "hello")
         assert result == "response"
-        prov.ask.assert_called_once()
+        prov.ask_single.assert_called_once()
         prov.ask_with_tools.assert_not_called()
 
     def test_run_with_filtered_tools(self):
@@ -98,7 +100,7 @@ class TestAgentRunner:
 
     def test_model_restored_on_exception(self):
         app, prov = _make_app(model="original")
-        prov.ask.side_effect = RuntimeError("boom")
+        prov.ask_single.side_effect = RuntimeError("boom")
         runner = AgentRunner(app)
         agent = AgentDef(name="test", model="override")
 
@@ -109,7 +111,7 @@ class TestAgentRunner:
 
     def test_temperature_restored_on_exception(self):
         app, prov = _make_app(temperature=0.5)
-        prov.ask.side_effect = RuntimeError("boom")
+        prov.ask_single.side_effect = RuntimeError("boom")
         runner = AgentRunner(app)
         agent = AgentDef(name="test", temperature=2.0)
 
@@ -123,7 +125,7 @@ class TestAgentRunner:
         claude_config = ProviderConfig(api_key="k", model="claude-3")
         claude_prov = MagicMock()
         claude_prov.config = claude_config
-        claude_prov.ask.return_value = "claude says"
+        claude_prov.ask_single.return_value = "claude says"
         app.providers["claude"] = claude_prov
 
         runner = AgentRunner(app)
@@ -131,7 +133,7 @@ class TestAgentRunner:
 
         result = runner.run(agent, "hello")
         assert result == "claude says"
-        claude_prov.ask.assert_called_once()
+        claude_prov.ask_single.assert_called_once()
 
     def test_missing_provider_raises(self):
         app, _ = _make_app(provider_name="gemini")
@@ -143,6 +145,7 @@ class TestAgentRunner:
 
     def test_stream(self):
         app, prov = _make_app()
+        prov.stream_single.return_value = iter(["chunk1", "chunk2"])
         runner = AgentRunner(app)
         agent = AgentDef(name="test")
 
@@ -151,6 +154,7 @@ class TestAgentRunner:
 
     def test_stream_restores_model(self):
         app, prov = _make_app(model="original")
+        prov.stream_single.return_value = iter(["chunk1", "chunk2"])
         runner = AgentRunner(app)
         agent = AgentDef(name="test", model="override")
 
@@ -163,7 +167,7 @@ class TestAgentRunner:
         agent = AgentDef(name="test", system_prompt="You are a helpful agent.")
 
         runner.run(agent, "hello")
-        call_args = prov.ask.call_args
+        call_args = prov.ask_single.call_args
         system = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("system")
         assert system is not None
         assert "You are a helpful agent." in system
