@@ -114,6 +114,24 @@ def test_filter_activity():
     assert provider.last_activity == "model: test"
 
 
+def test_filter_activity_dedupes_consecutive_normalized_updates():
+    """Whitespace-only activity churn should not leak repeated updates."""
+    config = ProviderConfig(api_key="key", model="mock")
+    provider = MockProvider(config)
+
+    raw_chunks = [
+        "[[cascade_activity]]   thinking   hard   ",
+        "[[cascade_activity]] thinking hard",
+        "[[cascade_activity]] thinking    hard ",
+        "Hello",
+    ]
+
+    filtered = list(provider._filter_activity(iter(raw_chunks)))
+
+    assert filtered == ["Hello"]
+    assert provider.last_activity == "thinking hard"
+
+
 def test_base_provider_get_fallback_model_returns_none():
     """Test BaseProvider.get_fallback_model() returns None by default."""
     config = ProviderConfig(api_key="key", model="mock-model")

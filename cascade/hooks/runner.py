@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 
 from .events import HookEvent
 from .context import HookContext, HookResult
+from .matchers import ToolMatcher
 
 
 # Re-export HookEvent for backward compatibility
@@ -30,6 +31,9 @@ class HookDefinition:
     Supports two handler types:
     - Shell: command is a shell string, handler is None
     - Python: handler is a callable, command is empty
+
+    Optional ``tool_filter`` restricts the hook to matching tool calls
+    using Claude Code-style patterns like ``Bash(git:*)``.
     """
 
     name: str
@@ -39,10 +43,21 @@ class HookDefinition:
     timeout: int = 30
     enabled: bool = True
     priority: int = 100  # lower = runs first
+    tool_filter: Optional[ToolMatcher] = None  # CC-style tool matcher
 
     @property
     def is_python_hook(self) -> bool:
         return self.handler is not None
+
+    def matches_tool(self, tool_name: str, arguments: dict | None = None) -> bool:
+        """Check if this hook applies to the given tool call.
+
+        Returns True if no filter is set (matches everything) or if
+        the filter pattern matches.
+        """
+        if self.tool_filter is None:
+            return True
+        return self.tool_filter.matches(tool_name, arguments)
 
 
 class HookRunner:
@@ -63,9 +78,24 @@ class HookRunner:
         """Return a new runner with the hook added. Immutable."""
         return HookRunner(self._hooks + (hook,))
 
-    def hooks_for_event(self, event: HookEvent) -> tuple[HookDefinition, ...]:
-        """Return all enabled hooks for a given event, sorted by priority."""
-        hooks = [h for h in self._hooks if h.event == event and h.enabled]
+    def hooks_for_event(
+        self,
+        event: HookEvent,
+        tool_name: str = "",
+        tool_args: dict | None = None,
+    ) -> tuple[HookDefinition, ...]:
+        """Return all enabled hooks for a given event, sorted by priority.
+
+        For tool-related events, filters by tool_filter pattern.
+        """
+        hooks = []
+        for h in self._hooks:
+            if h.event != event or not h.enabled:
+                continue
+            # Apply tool filter for tool lifecycle events
+            if tool_name and not h.matches_tool(tool_name, tool_args):
+                continue
+            hooks.append(h)
         hooks.sort(key=lambda h: h.priority)
         return tuple(hooks)
 
@@ -131,7 +161,10 @@ class HookRunner:
         This is the preferred API for new code. Returns None if no hook
         blocked or transformed.
         """
-        hooks = self.hooks_for_event(event)
+        # Extract tool info from context for pattern matching
+        tool_name = hook_context.tool_name
+        tool_args = dict(hook_context.tool_input) if hook_context.tool_input else None
+        hooks = self.hooks_for_event(event, tool_name=tool_name, tool_args=tool_args)
         if not hooks:
             return None
 

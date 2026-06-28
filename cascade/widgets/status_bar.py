@@ -57,7 +57,7 @@ class StatusBar(Static):
         height: 1;
         dock: bottom;
         width: 100%;
-        background: #121218;
+        background: #0d1117;
         padding: 0 2;
     }
     """

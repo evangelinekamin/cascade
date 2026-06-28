@@ -154,10 +154,13 @@ class CascadePromptREPL:
             bottom_toolbar=self._bottom_toolbar,
             key_bindings=self._kb,
         )
+        self._sync_current_provider_model()
 
     @property
     def current_provider(self) -> str:
-        return self.mode.active_provider
+        if self.mode.override_provider:
+            return self.mode.override_provider
+        return self.app.config.get_mode_provider(self.mode.mode_name)
 
     def _current_model(self) -> str:
         prov = self.app.providers.get(self.current_provider)
@@ -165,11 +168,21 @@ class CascadePromptREPL:
             return prov.config.model
         return "?"
 
+    def _sync_current_provider_model(self) -> None:
+        provider = self.current_provider
+        prov = self.app.providers.get(provider)
+        if prov is None:
+            return
+        model = self.app.config.get_model_for(provider, self.mode.mode_name, fast=False)
+        if model:
+            prov.config.model = model
+
     def _setup_keybindings(self) -> None:
         @self._kb.add("s-tab")
         def _cycle_mode(event):
             old_mode = self.mode.mode_name
             self.mode = self.mode.cycle()
+            self._sync_current_provider_model()
             render_bookmark(f"{old_mode} -> {self.mode.mode_name}")
 
     def _bottom_toolbar(self) -> HTML:
@@ -406,9 +419,11 @@ class CascadePromptREPL:
             return
         if arg.lower() == "reset":
             self.mode = self.mode.with_override(None)
+            self._sync_current_provider_model()
             console.print(f"Provider override cleared. Using {self.current_provider}", style="dim")
         elif arg in self.app.providers:
             self.mode = self.mode.with_override(arg)
+            self._sync_current_provider_model()
             console.print(f"Provider override: {arg}", style=f"dim {DEFAULT_THEME.palette.inline_code}")
         else:
             console.print(f"Provider '{arg}' not found.", style="dim red")
@@ -427,6 +442,7 @@ class CascadePromptREPL:
         old_mode = self.mode.mode_name
         idx = MODE_ORDER.index(target)
         self.mode = ModeState(index=idx, override_provider=self.mode.override_provider)
+        self._sync_current_provider_model()
         render_bookmark(f"{old_mode} -> {target}")
 
     def _show_context(self) -> None:

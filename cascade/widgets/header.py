@@ -80,31 +80,23 @@ class ProviderGhostTable(Static):
         self.refresh()
 
     def render(self) -> Text:
-        col_provider = 14
-        col_model = 29
+        col_name = 14
+        col_model = 26
 
         result = Text()
 
-        # Header row
-        result.append("  ")
-        result.append("PROVIDER".ljust(col_provider), style=f"dim {PALETTE.text_muted}")
-        result.append("MODEL".ljust(col_model), style=f"dim {PALETTE.text_muted}")
-        result.append("STATUS", style=f"dim {PALETTE.text_muted}")
-        result.append("\n")
-
         if not self._providers:
-            # Fallback: show known provider names with no model info
             for name in sorted(PROVIDERS.keys()):
                 pt = get_provider_theme(name)
                 is_active = name == self._active_provider
-                result.append("  ")
                 if is_active:
-                    result.append(name.ljust(col_provider), style=f"bold {pt.accent}")
-                    result.append("-".ljust(col_model), style=PALETTE.text_bright)
-                    result.append("active", style=pt.accent)
+                    result.append("  \u25cf ", style=f"bold {pt.accent}")
+                    result.append(name.ljust(col_name), style=f"bold {pt.accent}")
+                    result.append("-".ljust(col_model), style=PALETTE.text_primary)
+                    result.append("active", style=f"dim {pt.accent}")
                 else:
-                    result.append(name.ljust(col_provider), style=f"dim {PALETTE.text_muted}")
-                    result.append("-".ljust(col_model), style=f"dim {PALETTE.text_muted}")
+                    result.append("    ")
+                    result.append(name.ljust(col_name), style=f"dim {PALETTE.text_muted}")
                     result.append("\u00b7", style=f"dim {PALETTE.text_muted}")
                 result.append("\n")
             return result
@@ -115,14 +107,14 @@ class ProviderGhostTable(Static):
             is_active = name == self._active_provider
             pt = get_provider_theme(name)
 
-            result.append("  ")
             if is_active:
-                result.append(name.ljust(col_provider), style=f"bold {pt.accent}")
-                result.append(model.ljust(col_model), style=PALETTE.text_bright)
-                result.append("active", style=pt.accent)
+                result.append("  \u25cf ", style=f"bold {pt.accent}")
+                result.append(name.ljust(col_name), style=f"bold {pt.accent}")
+                result.append(model.ljust(col_model), style=PALETTE.text_primary)
+                result.append("active", style=f"dim {pt.accent}")
             else:
-                result.append(name.ljust(col_provider), style=f"dim {PALETTE.text_muted}")
-                result.append(model.ljust(col_model), style=f"dim {PALETTE.text_muted}")
+                result.append("    ")
+                result.append(name.ljust(col_name), style=f"dim {PALETTE.text_muted}")
                 result.append("\u00b7", style=f"dim {PALETTE.text_muted}")
             result.append("\n")
 

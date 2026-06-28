@@ -21,12 +21,25 @@ _TYPE_MAP = {
 
 @dataclass(frozen=True)
 class ToolDef:
-    """A tool definition with its JSON Schema and handler."""
+    """A tool definition with its JSON Schema and handler.
+
+    Tools with ``is_concurrent=True`` may execute in parallel with other
+    concurrent tools. Non-concurrent tools get exclusive access (serialised).
+    Read-only tools should set ``is_read_only=True`` (implies concurrent).
+    """
 
     name: str
     description: str
     parameters: dict
     handler: Callable
+    is_concurrent: bool = False
+    is_read_only: bool = False
+    is_destructive: bool = False
+
+    @property
+    def concurrency_safe(self) -> bool:
+        """Whether this tool can safely run alongside others."""
+        return self.is_concurrent or self.is_read_only
 
 
 def _annotation_to_schema(annotation: Any) -> dict:

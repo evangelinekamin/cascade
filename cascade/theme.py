@@ -21,6 +21,7 @@ class Palette:
     code_bg: str = "#161b22"
     border: str = "#30363d"
     border_subtle: str = "#1a1a28"
+    user_msg_bg: str = "#111820"
 
     # Text hierarchy
     text_bright: str = "#e8e8f0"
@@ -67,8 +68,9 @@ class ProviderTheme:
 
     name: str
     accent: str
-    dim: str            # accent at ~12% opacity on dark bg
-    abbreviation: str   # 3-char label for gutter
+    accent_shimmer: str  # lighter variant for animation oscillation
+    dim: str             # accent at ~12% opacity on dark bg
+    abbreviation: str    # 3-char label for gutter
     default_mode: str
     label: str
 
@@ -77,6 +79,7 @@ PROVIDERS: Dict[str, ProviderTheme] = {
     "gemini": ProviderTheme(
         name="gemini",
         accent="#b44dff",
+        accent_shimmer="#c97aff",
         dim="#2d1a3d",
         abbreviation="gem",
         default_mode="design",
@@ -85,6 +88,7 @@ PROVIDERS: Dict[str, ProviderTheme] = {
     "claude": ProviderTheme(
         name="claude",
         accent="#f0956c",
+        accent_shimmer="#f5b896",
         dim="#3d2a1d",
         abbreviation="cla",
         default_mode="plan",
@@ -93,14 +97,16 @@ PROVIDERS: Dict[str, ProviderTheme] = {
     "openai": ProviderTheme(
         name="openai",
         accent="#34d399",
+        accent_shimmer="#6ee7b7",
         dim="#1d3d2a",
-        abbreviation="cdx",
+        abbreviation="oai",
         default_mode="build",
         label="build mode",
     ),
     "openrouter": ProviderTheme(
         name="openrouter",
         accent="#d94060",
+        accent_shimmer="#e87088",
         dim="#3d1d25",
         abbreviation="ort",
         default_mode="test",
@@ -111,6 +117,7 @@ PROVIDERS: Dict[str, ProviderTheme] = {
 _NEUTRAL = ProviderTheme(
     name="unknown",
     accent=PALETTE.text_dim,
+    accent_shimmer=PALETTE.text_primary,
     dim=PALETTE.border_subtle,
     abbreviation="???",
     default_mode="chat",
@@ -156,6 +163,11 @@ def get_available_modes(available_providers: Collection[str] | None = None) -> t
 def get_accent(provider: str) -> str:
     """Get the accent hex for a provider."""
     return get_provider_theme(provider).accent
+
+
+def get_shimmer(provider: str) -> str:
+    """Get the shimmer hex for a provider."""
+    return get_provider_theme(provider).accent_shimmer
 
 
 def get_dim(provider: str) -> str:

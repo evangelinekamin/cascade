@@ -1,8 +1,8 @@
 """ASCII art banner using pyfiglet with smooth gradient coloring.
 
-Uses the 'ansi_shadow' font (same style as the Gemini CLI) with a
+Uses the 'small' font for a lightweight, refined look with a
 left-to-right gradient from cyan -> purple -> pink. Falls back to
-a built-in block-style banner if pyfiglet is unavailable.
+a built-in banner if pyfiglet is unavailable.
 """
 
 import logging
@@ -24,16 +24,15 @@ GRADIENT = [
     (229, 90, 155),   # #e55a9b  pink
 ]
 
-# Preferred figlet font (Gemini CLI style)
-FONT = "ansi_shadow"
+# Preferred figlet font -- lightweight and refined
+FONT = "small"
 
 # Built-in fallback keeps the UI readable even when pyfiglet is not installed.
 _FALLBACK_CASCADE = [
-    " ██████   █████   ███████  ██████   █████  ██████  ███████ ",
-    "██      ██   ██  ██      ██      ██   ██ ██   ██ ██      ",
-    "██      ███████  ███████ ██      ███████ ██   ██ █████   ",
-    "██      ██   ██       ██ ██      ██   ██ ██   ██ ██      ",
-    " ██████ ██   ██  ███████  ██████ ██   ██ ██████  ███████ ",
+    r"  ___   _   ___  ___   _   ___  ___ ",
+    r" / __| /_\ / __|/ __| /_\ |   \| __|",
+    r"| (__ / _ \\__ \| (__ / _ \| |) | _| ",
+    r" \___/_/ \_\___/ \___/_/ \_\___/|___|",
 ]
 
 

@@ -5,6 +5,8 @@ Bridges to synchronous provider.stream() via run_worker(thread=True).
 """
 
 import datetime
+import time
+from typing import Iterator
 
 from rich.text import Text
 from textual import events
@@ -20,9 +22,10 @@ from ..widgets.input_frame import InputFrame
 from ..widgets.status_bar import StatusBar
 from ..widgets.stream_message import StreamMessage
 from ..widgets.tool_call import ToolCallWidget
-from ..theme import PALETTE, MODE_CYCLE, MODES, get_available_modes, get_provider_theme
+from ..theme import PALETTE, MODE_CYCLE, MODES, get_provider_theme
 from ..commands import CommandHandler
 from ..hooks import HookContext, HookEvent
+from ..keybindings import ChordManager, ChordState
 
 
 def summarize_user_prompt(prompt: str) -> str:
@@ -35,6 +38,9 @@ def summarize_user_prompt(prompt: str) -> str:
 
 class MainScreen(Screen):
     """The core chat interface."""
+
+    _STREAM_BATCH_INTERVAL_SECONDS = 0.03
+    _STREAM_BATCH_MAX_CHARS = 1024
 
     BINDINGS = [
         ("shift+tab", "cycle_mode", "Cycle Mode"),
@@ -75,6 +81,29 @@ class MainScreen(Screen):
         self._activity_timer = None
         self._activity_provider = None
         self._last_seen_activity = None
+        self._chords = self._build_chord_manager()
+
+    @staticmethod
+    def _build_chord_manager() -> ChordManager:
+        """Set up default chord bindings."""
+        cm = ChordManager(timeout=1.0)
+        cm.register("ctrl+x ctrl+k", "kill_workers")
+        cm.register("ctrl+x ctrl+e", "export_session")
+        cm.register("ctrl+x ctrl+h", "toggle_hooks")
+        return cm
+
+    def on_key(self, event: events.Key) -> None:
+        """Route keypresses through the chord manager first."""
+        result = self._chords.feed(event.key)
+        if result.state == ChordState.PENDING:
+            event.stop()
+            event.prevent_default()
+        elif result.state == ChordState.MATCHED:
+            event.stop()
+            event.prevent_default()
+            handler = getattr(self, f"action_{result.action}", None)
+            if handler is not None:
+                handler()
 
     def compose(self) -> ComposeResult:
         yield WelcomeHeader(
@@ -171,9 +200,10 @@ class MainScreen(Screen):
         self.app.state.add_message("you", prompt)
         self.app.record_message("user", prompt)
 
-        # Mount user message widget
+        # Mount user message widget and trim overflow
         chat = self.query_one(ChatHistory)
         chat.mount(MessageWidget("you", summarize_user_prompt(prompt)))
+        self.call_later(chat.trim_overflow)
         self._scroll_chat_end(chat, force=True)
 
         # Kick off provider response in a worker thread
@@ -367,7 +397,7 @@ class MainScreen(Screen):
         # Extract the user prompt for record_turn (last user message)
         prompt = messages[-1]["content"] if messages else ""
         try:
-            for chunk in prov.stream(messages, final_system):
+            for chunk in self._coalesce_stream_chunks(prov.stream(messages, final_system)):
                 full_response.append(chunk)
                 self.app.call_from_thread(self._on_stream_chunk, chunk)
 
@@ -406,6 +436,43 @@ class MainScreen(Screen):
 
         except Exception as e:
             self.app.call_from_thread(self._on_stream_error, str(e))
+
+    @classmethod
+    def _coalesce_stream_chunks(cls, chunks: Iterator[str]) -> Iterator[str]:
+        """Batch rapid streaming chunks before they cross into the TUI thread.
+
+        This preserves fast first-token feedback while reducing `call_from_thread`
+        traffic and expensive StreamMessage re-layouts for providers that emit
+        many tiny fragments.
+        """
+        pending: list[str] = []
+        pending_chars = 0
+        last_emit = -cls._STREAM_BATCH_INTERVAL_SECONDS
+
+        for chunk in chunks:
+            if not chunk:
+                continue
+
+            now = time.monotonic()
+            if not pending and (now - last_emit) >= cls._STREAM_BATCH_INTERVAL_SECONDS:
+                yield chunk
+                last_emit = now
+                continue
+
+            pending.append(chunk)
+            pending_chars += len(chunk)
+
+            if (
+                pending_chars >= cls._STREAM_BATCH_MAX_CHARS
+                or (now - last_emit) >= cls._STREAM_BATCH_INTERVAL_SECONDS
+            ):
+                yield "".join(pending)
+                pending.clear()
+                pending_chars = 0
+                last_emit = now
+
+        if pending:
+            yield "".join(pending)
 
     def _tool_worker(self, cli_app, prov, messages, provider_name, final_system, tools):
         """Tool-calling path -- non-streaming with tool progress events."""
@@ -602,8 +669,9 @@ class MainScreen(Screen):
                 provider_obj = cli_app.providers.get(provider_name)
                 if base_cfg is None or provider_obj is None:
                     continue
-                provider_data = cli_app.config.data.get("providers", {}).get(provider_name, {})
-                summary_model = provider_data.get("fast_model") or base_cfg.model
+                summary_model = cli_app.config.get_model_for(provider_name, self._mode, fast=True)
+                if not isinstance(summary_model, str) or not summary_model:
+                    summary_model = base_cfg.model
                 provider_cls = type(provider_obj)
                 summary_provider = provider_cls(
                     ProviderConfig(
@@ -761,7 +829,9 @@ class MainScreen(Screen):
             self._stream_msg = None
 
         try:
-            self._scroll_chat_end(self.query_one(ChatHistory))
+            chat = self.query_one(ChatHistory)
+            self._scroll_chat_end(chat)
+            self.call_later(chat.trim_overflow)
         except Exception:
             pass
 
@@ -812,7 +882,17 @@ class MainScreen(Screen):
 
     def action_cycle_mode(self) -> None:
         previous_provider = self._active_provider
-        available_modes = get_available_modes(self._providers.keys())
+        cli_app = getattr(self.app, "cli_app", None)
+        if cli_app is not None and hasattr(cli_app, "config"):
+            candidate_modes = cli_app.config.get_available_modes(self._providers.keys())
+            if isinstance(candidate_modes, tuple) and all(isinstance(mode, str) for mode in candidate_modes):
+                available_modes = tuple(mode for mode in candidate_modes if mode in MODES)
+            else:
+                from ..theme import get_available_modes
+                available_modes = get_available_modes(self._providers.keys())
+        else:
+            from ..theme import get_available_modes
+            available_modes = get_available_modes(self._providers.keys())
         if not available_modes:
             available_modes = MODE_CYCLE
         if self._mode not in available_modes:
@@ -824,9 +904,22 @@ class MainScreen(Screen):
             next_idx = (current_idx + 1) % len(available_modes)
             next_mode = available_modes[next_idx]
         self._mode = next_mode
-        self._active_provider = MODES[self._mode]["provider"]
+        if cli_app is not None and hasattr(cli_app, "config"):
+            configured_provider = cli_app.config.get_mode_provider(self._mode)
+            if isinstance(configured_provider, str) and configured_provider in self._providers:
+                self._active_provider = configured_provider
+            else:
+                self._active_provider = MODES[self._mode]["provider"]
+            prov = cli_app.providers.get(self._active_provider)
+            if prov is not None:
+                model = cli_app.config.get_model_for(self._active_provider, self._mode, fast=False)
+                if isinstance(model, str) and model:
+                    prov.config.model = model
+        else:
+            self._active_provider = MODES[self._mode]["provider"]
 
         # Update state
+        self.app.state.fast_mode = False
         self.app.state.set_provider(self._active_provider, self._mode)
 
         # Update widgets

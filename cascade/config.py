@@ -2,10 +2,20 @@
 
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Collection
 import yaml
 
 from .providers.base import ProviderConfig
+from .theme import MODE_CYCLE, MODES
+
+
+_DEFAULT_MODE_CONFIG = {
+    mode_name: {
+        "provider": mode_cfg["provider"],
+        "model": "",
+    }
+    for mode_name, mode_cfg in MODES.items()
+}
 
 
 class ConfigManager:
@@ -71,6 +81,7 @@ class ConfigManager:
                 "provider": "gemini",
                 "theme": "deep-stream",
             },
+            "modes": _DEFAULT_MODE_CONFIG,
             "prompts": {
                 "use_default_system_prompt": True,
                 "include_design_language": True,
@@ -173,6 +184,68 @@ class ConfigManager:
     def get_default_provider(self) -> str:
         """Get the default provider name."""
         return self.data.get("defaults", {}).get("provider", "gemini")
+
+    def get_mode_config(self, mode_name: str) -> Dict[str, str]:
+        """Return provider/model config for a mode with defaults applied."""
+        base = dict(_DEFAULT_MODE_CONFIG.get(mode_name, {}))
+        raw = self.data.get("modes", {}).get(mode_name, {})
+        if isinstance(raw, dict):
+            provider = raw.get("provider")
+            model = raw.get("model")
+            if isinstance(provider, str) and provider.strip():
+                base["provider"] = provider.strip().lower()
+            if isinstance(model, str):
+                base["model"] = model.strip()
+        return base
+
+    def get_mode_provider(self, mode_name: str) -> str:
+        """Return the configured provider for a mode."""
+        return self.get_mode_config(mode_name).get(
+            "provider",
+            MODES.get(mode_name, {}).get("provider", "gemini"),
+        )
+
+    def get_mode_model_override(self, mode_name: str) -> str:
+        """Return the configured model override for a mode, if any."""
+        return self.get_mode_config(mode_name).get("model", "")
+
+    def get_model_for(self, provider_name: str, mode_name: Optional[str] = None, fast: bool = False) -> str:
+        """Resolve the model to use for a provider in the given mode."""
+        provider_data = self.data.get("providers", {}).get(provider_name, {})
+        if fast:
+            fast_model = str(provider_data.get("fast_model", "") or "").strip()
+            if fast_model:
+                return fast_model
+
+        if mode_name:
+            mode_cfg = self.get_mode_config(mode_name)
+            mode_provider = mode_cfg.get("provider", "")
+            mode_model = mode_cfg.get("model", "")
+            if mode_provider == provider_name and mode_model:
+                return mode_model
+
+        return str(provider_data.get("model", "") or "").strip()
+
+    def get_default_mode_for_provider(self, provider_name: str) -> str:
+        """Return the first configured mode that maps to the given provider."""
+        for mode_name in MODE_CYCLE:
+            if self.get_mode_provider(mode_name) == provider_name:
+                return mode_name
+        for mode_name, mode_cfg in MODES.items():
+            if mode_cfg.get("provider") == provider_name:
+                return mode_name
+        return "design"
+
+    def get_available_modes(self, configured_providers: Collection[str] | None = None) -> tuple[str, ...]:
+        """Return modes whose configured provider exists in this session."""
+        if not configured_providers:
+            return MODE_CYCLE
+        available = set(configured_providers)
+        return tuple(
+            mode_name
+            for mode_name in MODE_CYCLE
+            if self.get_mode_provider(mode_name) in available
+        )
 
     def get_enabled_providers(self) -> list[str]:
         """Get list of enabled provider names."""

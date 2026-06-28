@@ -89,7 +89,7 @@ class ClaudeProvider(BaseProvider):
     def stream(self, messages: list[Message], system: Optional[str] = None) -> Iterator[str]:
         """Stream tokens from Claude."""
         self._last_usage = None
-        self._last_activity = None
+        self.reset_activity_state()
         if self._use_cli_proxy:
             yield from self._filter_activity(self._stream_via_cli(messages, system))
             return

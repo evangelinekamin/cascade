@@ -34,6 +34,10 @@ class CommandSuggestion(Static):
 
     def render(self) -> Text:
         t = Text()
+        if self.has_class("selected"):
+            t.append("\u258c", style=f"bold {PALETTE.cyan}")
+        else:
+            t.append(" ")
         t.append(f"/{self._cmd.name}", style=f"bold {PALETTE.text_bright}")
         t.append("  ", style="")
         t.append(self._cmd.description, style=f"dim {PALETTE.text_muted}")

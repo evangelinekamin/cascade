@@ -3,13 +3,17 @@
 Gets providers, config, hooks, tools for free via the CLI app.
 """
 
+import asyncio
+from collections import OrderedDict
 
 from textual.app import App
 from textual.binding import Binding
 
 from .history import BranchingSession, HistoryDB
-from .state import CascadeState
+from .state import CascadeState, ProviderChanged, ThinkingChanged
 from .theme import MODES, get_provider_theme
+
+_TITLE_SPINNER_FRAMES = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
 
 
 class CascadeTUI(App):
@@ -30,6 +34,9 @@ class CascadeTUI(App):
         self.db = HistoryDB()
         self._db_session: dict | None = None
         self._branching_session: BranchingSession | None = None
+        self._title_timer = None
+        self._title_idx = 0
+        self._title_activities: OrderedDict[str, tuple[str, str]] = OrderedDict()
 
         # Populate state from CLI app
         if cli_app:
@@ -38,11 +45,16 @@ class CascadeTUI(App):
             if available_providers and default_provider not in cli_app.providers:
                 default_provider = available_providers[0]
             self.state.active_provider = default_provider
-            self.state.mode = get_provider_theme(default_provider).default_mode
-            for mode_name, mode_cfg in MODES.items():
-                if mode_cfg["provider"] == default_provider:
-                    self.state.mode = mode_name
-                    break
+            configured_mode = cli_app.config.get_default_mode_for_provider(default_provider)
+            if isinstance(configured_mode, str) and configured_mode in MODES:
+                self.state.mode = configured_mode
+            else:
+                self.state.mode = get_provider_theme(default_provider).default_mode
+            prov = cli_app.providers.get(default_provider)
+            if prov is not None:
+                model = cli_app.config.get_model_for(default_provider, self.state.mode, fast=False)
+                if isinstance(model, str) and model:
+                    prov.config.model = model
 
             # Initialize provider token counters for all known providers
             for name in cli_app.providers:
@@ -64,6 +76,7 @@ class CascadeTUI(App):
 
     def on_mount(self) -> None:
         self.state.bind(self)
+        self._sync_window_title()
 
         # Fire SESSION_START hook
         if self.cli_app:
@@ -85,6 +98,98 @@ class CascadeTUI(App):
             mode=self.state.mode,
             providers=providers,
         ))
+
+    def on_unmount(self) -> None:
+        if self._title_timer is not None:
+            self._title_timer.stop()
+            self._title_timer = None
+        self._sync_window_title()
+
+    def on_provider_changed(self, event: ProviderChanged) -> None:
+        del event
+        self._sync_window_title()
+
+    def on_thinking_changed(self, event: ThinkingChanged) -> None:
+        if event.thinking:
+            self.start_title_activity("chat", event.provider, event.thought or "thinking")
+        else:
+            self.stop_title_activity("chat")
+
+    def start_title_activity(self, source: str, provider: str, label: str) -> None:
+        """Register a busy activity that should animate in the terminal title."""
+        normalized_label = self._normalize_title_label(label)
+        normalized_provider = (provider or self.state.active_provider or "cascade").strip()
+        self._title_activities.pop(source, None)
+        self._title_activities[source] = (normalized_provider, normalized_label)
+        self._ensure_title_timer()
+        self._sync_window_title()
+
+    def update_title_activity(self, source: str, label: str, provider: str | None = None) -> None:
+        """Refresh the label for an existing title activity."""
+        current_provider = provider
+        if current_provider is None:
+            current_provider = self._title_activities.get(source, (self.state.active_provider, ""))[0]
+        self.start_title_activity(source, current_provider, label)
+
+    def stop_title_activity(self, source: str) -> None:
+        """Remove a busy activity from the terminal title."""
+        self._title_activities.pop(source, None)
+        if not self._title_activities and self._title_timer is not None:
+            self._title_timer.stop()
+            self._title_timer = None
+            self._title_idx = 0
+        self._sync_window_title()
+
+    def _tick_title(self) -> None:
+        if not self._title_activities:
+            if self._title_timer is not None:
+                self._title_timer.stop()
+                self._title_timer = None
+            self._title_idx = 0
+            self._sync_window_title()
+            return
+        self._title_idx = (self._title_idx + 1) % len(_TITLE_SPINNER_FRAMES)
+        self._sync_window_title()
+
+    def _ensure_title_timer(self) -> None:
+        if self._title_timer is None:
+            try:
+                asyncio.get_running_loop()
+                self._title_timer = self.set_interval(0.1, self._tick_title)
+            except RuntimeError:
+                self._title_timer = None
+
+    @staticmethod
+    def _normalize_title_label(label: str) -> str:
+        compact = " ".join(str(label or "").split()).strip() or "working"
+        return compact if len(compact) <= 72 else f"{compact[:69]}..."
+
+    def _base_window_title(self) -> str:
+        parts = ["cascade"]
+        provider = (self.state.active_provider or "").strip()
+        session_id = (self.state.session_id or "").strip()
+        if provider:
+            parts.append(provider)
+        if session_id:
+            parts.append(session_id)
+        return " . ".join(parts)
+
+    def _formatted_window_title(self) -> str:
+        base = self._base_window_title()
+        if not self._title_activities:
+            return base
+        provider, label = next(reversed(self._title_activities.values()))
+        frame = _TITLE_SPINNER_FRAMES[self._title_idx % len(_TITLE_SPINNER_FRAMES)]
+        provider = (provider or "").strip()
+        if provider and provider != self.state.active_provider and provider not in label:
+            return f"{frame} {base} . {provider} . {label}"
+        return f"{frame} {base} . {label}"
+
+    def _sync_window_title(self) -> None:
+        try:
+            self.console.set_window_title(self._formatted_window_title())
+        except Exception:
+            pass
 
     def action_cycle_mode(self) -> None:
         """Delegate to the current screen."""
@@ -129,6 +234,7 @@ class CascadeTUI(App):
         self._db_session = session
         self.state.set_session_id(session["id"])
         self._branching_session = BranchingSession(self.db, session["id"])
+        self._sync_window_title()
         return session
 
     def get_branching_session(self) -> BranchingSession:
