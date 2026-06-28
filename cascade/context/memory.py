@@ -22,6 +22,8 @@ class ContextBuilder:
         self._sources: list[dict] = []
         self._max_tokens = max_tokens
         self._current_chars = 0
+        self._cached_build = ""
+        self._dirty = False
 
     @property
     def token_estimate(self) -> int:
@@ -35,6 +37,7 @@ class ContextBuilder:
         """Add a raw text snippet."""
         self._sources.append({"type": "text", "label": label, "content": text})
         self._current_chars += len(text)
+        self._dirty = True
         return self
 
     def add_file(self, path: str) -> "ContextBuilder":
@@ -46,6 +49,7 @@ class ContextBuilder:
                 "label": str(file_path),
                 "content": f"File not found: {file_path}",
             })
+            self._dirty = True
             return self
 
         if file_path.suffix.lower() in _IMAGE_EXTENSIONS:
@@ -60,12 +64,14 @@ class ContextBuilder:
                 "content": content,
             })
             self._current_chars += len(content)
+            self._dirty = True
         except Exception as e:
             self._sources.append({
                 "type": "error",
                 "label": str(file_path),
                 "content": f"Error reading file: {e}",
             })
+            self._dirty = True
         return self
 
     def add_directory(self, path: str, glob: str = "*") -> "ContextBuilder":
@@ -104,6 +110,7 @@ class ContextBuilder:
                 "label": str(file_path),
                 "content": f"Image not found: {file_path}",
             })
+            self._dirty = True
             return self
 
         try:
@@ -119,18 +126,22 @@ class ContextBuilder:
             })
             # Images count roughly by their base64 size
             self._current_chars += len(encoded)
+            self._dirty = True
         except Exception as e:
             self._sources.append({
                 "type": "error",
                 "label": str(file_path),
                 "content": f"Error reading image: {e}",
             })
+            self._dirty = True
         return self
 
     def build(self) -> str:
         """Assemble all sources into a structured context string."""
         if not self._sources:
             return ""
+        if not self._dirty and self._cached_build:
+            return self._cached_build
 
         parts = ["--- Context Sources ---\n"]
         for source in self._sources:
@@ -146,12 +157,16 @@ class ContextBuilder:
                 parts.append(f"### {label}\n{content}\n")
 
         parts.append(f"\n--- End Context ({self.source_count} sources, ~{self.token_estimate} tokens) ---")
-        return "\n".join(parts)
+        self._cached_build = "\n".join(parts)
+        self._dirty = False
+        return self._cached_build
 
     def clear(self) -> "ContextBuilder":
         """Reset all context sources."""
         self._sources.clear()
         self._current_chars = 0
+        self._cached_build = ""
+        self._dirty = False
         return self
 
     def list_sources(self) -> list[dict]:

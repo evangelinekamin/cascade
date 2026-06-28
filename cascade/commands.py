@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .theme import MODES, PALETTE, get_available_modes, get_provider_theme
+from .theme import MODES, PALETTE, PROVIDERS
 
 
 @dataclass(frozen=True)
@@ -20,13 +20,24 @@ class CommandDef:
     description: str
 
 
+@dataclass
+class ProgressHandle:
+    """Mounted command progress row plus its title-spinner source."""
+
+    indicator: object | None
+    title_source: str | None
+    provider: str
+
+
 # Canonical list of available commands (used by autocomplete and /help)
 COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("exit", "/exit", "Exit cascade"),
     CommandDef("quit", "/quit", "Exit cascade"),
     CommandDef("fast", "/fast", "Toggle fast model for current provider"),
-    CommandDef("model", "/model <provider>", "Switch active provider"),
+    CommandDef("model", "/model <provider|reset>", "Switch active provider"),
     CommandDef("mode", "/mode <name>", "Switch mode (design, plan, build, test)"),
+    CommandDef("mode-provider", "/mode-provider <mode> <provider>", "Assign a provider to a mode"),
+    CommandDef("mode-model", "/mode-model <mode> <model|reset>", "Set or clear a mode-specific model"),
     CommandDef("providers", "/providers", "List available providers"),
     CommandDef("agent", "/agent <name> <prompt>", "Run a named agent"),
     CommandDef("agents", "/agents", "List available agents"),
@@ -99,6 +110,8 @@ class CommandHandler:
             "fast": self._cmd_fast,
             "model": self._cmd_model,
             "mode": self._cmd_mode,
+            "mode-provider": self._cmd_mode_provider,
+            "mode-model": self._cmd_mode_model,
             "help": self._cmd_help,
             "providers": self._cmd_providers,
             "agent": self._cmd_agent,
@@ -155,10 +168,17 @@ class CommandHandler:
 
     def _mount_progress_indicator(self, label: str):
         """Attach a live spinner row for long-running slash commands."""
+        provider = getattr(getattr(self.app, "state", None), "active_provider", "gemini")
+        title_source = f"command:{id(self)}:{datetime.datetime.now().timestamp()}"
+        starter = getattr(self.app, "start_title_activity", None)
+        if callable(starter):
+            try:
+                starter(title_source, provider, label)
+            except Exception:
+                title_source = None
         try:
             from .widgets.message import ChatHistory, ThinkingIndicator
 
-            provider = getattr(getattr(self.app, "state", None), "active_provider", "gemini")
             chat = self.app.screen.query_one(ChatHistory)
             indicator = ThinkingIndicator(provider=provider, label=label)
             chat.mount(indicator)
@@ -167,17 +187,47 @@ class CommandHandler:
                 screen._scroll_chat_end(chat, force=True)
             else:
                 chat.scroll_end(animate=False)
-            return indicator
+            return ProgressHandle(indicator=indicator, title_source=title_source, provider=provider)
         except Exception:
-            return None
+            return ProgressHandle(indicator=None, title_source=title_source, provider=provider)
 
-    @staticmethod
-    def _set_progress_indicator_label(indicator, label: str) -> None:
+    def _set_progress_indicator_label(self, handle, label: str) -> None:
         """Safely update a long-running command spinner label."""
-        if indicator is None:
+        if handle is None:
             return
+        updater = getattr(handle, "set_label", None)
+        if not callable(updater):
+            updater = getattr(getattr(handle, "indicator", None), "set_label", None)
+        if callable(updater):
+            try:
+                updater(label)
+            except Exception:
+                pass
+        activity_updater = getattr(self.app, "update_title_activity", None)
+        if callable(activity_updater) and getattr(handle, "title_source", None):
+            try:
+                activity_updater(handle.title_source, label, getattr(handle, "provider", None))
+            except Exception:
+                pass
+
+    def _clear_progress_indicator(self, handle) -> None:
+        """Remove a live spinner row if it was mounted."""
+        if handle is None:
+            return
+        stopper = getattr(self.app, "stop_title_activity", None)
+        title_source = getattr(handle, "title_source", None)
+        if callable(stopper) and title_source:
+            try:
+                stopper(title_source)
+            except Exception:
+                pass
         try:
-            indicator.set_label(label)
+            remover = getattr(handle, "remove", None)
+            if not callable(remover):
+                indicator = getattr(handle, "indicator", None)
+                remover = getattr(indicator, "remove", None)
+            if callable(remover):
+                remover()
         except Exception:
             pass
 
@@ -227,16 +277,6 @@ class CommandHandler:
                 provider_states[provider] = message or "done"
 
         return ""
-
-    @staticmethod
-    def _clear_progress_indicator(indicator) -> None:
-        """Remove a live spinner row if it was mounted."""
-        if indicator is None:
-            return
-        try:
-            indicator.remove()
-        except Exception:
-            pass
 
     def _record_history_message(self, role: str, content: str, token_count: int = 0) -> None:
         """Persist a message to history when the app exposes record_message()."""
@@ -288,12 +328,77 @@ class CommandHandler:
         return stored_role
 
     @staticmethod
-    def _mode_for_provider(provider: str) -> str:
+    def _configured_providers(cli_app) -> list[str]:
+        """Return configured providers from the live CLI app."""
+        return list(getattr(cli_app, "providers", {}).keys())
+
+    @staticmethod
+    def _mode_for_provider(cli_app, provider: str) -> str:
         """Return the default mode associated with a provider."""
+        if cli_app is not None and hasattr(cli_app, "config"):
+            mode_name = cli_app.config.get_default_mode_for_provider(provider)
+            if isinstance(mode_name, str) and mode_name in MODES:
+                return mode_name
         for mode_name, mode_cfg in MODES.items():
             if mode_cfg.get("provider") == provider:
                 return mode_name
         return "design"
+
+    @staticmethod
+    def _mode_provider(cli_app, mode_name: str) -> str:
+        """Return the configured provider for a mode."""
+        if cli_app is not None and hasattr(cli_app, "config"):
+            provider_name = cli_app.config.get_mode_provider(mode_name)
+            if isinstance(provider_name, str) and provider_name in PROVIDERS:
+                return provider_name
+        return MODES.get(mode_name, {}).get("provider", "gemini")
+
+    @classmethod
+    def _available_modes(cls, cli_app) -> tuple[str, ...]:
+        """Return modes available with the currently configured providers."""
+        configured = cls._configured_providers(cli_app)
+        if cli_app is not None and hasattr(cli_app, "config"):
+            modes = cli_app.config.get_available_modes(configured)
+            if isinstance(modes, tuple) and all(isinstance(mode, str) for mode in modes):
+                return tuple(mode for mode in modes if mode in MODES)
+        from .theme import get_available_modes
+        return get_available_modes(configured)
+
+    @staticmethod
+    def _apply_provider_model(app, provider_name: str, mode_name: str, *, fast: bool = False) -> str:
+        """Sync a provider object's active model from config and return the chosen model."""
+        cli_app = getattr(app, "cli_app", None)
+        if cli_app is None:
+            return ""
+        prov = cli_app.providers.get(provider_name)
+        if prov is None:
+            return ""
+        model = cli_app.config.get_model_for(provider_name, mode_name, fast=fast)
+        if isinstance(model, str) and model:
+            prov.config.model = model
+        return model or str(getattr(getattr(prov, "config", None), "model", "") or "")
+
+    def _set_active_mode_and_provider(self, provider_name: str, mode_name: str, *, fast: bool = False) -> None:
+        """Apply provider/mode selection to state, widgets, and model config."""
+        self._apply_provider_model(self.app, provider_name, mode_name, fast=fast)
+        self.app.state.set_provider(provider_name, mode_name)
+        self.app.state.fast_mode = fast
+        try:
+            screen = self.app.screen
+            screen._active_provider = provider_name
+            screen._mode = mode_name
+            inp = screen.query_one("InputFrame")
+            inp.active_provider = provider_name
+            inp.mode = mode_name
+        except Exception:
+            pass
+        try:
+            from .widgets.header import ProviderGhostTable
+            self.app.screen.query_one(ProviderGhostTable).set_active(provider_name)
+            self.app.screen.query_one(ProviderGhostTable).refresh()
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def _parse_compete_args(
@@ -447,10 +552,8 @@ class CommandHandler:
             self.app.notify(f"Provider '{provider_name}' not active")
             return
 
-        # Read fast_model from raw config data
         provider_data = cli_app.config.data.get("providers", {}).get(provider_name, {})
-        fast_model = provider_data.get("fast_model", "")
-        primary_model = provider_data.get("model", "")
+        fast_model = str(provider_data.get("fast_model", "") or "").strip()
 
         if not fast_model:
             self.app.notify(f"No fast_model configured for {provider_name}")
@@ -459,13 +562,21 @@ class CommandHandler:
         # Toggle
         state = self.app.state
         if state.fast_mode:
-            prov.config.model = primary_model
+            label = self._apply_provider_model(
+                self.app,
+                provider_name,
+                state.mode,
+                fast=False,
+            )
             state.fast_mode = False
-            label = primary_model
         else:
-            prov.config.model = fast_model
+            label = self._apply_provider_model(
+                self.app,
+                provider_name,
+                state.mode,
+                fast=True,
+            ) or fast_model
             state.fast_mode = True
-            label = fast_model
 
         # Update ghost table to show new model
         try:
@@ -479,12 +590,24 @@ class CommandHandler:
 
     def _cmd_model(self, args: list[str]) -> None:
         if not args:
-            self.app.notify("Usage: /model <provider>")
+            self.app.notify("Usage: /model <provider|reset>")
             return
         name = args[0].lower()
-        from .theme import PROVIDERS
         cli_app = getattr(self.app, "cli_app", None)
-        configured = list(getattr(cli_app, "providers", {}).keys())
+        configured = self._configured_providers(cli_app)
+        if name == "reset":
+            mode_name = self.app.state.mode
+            provider_name = self._mode_provider(cli_app, mode_name)
+            if configured and provider_name not in configured:
+                available_modes = self._available_modes(cli_app)
+                if not available_modes:
+                    self.app.notify("No configured providers available")
+                    return
+                mode_name = available_modes[0]
+                provider_name = self._mode_provider(cli_app, mode_name)
+            self._set_active_mode_and_provider(provider_name, mode_name, fast=False)
+            self.app.notify(f"Provider reset to {provider_name} for {mode_name} mode")
+            return
         if configured:
             if name not in configured:
                 self.app.notify(
@@ -494,25 +617,9 @@ class CommandHandler:
         elif name not in PROVIDERS:
             self.app.notify(f"Provider '{name}' not found. Available: {', '.join(PROVIDERS)}")
             return
-        pt = get_provider_theme(name)
-        self.app.state.set_provider(name, pt.default_mode)
-        # Reset fast mode on provider switch
-        self.app.state.fast_mode = False
-        try:
-            screen = self.app.screen
-            screen._active_provider = name
-            screen._mode = pt.default_mode
-            inp = screen.query_one("InputFrame")
-            inp.active_provider = name
-            inp.mode = pt.default_mode
-        except Exception:
-            pass
-        try:
-            from .widgets.header import ProviderGhostTable
-            self.app.screen.query_one(ProviderGhostTable).set_active(name)
-        except Exception:
-            pass
-        self.app.notify(f"Switched to {name}")
+        mode_name = self._mode_for_provider(cli_app, name)
+        self._set_active_mode_and_provider(name, mode_name, fast=False)
+        self.app.notify(f"Switched to {name} ({mode_name} mode)")
 
     def _cmd_mode(self, args: list[str]) -> None:
         if not args:
@@ -520,35 +627,89 @@ class CommandHandler:
             return
         mode_name = args[0].lower()
         cli_app = getattr(self.app, "cli_app", None)
-        configured = list(getattr(cli_app, "providers", {}).keys())
-        available_modes = get_available_modes(configured)
+        configured = self._configured_providers(cli_app)
+        available_modes = self._available_modes(cli_app)
         if mode_name not in MODES:
             self.app.notify(f"Mode '{mode_name}' not found. Available: {', '.join(available_modes)}")
             return
-        provider = MODES[mode_name]["provider"]
+        provider = self._mode_provider(cli_app, mode_name)
         if configured and provider not in configured:
             self.app.notify(
                 f"Mode '{mode_name}' is unavailable because provider '{provider}' is not configured. "
                 f"Available modes: {', '.join(available_modes)}"
             )
             return
-        self.app.state.set_provider(provider, mode_name)
-        self.app.state.fast_mode = False
-        try:
-            screen = self.app.screen
-            screen._active_provider = provider
-            screen._mode = mode_name
-            inp = screen.query_one("InputFrame")
-            inp.active_provider = provider
-            inp.mode = mode_name
-        except Exception:
-            pass
-        try:
-            from .widgets.header import ProviderGhostTable
-            self.app.screen.query_one(ProviderGhostTable).set_active(provider)
-        except Exception:
-            pass
+        self._set_active_mode_and_provider(provider, mode_name, fast=False)
         self.app.notify(f"Switched to {mode_name} mode")
+
+    def _cmd_mode_provider(self, args: list[str]) -> None:
+        if len(args) != 2:
+            self.app.notify("Usage: /mode-provider <mode> <provider>")
+            return
+        mode_name = args[0].lower()
+        provider_name = args[1].lower()
+        if mode_name not in MODES:
+            self.app.notify(f"Mode '{mode_name}' not found. Available: {', '.join(MODES)}")
+            return
+        if provider_name not in PROVIDERS:
+            self.app.notify(f"Provider '{provider_name}' not found. Available: {', '.join(PROVIDERS)}")
+            return
+
+        cli_app = getattr(self.app, "cli_app", None)
+        if cli_app is None:
+            self.app.notify("No app available")
+            return
+
+        modes = cli_app.config.data.setdefault("modes", {})
+        entry = modes.setdefault(mode_name, {})
+        entry["provider"] = provider_name
+        cli_app.config.save()
+
+        if self.app.state.mode == mode_name:
+            configured = self._configured_providers(cli_app)
+            if configured and provider_name in configured:
+                self._set_active_mode_and_provider(provider_name, mode_name, fast=False)
+                self.app.notify(f"{mode_name} mode now uses {provider_name}")
+                return
+
+        self.app.notify(f"Saved {mode_name} provider: {provider_name}")
+
+    def _cmd_mode_model(self, args: list[str]) -> None:
+        if len(args) < 2:
+            self.app.notify("Usage: /mode-model <mode> <model|reset>")
+            return
+        mode_name = args[0].lower()
+        if mode_name not in MODES:
+            self.app.notify(f"Mode '{mode_name}' not found. Available: {', '.join(MODES)}")
+            return
+
+        cli_app = getattr(self.app, "cli_app", None)
+        if cli_app is None:
+            self.app.notify("No app available")
+            return
+
+        raw_model = " ".join(args[1:]).strip()
+        modes = cli_app.config.data.setdefault("modes", {})
+        entry = modes.setdefault(mode_name, {})
+        if raw_model.lower() == "reset":
+            entry["model"] = ""
+            cli_app.config.save()
+            provider_name = self._mode_provider(cli_app, mode_name)
+            if self.app.state.mode == mode_name and self.app.state.active_provider == provider_name:
+                self._set_active_mode_and_provider(provider_name, mode_name, fast=False)
+            self.app.notify(f"Cleared {mode_name} mode model override")
+            return
+
+        entry["model"] = raw_model
+        cli_app.config.save()
+
+        provider_name = self._mode_provider(cli_app, mode_name)
+        if self.app.state.mode == mode_name and self.app.state.active_provider == provider_name:
+            self._set_active_mode_and_provider(provider_name, mode_name, fast=False)
+            self.app.notify(f"{mode_name} mode now uses {raw_model}")
+            return
+
+        self.app.notify(f"Saved {mode_name} mode model: {raw_model}")
 
     def _cmd_help(self, args: list[str]) -> None:
         lines = []
@@ -585,17 +746,25 @@ class CommandHandler:
             from .widgets.message import ChatHistory, ThinkingIndicator
 
             chat = self.app.screen.query_one(ChatHistory)
+            provider = getattr(getattr(self.app, "state", None), "active_provider", "gemini")
 
-            thinking = ThinkingIndicator(label)
+            thinking = ThinkingIndicator(provider=provider, label=label)
             chat.mount(thinking)
             chat.scroll_end(animate=False)
+            title_source = f"worker:{label}:{datetime.datetime.now().timestamp()}"
+            starter = getattr(self.app, "start_title_activity", None)
+            if callable(starter):
+                try:
+                    starter(title_source, provider, label)
+                except Exception:
+                    title_source = None
 
             def _worker():
                 try:
                     result = fn()
-                    self.app.call_from_thread(self._finish_worker, thinking, result)
+                    self.app.call_from_thread(self._finish_worker, thinking, result, title_source)
                 except Exception as e:
-                    self.app.call_from_thread(self._finish_worker, thinking, f"Error: {e}")
+                    self.app.call_from_thread(self._finish_worker, thinking, f"Error: {e}", title_source)
 
             self.app.screen.run_worker(_worker, thread=True, exclusive=False)
         except Exception:
@@ -606,8 +775,14 @@ class CommandHandler:
             except Exception as e:
                 self._post_system(f"Error: {e}")
 
-    def _finish_worker(self, thinking, result: str) -> None:
+    def _finish_worker(self, thinking, result: str, title_source: str | None = None) -> None:
         """Remove thinking indicator and post the result."""
+        stopper = getattr(self.app, "stop_title_activity", None)
+        if callable(stopper) and title_source:
+            try:
+                stopper(title_source)
+            except Exception:
+                pass
         try:
             thinking.remove()
         except Exception:
@@ -1071,8 +1246,10 @@ class CommandHandler:
         # Adopt this session as the current one and reset in-memory conversation state.
         self.app.adopt_session(session)
         self.app.state.reset_session(session_id=session["id"])
-        if session_provider in getattr(getattr(self.app, "cli_app", None), "providers", {}):
-            restored_mode = self._mode_for_provider(session_provider)
+        cli_app = getattr(self.app, "cli_app", None)
+        if session_provider in getattr(cli_app, "providers", {}):
+            restored_mode = self._mode_for_provider(cli_app, session_provider)
+            self._apply_provider_model(self.app, session_provider, restored_mode, fast=False)
             self.app.state.set_provider(session_provider, restored_mode)
             try:
                 self.app.screen._active_provider = session_provider

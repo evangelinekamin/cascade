@@ -7,10 +7,11 @@ from textual.message_pump import active_app
 
 from cascade.app import CascadeTUI
 from cascade.commands import CommandHandler
+from cascade.config import ConfigManager
 from cascade.hooks import HookEvent
 from cascade.history import BranchingSession, HistoryDB
 from cascade.screens.main import MainScreen, WelcomeHeader
-from cascade.state import CascadeState
+from cascade.state import CascadeState, ThinkingChanged
 from cascade.widgets.header import ProviderGhostTable
 from cascade.widgets.input_frame import InputFrame
 from cascade.widgets.message import ChatHistory
@@ -63,6 +64,36 @@ def test_record_message_persists_parent_chain_via_branching(tui_app):
     assert [msg["id"] for msg in path] == [messages[0]["id"], messages[1]["id"]]
 
 
+def test_tui_window_title_tracks_busy_activity(tui_app):
+    tui_app.console.set_window_title = MagicMock()
+    tui_app.state.active_provider = "claude"
+    tui_app.state.set_session_id("night-river")
+
+    assert tui_app._formatted_window_title() == "cascade . claude . night-river"
+
+    tui_app.start_title_activity("chat", "claude", "thinking")
+    busy_title = tui_app._formatted_window_title()
+    assert "cascade . claude . night-river" in busy_title
+    assert "thinking" in busy_title
+
+    tui_app.stop_title_activity("chat")
+    assert tui_app._formatted_window_title() == "cascade . claude . night-river"
+
+
+def test_tui_thinking_event_updates_window_title_state(tui_app):
+    tui_app.console.set_window_title = MagicMock()
+    tui_app.state.active_provider = "gemini"
+    tui_app.state.set_session_id("cedar-pulse")
+
+    tui_app.on_thinking_changed(ThinkingChanged("openrouter", True, "routing"))
+    title = tui_app._formatted_window_title()
+    assert "routing" in title
+    assert "openrouter" in title
+
+    tui_app.on_thinking_changed(ThinkingChanged("openrouter", False, ""))
+    assert tui_app._formatted_window_title() == "cascade . gemini . cedar-pulse"
+
+
 class _FakeApp:
     def __init__(self, db, screen, cli_app):
         self.db = db
@@ -78,6 +109,26 @@ class _FakeApp:
 
     def get_branching_session(self) -> BranchingSession:
         return BranchingSession(self.db, self._db_session["id"])
+
+    def notify(self, _text: str) -> None:
+        return None
+
+
+class _FakeCommandApp:
+    def __init__(self) -> None:
+        self.state = CascadeState()
+        self.screen = MagicMock()
+        self.screen.query_one.return_value = MagicMock()
+        self._title_events: list[tuple[str, str, str]] = []
+
+    def start_title_activity(self, source: str, provider: str, label: str) -> None:
+        self._title_events.append(("start", provider, label))
+
+    def update_title_activity(self, source: str, label: str, provider: str | None = None) -> None:
+        self._title_events.append(("update", provider or "", label))
+
+    def stop_title_activity(self, source: str) -> None:
+        self._title_events.append(("stop", "", source))
 
     def notify(self, _text: str) -> None:
         return None
@@ -246,6 +297,23 @@ def test_chat_history_mouse_scroll_stops_event():
     down_event.prevent_default.assert_called_once()
 
 
+def test_command_progress_handle_updates_title_activity():
+    app = _FakeCommandApp()
+    handler = CommandHandler(app)
+
+    handle = handler._mount_progress_indicator("claude queued | openai queued")
+    handler._set_progress_indicator_label(handle, "claude done | openai running")
+    handler._clear_progress_indicator(handle)
+
+    assert app._title_events[0] == ("start", app.state.active_provider, "claude queued | openai queued")
+    assert app._title_events[1] == (
+        "update",
+        app.state.active_provider,
+        "claude done | openai running",
+    )
+    assert app._title_events[2][0] == "stop"
+
+
 def test_export_preserves_cross_model_provider_labels(tmp_path, monkeypatch):
     db = HistoryDB(db_path=str(tmp_path / "export.db"))
     session = db.create_session(
@@ -325,6 +393,79 @@ def test_mode_command_rejects_mode_for_missing_provider():
         "Available modes: plan"
     )
     assert app.state.mode == "design"
+
+
+def test_mode_command_uses_configured_mode_provider_and_model(tmp_path):
+    config = ConfigManager(str(tmp_path / "config.yaml"))
+    config.data["modes"]["design"]["provider"] = "openrouter"
+    config.data["modes"]["design"]["model"] = "kwaipilot/kat-coder-pro-v2"
+
+    openrouter = MagicMock()
+    openrouter.config.model = "qwen/qwen3.5-9b"
+
+    app = MagicMock()
+    app.cli_app = MagicMock()
+    app.cli_app.providers = {"openrouter": openrouter}
+    app.cli_app.config = config
+    app.state = CascadeState()
+    app.screen = MagicMock()
+    app.notify = MagicMock()
+
+    handler = CommandHandler(app)
+    handler._cmd_mode(["design"])
+
+    assert app.state.active_provider == "openrouter"
+    assert app.state.mode == "design"
+    assert openrouter.config.model == "kwaipilot/kat-coder-pro-v2"
+    app.notify.assert_called_once_with("Switched to design mode")
+
+
+def test_mode_provider_command_applies_immediately_for_active_mode(tmp_path):
+    config = ConfigManager(str(tmp_path / "config.yaml"))
+    claude = MagicMock()
+    claude.config.model = "claude-sonnet-4-6"
+    openrouter = MagicMock()
+    openrouter.config.model = "qwen/qwen3.5-9b"
+
+    app = MagicMock()
+    app.cli_app = MagicMock()
+    app.cli_app.providers = {"claude": claude, "openrouter": openrouter}
+    app.cli_app.config = config
+    app.state = CascadeState()
+    app.state.set_provider("claude", "plan")
+    app.screen = MagicMock()
+    app.notify = MagicMock()
+
+    handler = CommandHandler(app)
+    handler._cmd_mode_provider(["plan", "openrouter"])
+
+    assert config.data["modes"]["plan"]["provider"] == "openrouter"
+    assert app.state.active_provider == "openrouter"
+    assert app.state.mode == "plan"
+    app.notify.assert_called_once_with("plan mode now uses openrouter")
+
+
+def test_mode_model_command_applies_immediately_for_active_mode(tmp_path):
+    config = ConfigManager(str(tmp_path / "config.yaml"))
+    config.data["modes"]["test"]["provider"] = "openrouter"
+    openrouter = MagicMock()
+    openrouter.config.model = "qwen/qwen3.5-9b"
+
+    app = MagicMock()
+    app.cli_app = MagicMock()
+    app.cli_app.providers = {"openrouter": openrouter}
+    app.cli_app.config = config
+    app.state = CascadeState()
+    app.state.set_provider("openrouter", "test")
+    app.screen = MagicMock()
+    app.notify = MagicMock()
+
+    handler = CommandHandler(app)
+    handler._cmd_mode_model(["test", "kwaipilot/kat-coder-pro-v2"])
+
+    assert config.data["modes"]["test"]["model"] == "kwaipilot/kat-coder-pro-v2"
+    assert openrouter.config.model == "kwaipilot/kat-coder-pro-v2"
+    app.notify.assert_called_once_with("test mode now uses kwaipilot/kat-coder-pro-v2")
 
 
 def test_cycle_mode_skips_unconfigured_providers():

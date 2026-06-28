@@ -21,11 +21,11 @@ def test_render_banner_default_word():
 
 
 def test_render_banner_contains_art_chars():
-    """Banner should contain box-drawing or block characters from figlet."""
+    """Banner should contain figlet art characters (slashes, pipes, underscores)."""
     result = render_banner()
     plain = result.plain
-    # ansi_shadow uses block chars and box-drawing chars
-    art_chars = set("\u2588\u2580\u2584\u2554\u2557\u255a\u255d\u2551\u2550\u2560\u2563\u256c\u2569\u2566")
+    # small font uses ASCII art chars like /, \, |, _
+    art_chars = set("/\\|_")
     has_art = any(ch in art_chars for ch in plain)
     assert has_art, "Banner should use figlet art characters"
 

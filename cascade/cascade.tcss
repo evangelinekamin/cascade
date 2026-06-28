@@ -33,7 +33,7 @@ Screen {
     dock: bottom;
     height: 1;
     width: 100%;
-    background: #121218;
+    background: #0d1117;
     padding: 0 2;
 }
 
@@ -100,6 +100,12 @@ ChatHistory {
     max-width: 10;
 }
 
+.gutter-separator {
+    width: 1;
+    height: auto;
+    padding: 0;
+}
+
 .message-body {
     width: 1fr;
     height: auto;
@@ -109,8 +115,13 @@ ChatHistory {
 .thinking-indicator {
     height: 1;
     width: 100%;
-    padding: 0 0 0 11;
+    padding: 0 0 0 12;
     color: #6e7681;
+}
+
+/* User message background tint */
+.user-message {
+    background: #111820;
 }
 
 /* ------------------------------------------------------------------ */
@@ -165,7 +176,7 @@ InputFrame {
     height: 3;
     width: 100%;
     border: round #b44dff;
-    background: #121218;
+    background: #0d1117;
     padding: 0 1;
     layout: horizontal;
 }
@@ -184,7 +195,7 @@ InputFrame {
 .main-input {
     width: 1fr;
     height: 1;
-    background: #121218;
+    background: #0d1117;
     border: none;
     padding: 0;
 }
@@ -227,7 +238,7 @@ StatusBar {
     height: auto;
     border: round #30363d;
     background: #121218;
-    padding: 1 2;
+    padding: 2 2;
     content-align: center middle;
 }
 

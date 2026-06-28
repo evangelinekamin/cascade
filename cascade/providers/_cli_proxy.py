@@ -262,6 +262,10 @@ class ClaudeEventHandler(CLIEventHandler):
 class CodexEventHandler(CLIEventHandler):
     """Handles Codex CLI ``--json`` events."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.thread_id: Optional[str] = None
+
     @staticmethod
     def _extract_text(item: dict) -> str:
         """Extract assistant text from a Codex item payload."""
@@ -286,6 +290,7 @@ class CodexEventHandler(CLIEventHandler):
         if ev_type == "thread.started":
             thread_id = event.get("thread_id")
             if isinstance(thread_id, str) and thread_id:
+                self.thread_id = thread_id
                 yield ("activity", f"thread: {thread_id[:12]}...")
 
         elif ev_type == "turn.started":

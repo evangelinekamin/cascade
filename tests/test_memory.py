@@ -71,6 +71,22 @@ def test_build_format():
     assert "1 sources" in built
 
 
+def test_build_reuses_cached_result_until_context_changes():
+    cb = ContextBuilder()
+    cb.add_text("alpha", label="first")
+
+    first = cb.build()
+    second = cb.build()
+
+    assert first is second
+
+    cb.add_text("beta", label="second")
+    third = cb.build()
+
+    assert third != first
+    assert "beta" in third
+
+
 def test_clear():
     cb = ContextBuilder()
     cb.add_text("data")

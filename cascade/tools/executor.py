@@ -3,8 +3,12 @@
 Provides a safe execution wrapper that catches exceptions and returns
 structured results for the tool calling loop. Supports hook lifecycle
 events for tool_call (pre-execution) and tool_result (post-execution).
+
+The ConcurrentToolExecutor extends this with async support: tools marked
+``concurrency_safe`` run in parallel, others get exclusive access.
 """
 
+import asyncio
 import json
 from typing import Any, Optional
 
@@ -34,6 +38,9 @@ class ToolExecutor:
 
     def has_tool(self, name: str) -> bool:
         return name in self._tools
+
+    def get_tool(self, name: str) -> Optional[ToolDef]:
+        return self._tools.get(name)
 
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """Execute a tool call and return the result as a JSON string.
@@ -97,3 +104,87 @@ class ToolExecutor:
             return json.dumps({"error": f"Invalid arguments for {tool_name}: {e}"})
         except Exception as e:
             return json.dumps({"error": f"Tool {tool_name} failed: {e}"})
+
+
+class ConcurrentToolExecutor(ToolExecutor):
+    """Tool executor with async concurrency control.
+
+    Concurrent-safe tools run in parallel. Non-concurrent tools acquire
+    an exclusive lock and wait for all running tools to finish first.
+    """
+
+    def __init__(
+        self,
+        tools: dict[str, ToolDef],
+        hook_runner: Optional[HookRunner] = None,
+    ):
+        super().__init__(tools, hook_runner)
+        self._exclusive_lock = asyncio.Lock()
+        self._running_count = 0
+        self._all_done = asyncio.Event()
+        self._all_done.set()
+
+    async def execute_async(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        """Execute a tool with concurrency control.
+
+        Concurrent tools run alongside each other. Non-concurrent tools
+        wait for all running tools to finish, then run exclusively.
+        """
+        tool = self._tools.get(tool_name)
+        if tool is None:
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+        if tool.concurrency_safe:
+            return await self._run_concurrent(tool_name, arguments)
+        return await self._run_exclusive(tool_name, arguments)
+
+    async def execute_batch(
+        self,
+        calls: list[tuple[str, dict[str, Any]]],
+    ) -> list[str]:
+        """Execute a batch of tool calls, parallelising where safe.
+
+        Concurrent calls run together; non-concurrent calls are serialised.
+        """
+        concurrent = []
+        sequential = []
+
+        for tool_name, args in calls:
+            tool = self._tools.get(tool_name)
+            if tool is not None and tool.concurrency_safe:
+                concurrent.append((tool_name, args))
+            else:
+                sequential.append((tool_name, args))
+
+        results: list[str] = []
+
+        # Run concurrent batch in parallel
+        if concurrent:
+            tasks = [self.execute_async(n, a) for n, a in concurrent]
+            results.extend(await asyncio.gather(*tasks))
+
+        # Run sequential tools one at a time
+        for tool_name, args in sequential:
+            results.append(await self.execute_async(tool_name, args))
+
+        return results
+
+    async def _run_concurrent(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        """Run a concurrent-safe tool without exclusive lock."""
+        self._running_count += 1
+        self._all_done.clear()
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self.execute, tool_name, arguments)
+        finally:
+            self._running_count -= 1
+            if self._running_count == 0:
+                self._all_done.set()
+
+    async def _run_exclusive(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        """Run a non-concurrent tool with exclusive access."""
+        async with self._exclusive_lock:
+            # Wait for all concurrent tools to finish
+            await self._all_done.wait()
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self.execute, tool_name, arguments)

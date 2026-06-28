@@ -25,6 +25,45 @@ def test_get_default_provider():
         assert default == "gemini"
 
 
+def test_mode_config_defaults_follow_builtin_mapping():
+    """Mode config should default to the builtin provider mapping."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        assert manager.get_mode_provider("design") == "gemini"
+        assert manager.get_mode_provider("plan") == "claude"
+        assert manager.get_mode_provider("build") == "openai"
+        assert manager.get_mode_provider("test") == "openrouter"
+
+
+def test_get_model_for_respects_mode_override():
+    """Mode-level model override should beat the provider default model."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        manager.data["modes"]["design"]["provider"] = "openrouter"
+        manager.data["modes"]["design"]["model"] = "kwaipilot/kat-coder-pro-v2"
+
+        assert manager.get_model_for("openrouter", "design") == "kwaipilot/kat-coder-pro-v2"
+        assert manager.get_model_for("openrouter", "test") == "qwen/qwen3.5-9b"
+
+
+def test_get_available_modes_uses_configured_mode_providers():
+    """Mode availability should follow configured mode providers, not hardcoded defaults."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        manager.data["modes"]["design"]["provider"] = "openrouter"
+        manager.data["modes"]["plan"]["provider"] = "openrouter"
+
+        available = manager.get_available_modes({"openrouter"})
+
+        assert available == ("design", "plan", "test")
+
+
 def test_env_var_resolution():
     """Test environment variable resolution."""
     import os

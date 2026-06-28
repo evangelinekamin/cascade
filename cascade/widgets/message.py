@@ -7,6 +7,8 @@ ThinkingIndicator -- braille spinner during provider processing
 
 import re
 import time
+from collections import OrderedDict
+from hashlib import md5
 
 from rich.text import Text
 from textual import events
@@ -15,7 +17,22 @@ from textual.widget import Widget
 from textual.app import ComposeResult
 from textual.widgets import Static
 
-from ..theme import PALETTE, get_accent, get_abbreviation
+from ..theme import PALETTE, get_accent, get_shimmer, get_abbreviation
+
+
+# ---------------------------------------------------------------------------
+# Markdown parse cache (LRU, keyed by content hash)
+# ---------------------------------------------------------------------------
+
+_MD_CACHE_MAX = 500
+_md_cache: OrderedDict[str, Text] = OrderedDict()
+
+# Fast-path: skip markdown parsing for content with no syntax markers
+_MD_SYNTAX_RE = re.compile(r"[#*`|>\[~_]|\n\n|\d+\. ")
+
+
+def _cache_key(content: str) -> str:
+    return md5(content.encode(), usedforsecurity=False).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -101,12 +118,36 @@ def _inline_format(text: str) -> Text:
 
 
 def render_content(content: str) -> Text:
-    """Render multi-line markdown content (prose only, no fenced blocks)."""
+    """Render multi-line markdown content (prose only, no fenced blocks).
+
+    Uses an LRU cache keyed by content hash and a fast-path that skips
+    parsing for plain text with no markdown syntax markers.
+    """
+    if not content:
+        return Text("")
+
+    # Fast-path: no markdown syntax detected
+    if not _MD_SYNTAX_RE.search(content):
+        return Text(content, style=PALETTE.text_primary)
+
+    # Check cache
+    key = _cache_key(content)
+    if key in _md_cache:
+        _md_cache.move_to_end(key)
+        return _md_cache[key].copy()
+
+    # Full parse
     result = Text()
     for i, line in enumerate(content.split("\n")):
         if i > 0:
             result.append("\n")
         result.append_text(_render_md_line(line))
+
+    # Store in cache with LRU eviction
+    _md_cache[key] = result.copy()
+    if len(_md_cache) > _MD_CACHE_MAX:
+        _md_cache.popitem(last=False)
+
     return result
 
 
@@ -115,7 +156,12 @@ def render_content(content: str) -> Text:
 # ---------------------------------------------------------------------------
 
 class ChatHistory(VerticalScroll):
-    """Scrollable container for all conversation messages."""
+    """Scrollable container with virtual widget pooling.
+
+    Caps mounted widgets at ``max_widgets``. When the limit is exceeded,
+    the oldest widgets are unmounted and their data stored in
+    ``_overflow`` for later export or scroll-back re-mount.
+    """
 
     DEFAULT_CSS = """
     ChatHistory {
@@ -125,6 +171,12 @@ class ChatHistory(VerticalScroll):
         background: #0d1117;
     }
     """
+
+    def __init__(self, max_widgets: int = 200, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._max_widgets = max_widgets
+        self._overflow: list[tuple[str, str]] = []  # (role, content) pairs
+        self._overflow_indicator: Static | None = None
 
     def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
         self.scroll_relative(y=-6, animate=False, force=True)
@@ -136,9 +188,57 @@ class ChatHistory(VerticalScroll):
         event.stop()
         event.prevent_default()
 
+    async def trim_overflow(self) -> None:
+        """Remove oldest widgets when exceeding the pool cap."""
+        children = list(self.children)
+        # Only trim MessageWidget instances (not ThinkingIndicator, StreamMessage)
+        msg_widgets = [c for c in children if isinstance(c, MessageWidget)]
+        excess = len(msg_widgets) - self._max_widgets
+        if excess <= 0:
+            return
+
+        for widget in msg_widgets[:excess]:
+            role = getattr(widget, "_role", "")
+            content = getattr(widget, "_content", "")
+            self._overflow.append((role, content))
+            await widget.remove()
+
+        # Show/update overflow indicator
+        count = len(self._overflow)
+        if self._overflow_indicator is None:
+            self._overflow_indicator = Static(
+                Text(f"  {count} earlier messages  ", style=f"dim {PALETTE.text_muted}"),
+                classes="overflow-indicator",
+            )
+            await self.mount(self._overflow_indicator, before=0)
+        else:
+            self._overflow_indicator.update(
+                Text(f"  {count} earlier messages  ", style=f"dim {PALETTE.text_muted}")
+            )
+
+    @property
+    def overflow_messages(self) -> list[tuple[str, str]]:
+        """Access unmounted messages for export/history."""
+        return list(self._overflow)
+
+
+class GutterSeparator(Static):
+    """Thin vertical hairline between gutter and message body."""
+
+    DEFAULT_CSS = """
+    GutterSeparator {
+        width: 1;
+        height: auto;
+        padding: 0;
+    }
+    """
+
+    def render(self) -> Text:
+        return Text("\u2502", style=f"dim {PALETTE.border_subtle}")
+
 
 class MessageWidget(Widget):
-    """A single message row: gutter label + body content."""
+    """A single message row: gutter label + separator + body content."""
 
     DEFAULT_CSS = """
     MessageWidget {
@@ -147,6 +247,9 @@ class MessageWidget(Widget):
         padding: 0 0 1 0;
         layout: horizontal;
     }
+    MessageWidget.user-message {
+        background: #111820;
+    }
     """
 
     def __init__(self, role: str, content: str, tokens: int = 0, **kwargs) -> None:
@@ -154,9 +257,12 @@ class MessageWidget(Widget):
         self._role = role
         self._content = content
         self._tokens = tokens
+        if role == "you":
+            self.add_class("user-message")
 
     def compose(self) -> ComposeResult:
         yield GutterLabel(self._role)
+        yield GutterSeparator()
         yield MessageBody(self._content)
 
 
@@ -216,7 +322,7 @@ class ThinkingIndicator(Static):
     ThinkingIndicator {
         height: 1;
         width: 100%;
-        padding: 0 0 0 11;
+        padding: 0 0 0 12;
     }
     """
 
@@ -246,14 +352,15 @@ class ThinkingIndicator(Static):
         self.refresh()
 
     def render(self) -> Text:
-        accent = get_accent(self._provider)
+        # Oscillate between accent and shimmer for smooth animation
+        color = get_accent(self._provider) if self._idx % 2 == 0 else get_shimmer(self._provider)
         ch = self.SPINNER_FRAMES[self._idx]
         elapsed = max(0, int(time.monotonic() - self._started_at))
         t = Text()
-        t.append(ch, style=f"bold {accent}")
+        t.append(ch, style=f"bold {color}")
         label = self._label.strip()
         if elapsed > 0:
-            t.append(f" {label} | {elapsed}s", style=f"dim {PALETTE.text_dim}")
+            t.append(f" {label}  {elapsed}s", style=f"dim {PALETTE.text_dim}")
         else:
             t.append(f" {label}", style=f"dim {PALETTE.text_dim}")
         return t

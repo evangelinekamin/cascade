@@ -191,7 +191,7 @@ class FramedInput(Widget):
         height: 3;
         width: 100%;
         border: round #b44dff;
-        background: #121218;
+        background: #0d1117;
         padding: 0 1;
         layout: horizontal;
     }
@@ -258,8 +258,8 @@ class ModeIndicator(Static):
         provider = MODES.get(self._mode, {"provider": "gemini"})["provider"]
         accent = get_accent(provider)
         t = Text()
-        t.append("\u25b6\u25b6 ", style=f"bold {accent}")
-        t.append(f"{self._mode} mode", style=f"bold {accent}")
-        t.append(" . ", style=f"dim {PALETTE.text_dim}")
-        t.append("shift+tab to cycle", style=f"dim {PALETTE.text_dim}")
+        t.append("\u2500\u2500\u2500 ", style=f"dim {PALETTE.text_muted}")
+        t.append(self._mode, style=f"bold {accent}")
+        t.append(" \u2500\u2500\u2500 ", style=f"dim {PALETTE.text_muted}")
+        t.append("shift+tab", style=f"dim {PALETTE.text_dim}")
         return t

@@ -1,10 +1,11 @@
 """OpenAI provider for GPT-4o, o1, o3, and Codex models."""
 
+import hashlib
 import json
 import os
 import re
 import shutil
-import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Iterator, TYPE_CHECKING
@@ -83,6 +84,15 @@ _SKIP_DIRS = {
     "venv",
 }
 
+_SYNTHETIC_CONTEXT_PREFIXES = (
+    "[Prior session context]",
+    "[Context from previous model interactions]",
+    "[Conversation summary]",
+    "[Response from ",
+)
+
+_FILENAME_INDEX_TTL_SECONDS = 30.0
+
 
 @register_provider("openai")
 class OpenAIProvider(BaseProvider):
@@ -93,6 +103,9 @@ class OpenAIProvider(BaseProvider):
         self.base_url = config.base_url or "https://api.openai.com/v1"
         self.client = httpx.Client(timeout=60.0)
         self._codex_bin = shutil.which("codex")
+        self._codex_sessions: dict[str, str] = {}
+        self._filename_index_cache: dict[str, tuple[float, dict[str, Path]]] = {}
+        self._line_count_cache: dict[str, tuple[int, int, int]] = {}
         self._use_oauth_cli = self._looks_like_jwt(config.api_key)
         self._use_cli_proxy = (
             self._use_oauth_cli
@@ -105,6 +118,10 @@ class OpenAIProvider(BaseProvider):
                 "CASCADE_OPENAI_ACTIVITY",
                 os.getenv("CASCADE_CODEX_ACTIVITY", default_activity),
             ).lower()
+            not in ("0", "false", "no", "off")
+        )
+        self._reuse_cli_sessions = (
+            os.getenv("CASCADE_CODEX_REUSE_SESSION", "1").lower()
             not in ("0", "false", "no", "off")
         )
 
@@ -196,13 +213,28 @@ class OpenAIProvider(BaseProvider):
         return None
 
     def _find_filename_match(self, filename: str, root: Path) -> Optional[Path]:
+        index = self._get_filename_index(root)
+        return index.get(filename)
+
+    def _get_filename_index(self, root: Path) -> dict[str, Path]:
+        root_key = str(root.resolve())
+        now = time.monotonic()
+        cached = self._filename_index_cache.get(root_key)
+        if cached is not None and (now - cached[0]) < _FILENAME_INDEX_TTL_SECONDS:
+            return cached[1]
+
+        index: dict[str, Path] = {}
         for current_root, dirnames, filenames in os.walk(root):
             dirnames[:] = [name for name in dirnames if name not in _SKIP_DIRS]
-            if filename in filenames:
+            for filename in filenames:
+                if filename in index:
+                    continue
                 path = Path(current_root, filename)
                 if path.is_file():
-                    return path
-        return None
+                    index[filename] = path
+
+        self._filename_index_cache[root_key] = (now, index)
+        return index
 
     def _resolve_referenced_files(self, messages: list[Message], workdir: str) -> list[Path]:
         root = Path(workdir).resolve()
@@ -238,13 +270,64 @@ class OpenAIProvider(BaseProvider):
 
         return resolved
 
-    @staticmethod
-    def _line_count(path: Path) -> int:
+    def _line_count(self, path: Path) -> int:
         try:
-            with path.open("r", encoding="utf-8", errors="ignore") as handle:
-                return sum(1 for _ in handle)
+            stat = path.stat()
         except Exception:
             return 0
+
+        cache_key = str(path.resolve())
+        cached = self._line_count_cache.get(cache_key)
+        if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+            return cached[2]
+
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                count = sum(1 for _ in handle)
+        except Exception:
+            return 0
+
+        self._line_count_cache[cache_key] = (stat.st_mtime_ns, stat.st_size, count)
+        return count
+
+    @staticmethod
+    def _focused_workspace_root() -> Path:
+        raw = os.getenv("CASCADE_CODEX_WORKSPACE_ROOT", "")
+        if raw:
+            root = Path(raw).expanduser()
+        else:
+            root = Path.home() / ".cache" / "cascade" / "codex-workspaces"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    @staticmethod
+    def _reset_workspace_dir(root: Path) -> None:
+        if root.exists():
+            shutil.rmtree(root)
+        root.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _relative_workspace_paths(source_root: Path, files: list[Path]) -> list[str]:
+        relative_paths: list[str] = []
+        for path in files:
+            try:
+                relative_paths.append(path.relative_to(source_root).as_posix())
+            except ValueError:
+                relative_paths.append(path.name)
+        return relative_paths
+
+    def _focused_workspace_key(self, source_root: Path, relative_paths: list[str]) -> str:
+        material = "\0".join(
+            ["focused", str(source_root), self.config.model, *relative_paths]
+        ).encode("utf-8")
+        return hashlib.sha1(material, usedforsecurity=False).hexdigest()
+
+    def _system_fingerprint(self, system: Optional[str]) -> str:
+        condensed = self._condense_system_for_cli(system or "")
+        if not condensed:
+            return "none"
+        digest = hashlib.sha1(condensed.encode("utf-8"), usedforsecurity=False).hexdigest()
+        return digest[:12]
 
     def _mirror_focused_files(
         self,
@@ -308,6 +391,41 @@ class OpenAIProvider(BaseProvider):
         )
         return "\n".join(note_lines) + "\n\n" + prompt
 
+    @staticmethod
+    def _has_synthetic_context(messages: list[Message]) -> bool:
+        for message in messages[:-1]:
+            content = str(message.get("content", "")).lstrip()
+            if any(content.startswith(prefix) for prefix in _SYNTHETIC_CONTEXT_PREFIXES):
+                return True
+        return False
+
+    def _build_resume_prompt(
+        self,
+        messages: list[Message],
+        system: Optional[str],
+        workspace_mode: str,
+        full_prompt: str,
+        session_id: str | None,
+    ) -> str:
+        if workspace_mode != "focused" or not session_id:
+            return full_prompt
+        if self._has_synthetic_context(messages):
+            return full_prompt
+
+        current_prompt = self._latest_user_prompt(messages).strip()
+        if not current_prompt:
+            return full_prompt
+
+        parts: list[str] = []
+        condensed = self._condense_system_for_cli(system or "")
+        if condensed:
+            parts.append(f"System instructions:\n{condensed}")
+        parts.append(
+            "You are continuing an existing Cascade Codex session in the same focused workspace."
+        )
+        parts.append(f"Current request:\n{current_prompt}")
+        return "\n\n".join(parts)
+
     @contextmanager
     def _cli_workspace(
         self,
@@ -316,26 +434,62 @@ class OpenAIProvider(BaseProvider):
     ):
         prompt = self._build_cli_prompt(messages, system)
         workdir = self.get_working_directory()
+        agentic = self._looks_agentic_request(self._latest_user_prompt(messages).lower(), system)
+        system_fingerprint = self._system_fingerprint(system)
         if self._should_use_repo_workspace(messages, system, workdir):
-            yield prompt, workdir, None
+            workspace_mode = "repo-write" if agentic else "repo-read"
+            session_key = (
+                f"{workspace_mode}:{Path(workdir).resolve()}:{self.config.model}:{system_fingerprint}"
+            )
+            yield prompt, workdir, workspace_mode, session_key
             return
 
         referenced_files = self._resolve_referenced_files(messages, workdir)
         prompt_lower = self._latest_user_prompt(messages).lower()
         if not referenced_files and any(hint in prompt_lower for hint in _REPO_SCOPE_HINTS):
-            yield prompt, workdir, None
+            workspace_mode = "repo-read"
+            session_key = (
+                f"{workspace_mode}:{Path(workdir).resolve()}:{self.config.model}:{system_fingerprint}"
+            )
+            yield prompt, workdir, workspace_mode, session_key
             return
 
         source_root = Path(workdir).resolve()
-        with tempfile.TemporaryDirectory(prefix="cascade-codex-") as scratch_dir:
-            scratch_root = Path(scratch_dir)
-            self._mirror_focused_files(source_root, scratch_root, referenced_files)
-            focused_prompt = self._augment_prompt_for_focused_workspace(
-                prompt,
-                referenced_files,
-                source_root,
-            )
-            yield focused_prompt, str(scratch_root), scratch_root
+        relative_paths = self._relative_workspace_paths(source_root, referenced_files)
+        workspace_key = self._focused_workspace_key(source_root, relative_paths)
+        scratch_root = self._focused_workspace_root() / workspace_key
+        self._reset_workspace_dir(scratch_root)
+        self._mirror_focused_files(source_root, scratch_root, referenced_files)
+        focused_prompt = self._augment_prompt_for_focused_workspace(
+            prompt,
+            referenced_files,
+            source_root,
+        )
+        session_key = f"focused:{workspace_key}:{system_fingerprint}"
+        yield focused_prompt, str(scratch_root), "focused", session_key
+
+    def _build_cli_cmd(
+        self,
+        prompt: str,
+        workdir: str,
+        workspace_mode: str,
+        session_id: str | None = None,
+    ) -> list[str]:
+        if session_id:
+            cmd = [self._codex_bin, "exec", "resume", session_id, "--json"]
+            if workspace_mode == "focused":
+                cmd.append("--skip-git-repo-check")
+        else:
+            cmd = [self._codex_bin, "exec", "--json", "--cd", workdir]
+            if workspace_mode == "focused":
+                cmd.extend(["--skip-git-repo-check", "--sandbox", "read-only"])
+            elif workspace_mode == "repo-write":
+                cmd.extend(["--sandbox", "workspace-write"])
+
+        if self.config.model:
+            cmd.extend(["--model", self.config.model])
+        cmd.append(prompt)
+        return cmd
 
     def _stream_via_cli(
         self,
@@ -347,26 +501,49 @@ class OpenAIProvider(BaseProvider):
             yield "Error: codex CLI not found in PATH for OAuth mode."
             return
 
-        with self._cli_workspace(messages, system) as (full_prompt, workdir, scratch_root):
-            cmd = [self._codex_bin, "exec", "--json", "--cd", workdir]
-            if scratch_root is not None:
-                cmd.extend(["--skip-git-repo-check", "--ephemeral", "--sandbox", "read-only"])
-            elif self._looks_agentic_request(self._latest_user_prompt(messages).lower(), system):
-                cmd.extend(["--sandbox", "workspace-write"])
-            if self.config.model:
-                cmd.extend(["--model", self.config.model])
-            cmd.append(full_prompt)
+        with self._cli_workspace(messages, system) as (full_prompt, workdir, workspace_mode, session_key):
+            attempts = 2 if self._reuse_cli_sessions else 1
+            for attempt in range(attempts):
+                session_id = (
+                    self._codex_sessions.get(session_key)
+                    if self._reuse_cli_sessions
+                    else None
+                )
+                prompt = self._build_resume_prompt(
+                    messages,
+                    system,
+                    workspace_mode,
+                    full_prompt,
+                    session_id,
+                )
+                cmd = self._build_cli_cmd(
+                    prompt,
+                    workdir,
+                    workspace_mode,
+                    session_id=session_id,
+                )
+                handler = CodexEventHandler()
+                cfg = CLIProxyConfig(
+                    binary=self._codex_bin,
+                    cli_name="codex",
+                    cmd_args=cmd,
+                    cwd=workdir,
+                )
+                try:
+                    yield from stream_cli_proxy(cfg, handler, self._emit_activity)
+                except RuntimeError:
+                    if session_id and attempt == 0 and not handler.saw_text:
+                        self._codex_sessions.pop(session_key, None)
+                        continue
+                    raise
 
-            handler = CodexEventHandler()
-            cfg = CLIProxyConfig(
-                binary=self._codex_bin,
-                cli_name="codex",
-                cmd_args=cmd,
-                cwd=workdir,
-            )
-            yield from stream_cli_proxy(cfg, handler, self._emit_activity)
-            if handler.last_usage:
-                self._last_usage = handler.last_usage
+                if handler.thread_id:
+                    self._codex_sessions[session_key] = handler.thread_id
+                elif session_id:
+                    self._codex_sessions.setdefault(session_key, session_id)
+                if handler.last_usage:
+                    self._last_usage = handler.last_usage
+                return
 
     def ask(self, messages: list[Message], system: Optional[str] = None) -> str:
         """Get a complete response from OpenAI."""
@@ -375,7 +552,7 @@ class OpenAIProvider(BaseProvider):
     def stream(self, messages: list[Message], system: Optional[str] = None) -> Iterator[str]:
         """Stream tokens from OpenAI."""
         self._last_usage = None
-        self._last_activity = None
+        self.reset_activity_state()
         if self._use_cli_proxy:
             yield from self._filter_activity(self._stream_via_cli(messages, system))
             return

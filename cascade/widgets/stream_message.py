@@ -12,7 +12,7 @@ from textual.widget import Widget
 from textual.app import ComposeResult
 from textual.widgets import Static
 
-from .message import render_content, GutterLabel
+from .message import render_content, GutterLabel, GutterSeparator
 from .code_block import CodeBlock
 
 
@@ -61,6 +61,7 @@ class StreamMessage(Widget):
 
     def compose(self) -> ComposeResult:
         yield GutterLabel(self._provider)
+        yield GutterSeparator()
         with Vertical(classes="stream-body"):
             self._prose_widget = _ProseBody("")
             yield self._prose_widget

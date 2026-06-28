@@ -42,7 +42,7 @@ class CodeBlock(Static):
             syntax = Syntax(
                 self._code or "",
                 self._language or "text",
-                theme="monokai",
+                theme="native",
                 line_numbers=True,
                 word_wrap=False,
                 background_color=PALETTE.code_bg,
@@ -51,14 +51,10 @@ class CodeBlock(Static):
             title = Text()
             title.append(f" {(self._language or 'text').upper()} ", style=f"bold {accent}")
 
-            subtitle = Text(" copy ", style=f"dim {PALETTE.text_dim}")
-
             return Panel(
                 syntax,
                 title=title,
                 title_align="left",
-                subtitle=subtitle,
-                subtitle_align="right",
                 border_style=PALETTE.border,
                 background=PALETTE.code_bg,
                 padding=(0, 1),

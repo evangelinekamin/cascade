@@ -9,6 +9,7 @@ from .events import HookEvent
 from .context import HookContext, HookResult
 from .runner import HookDefinition, HookRunner, load_python_hook
 from .loader import load_hooks_from_config
+from .matchers import ToolMatcher, compile_matcher, matches_any
 
 __all__ = [
     "HookEvent",
@@ -18,4 +19,7 @@ __all__ = [
     "HookRunner",
     "load_hooks_from_config",
     "load_python_hook",
+    "ToolMatcher",
+    "compile_matcher",
+    "matches_any",
 ]

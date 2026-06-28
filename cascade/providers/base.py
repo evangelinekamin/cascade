@@ -54,6 +54,7 @@ class BaseProvider(ABC):
         self.name = self.__class__.__name__
         self._last_usage: Optional[tuple[int, int]] = None
         self._last_activity: Optional[str] = None
+        self._last_activity_key: Optional[str] = None
         self._emit_activity: bool = False
         self._workdir_override: Optional[str] = None
 
@@ -73,6 +74,11 @@ class BaseProvider(ABC):
             return None
         return f"{self._ACTIVITY_PREFIX}{message}"
 
+    def reset_activity_state(self) -> None:
+        """Clear cached activity so duplicate suppression is per-request."""
+        self._last_activity = None
+        self._last_activity_key = None
+
     def get_working_directory(self) -> str:
         """Return the provider's effective working directory."""
         return self._workdir_override or os.getcwd()
@@ -91,7 +97,12 @@ class BaseProvider(ABC):
         """Strip activity prefix messages from stream, storing them for TUI access."""
         for chunk in chunks:
             if isinstance(chunk, str) and chunk.startswith(self._ACTIVITY_PREFIX):
-                self._last_activity = chunk[len(self._ACTIVITY_PREFIX):].strip()
+                activity = chunk[len(self._ACTIVITY_PREFIX):].strip()
+                activity_key = " ".join(activity.split())
+                if activity_key and activity_key == self._last_activity_key:
+                    continue
+                self._last_activity = activity_key or activity
+                self._last_activity_key = activity_key or None
                 continue
             yield chunk
 
