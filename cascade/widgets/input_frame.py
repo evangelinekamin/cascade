@@ -190,7 +190,7 @@ class FramedInput(Widget):
     FramedInput {
         height: 3;
         width: 100%;
-        border: round #b44dff;
+        border: solid #b44dff;
         background: #0d1117;
         padding: 0 1;
         layout: horizontal;
@@ -216,7 +216,7 @@ class FramedInput(Widget):
 
     def _apply_accent(self) -> None:
         accent = get_accent(self._provider)
-        self.styles.border = ("round", accent)
+        self.styles.border = ("solid", accent)
 
         self.border_title = Text(f" {self._provider} ", style=f"bold {accent}")
 

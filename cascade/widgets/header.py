@@ -37,9 +37,8 @@ class WelcomeHeader(Widget):
 
     def compose(self) -> ComposeResult:
         yield Static(render_banner(), id="banner")
-        count = len(self._providers) if self._providers else len(PROVIDERS)
         yield Static(
-            f"v{self._version} . {count} providers active",
+            f"v{self._version}  ·  READY",
             id="version_line",
         )
         yield ProviderGhostTable(
@@ -82,40 +81,33 @@ class ProviderGhostTable(Static):
     def render(self) -> Text:
         col_name = 14
         col_model = 26
-
         result = Text()
+
+        def append_row(name: str, model: str, is_active: bool, accent: str) -> None:
+            if is_active:
+                result.append("  \u25cf ", style=f"bold {accent}")
+                result.append(name.ljust(col_name), style=f"bold {accent}")
+                result.append(model.ljust(col_model), style=PALETTE.text_primary)
+                result.append("active", style=f"dim {accent}")
+            else:
+                result.append("    ")
+                result.append(name.ljust(col_name), style=PALETTE.text_dim)
+                result.append(model, style=PALETTE.text_dim)
+            result.append("\n")
 
         if not self._providers:
             for name in sorted(PROVIDERS.keys()):
-                pt = get_provider_theme(name)
                 is_active = name == self._active_provider
-                if is_active:
-                    result.append("  \u25cf ", style=f"bold {pt.accent}")
-                    result.append(name.ljust(col_name), style=f"bold {pt.accent}")
-                    result.append("-".ljust(col_model), style=PALETTE.text_primary)
-                    result.append("active", style=f"dim {pt.accent}")
-                else:
-                    result.append("    ")
-                    result.append(name.ljust(col_name), style=f"dim {PALETTE.text_muted}")
-                    result.append("\u00b7", style=f"dim {PALETTE.text_muted}")
-                result.append("\n")
+                append_row(
+                    name, "-" if is_active else "", is_active,
+                    get_provider_theme(name).accent,
+                )
             return result
 
         for name in sorted(self._providers.keys()):
             prov = self._providers[name]
             model = str(getattr(getattr(prov, "config", None), "model", "?") or "?")
             is_active = name == self._active_provider
-            pt = get_provider_theme(name)
-
-            if is_active:
-                result.append("  \u25cf ", style=f"bold {pt.accent}")
-                result.append(name.ljust(col_name), style=f"bold {pt.accent}")
-                result.append(model.ljust(col_model), style=PALETTE.text_primary)
-                result.append("active", style=f"dim {pt.accent}")
-            else:
-                result.append("    ")
-                result.append(name.ljust(col_name), style=f"dim {PALETTE.text_muted}")
-                result.append("\u00b7", style=f"dim {PALETTE.text_muted}")
-            result.append("\n")
+            append_row(name, model, is_active, get_provider_theme(name).accent)
 
         return result
