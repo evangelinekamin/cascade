@@ -29,6 +29,11 @@ class Palette:
     text_dim: str = "#6e7681"
     text_muted: str = "#363648"
 
+    # Logo wordmark (vertical gradient: light aqua -> deep blue),
+    # from the "Cascade Logo (Blue)" design.
+    logo_top: str = "#a5e8f0"
+    logo_bottom: str = "#1e4fa8"
+
     # Functional
     cyan: str = "#00d4e5"
     green: str = "#34d399"

@@ -175,14 +175,14 @@ InputFrame {
 .input-area {
     height: 3;
     width: 100%;
-    border: round #b44dff;
+    border: solid #b44dff;
     background: #0d1117;
     padding: 0 1;
     layout: horizontal;
 }
 
 .input-area:focus-within {
-    border: round #b44dff;
+    border: solid #b44dff;
 }
 
 .prompt-char {
