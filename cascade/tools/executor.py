@@ -4,12 +4,13 @@ Provides a safe execution wrapper that catches exceptions and returns
 structured results for the tool calling loop. Supports hook lifecycle
 events for tool_call (pre-execution) and tool_result (post-execution).
 
-The ConcurrentToolExecutor extends this with async support: tools marked
-``concurrency_safe`` run in parallel, others get exclusive access.
+The ConcurrentToolExecutor extends this with batch parallelism: tools marked
+``concurrency_safe`` run together in a thread pool, while every other call is a
+serialisation barrier. Results are always returned in request order.
 """
 
-import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from .schema import ToolDef
@@ -106,85 +107,68 @@ class ToolExecutor:
             return json.dumps({"error": f"Tool {tool_name} failed: {e}"})
 
 
-class ConcurrentToolExecutor(ToolExecutor):
-    """Tool executor with async concurrency control.
+Call = tuple[str, dict[str, Any]]
 
-    Concurrent-safe tools run in parallel. Non-concurrent tools acquire
-    an exclusive lock and wait for all running tools to finish first.
+
+class ConcurrentToolExecutor(ToolExecutor):
+    """Run a batch of tool calls, overlapping the concurrency-safe ones.
+
+    Maximal runs of consecutive ``concurrency_safe`` calls execute together in
+    a thread pool. Every other call is a serialisation barrier: it runs alone,
+    after all preceding calls have finished and before any following call
+    starts. Results are returned in request order, so callers can zip them back
+    against the calls they submitted.
+
+    Single-call execution and the full hook lifecycle are inherited unchanged
+    from ToolExecutor; this subclass only decides what is allowed to overlap.
     """
 
     def __init__(
         self,
         tools: dict[str, ToolDef],
         hook_runner: Optional[HookRunner] = None,
+        max_workers: Optional[int] = None,
     ):
         super().__init__(tools, hook_runner)
-        self._exclusive_lock = asyncio.Lock()
-        self._running_count = 0
-        self._all_done = asyncio.Event()
-        self._all_done.set()
+        self._max_workers = max_workers
 
-    async def execute_async(self, tool_name: str, arguments: dict[str, Any]) -> str:
-        """Execute a tool with concurrency control.
+    def execute_batch(self, calls: list[Call]) -> list[str]:
+        """Execute *calls* in request order, overlapping safe runs.
 
-        Concurrent tools run alongside each other. Non-concurrent tools
-        wait for all running tools to finish, then run exclusively.
+        Args:
+            calls: Ordered ``(tool_name, arguments)`` pairs to execute.
+
+        Returns:
+            JSON-encoded result strings aligned one-to-one with *calls*.
         """
-        tool = self._tools.get(tool_name)
-        if tool is None:
-            return json.dumps({"error": f"Unknown tool: {tool_name}"})
-
-        if tool.concurrency_safe:
-            return await self._run_concurrent(tool_name, arguments)
-        return await self._run_exclusive(tool_name, arguments)
-
-    async def execute_batch(
-        self,
-        calls: list[tuple[str, dict[str, Any]]],
-    ) -> list[str]:
-        """Execute a batch of tool calls, parallelising where safe.
-
-        Concurrent calls run together; non-concurrent calls are serialised.
-        """
-        concurrent = []
-        sequential = []
-
-        for tool_name, args in calls:
-            tool = self._tools.get(tool_name)
-            if tool is not None and tool.concurrency_safe:
-                concurrent.append((tool_name, args))
-            else:
-                sequential.append((tool_name, args))
-
         results: list[str] = []
+        segment: list[Call] = []
 
-        # Run concurrent batch in parallel
-        if concurrent:
-            tasks = [self.execute_async(n, a) for n, a in concurrent]
-            results.extend(await asyncio.gather(*tasks))
+        for tool_name, arguments in calls:
+            if self._is_concurrency_safe(tool_name):
+                segment.append((tool_name, arguments))
+                continue
+            # A non-safe call is a barrier: flush pending safe calls, then run
+            # this one exclusively before any later call is considered.
+            results.extend(self._run_parallel(segment))
+            segment = []
+            results.append(self.execute(tool_name, arguments))
 
-        # Run sequential tools one at a time
-        for tool_name, args in sequential:
-            results.append(await self.execute_async(tool_name, args))
-
+        results.extend(self._run_parallel(segment))
         return results
 
-    async def _run_concurrent(self, tool_name: str, arguments: dict[str, Any]) -> str:
-        """Run a concurrent-safe tool without exclusive lock."""
-        self._running_count += 1
-        self._all_done.clear()
-        try:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self.execute, tool_name, arguments)
-        finally:
-            self._running_count -= 1
-            if self._running_count == 0:
-                self._all_done.set()
+    def _is_concurrency_safe(self, tool_name: str) -> bool:
+        tool = self._tools.get(tool_name)
+        return tool is not None and tool.concurrency_safe
 
-    async def _run_exclusive(self, tool_name: str, arguments: dict[str, Any]) -> str:
-        """Run a non-concurrent tool with exclusive access."""
-        async with self._exclusive_lock:
-            # Wait for all concurrent tools to finish
-            await self._all_done.wait()
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self.execute, tool_name, arguments)
+    def _run_parallel(self, calls: list[Call]) -> list[str]:
+        """Run a run of concurrency-safe calls together, preserving order."""
+        if not calls:
+            return []
+        if len(calls) == 1:
+            tool_name, arguments = calls[0]
+            return [self.execute(tool_name, arguments)]
+
+        workers = min(len(calls), self._max_workers or len(calls))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return list(pool.map(lambda call: self.execute(*call), calls))

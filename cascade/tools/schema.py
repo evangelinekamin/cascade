@@ -25,7 +25,9 @@ class ToolDef:
 
     Tools with ``is_concurrent=True`` may execute in parallel with other
     concurrent tools. Non-concurrent tools get exclusive access (serialised).
-    Read-only tools should set ``is_read_only=True`` (implies concurrent).
+    Read-only tools should set ``is_read_only=True`` (also treated as safe to
+    parallelise). ``is_destructive=True`` forces exclusive execution even when
+    the other flags would otherwise allow overlap.
     """
 
     name: str
@@ -38,7 +40,14 @@ class ToolDef:
 
     @property
     def concurrency_safe(self) -> bool:
-        """Whether this tool can safely run alongside others."""
+        """Whether this tool can safely run alongside others.
+
+        A tool is safe to parallelise when it is read-only or explicitly
+        marked concurrent. The destructive flag always wins and forces
+        exclusive execution, regardless of the other flags.
+        """
+        if self.is_destructive:
+            return False
         return self.is_concurrent or self.is_read_only
 
 
@@ -78,6 +87,10 @@ def callable_to_tool_def(
     name: str,
     fn: Callable,
     description: str = "",
+    *,
+    read_only: bool = False,
+    concurrent: bool = False,
+    destructive: bool = False,
 ) -> ToolDef:
     """Build a ToolDef from a Python callable using its signature and docstring.
 
@@ -85,9 +98,16 @@ def callable_to_tool_def(
         name: Tool name for the registry.
         fn: The callable to introspect.
         description: Fallback description if the function has no docstring.
+        read_only: Tool only reads state, so it is safe to run in parallel.
+        concurrent: Tool is explicitly safe to run alongside other concurrent
+            tools even though it is not strictly read-only.
+        destructive: Tool mutates state in a way that must never overlap; this
+            forces exclusive execution and wins over the other two flags.
 
     Returns:
         A ToolDef with JSON Schema parameters derived from type annotations.
+        The concurrency flags default to safe (not concurrency-safe), so
+        existing callers are unaffected.
     """
     sig = inspect.signature(fn)
     doc = inspect.getdoc(fn) or description
@@ -129,6 +149,9 @@ def callable_to_tool_def(
         description=doc,
         parameters=parameters,
         handler=fn,
+        is_concurrent=concurrent,
+        is_read_only=read_only,
+        is_destructive=destructive,
     )
 
 

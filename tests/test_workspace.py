@@ -29,6 +29,16 @@ def test_workspace_tools_build_exposes_four_tools():
         assert set(tools) == {"read_file", "write_file", "append_file", "list_files"}
 
 
+def test_workspace_read_tools_are_concurrency_safe():
+    with tempfile.TemporaryDirectory() as root:
+        tools = WorkspaceTools(root).build()
+        # Reads can overlap; mutations must stay exclusive.
+        assert tools["read_file"].concurrency_safe is True
+        assert tools["list_files"].concurrency_safe is True
+        assert tools["write_file"].concurrency_safe is False
+        assert tools["append_file"].concurrency_safe is False
+
+
 def test_run_agent_api_provider_uses_workspace_tools():
     provider = MagicMock()
     provider._use_cli_proxy = False

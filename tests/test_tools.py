@@ -1,10 +1,12 @@
 """Tests for the tool system: schema, executor, and reflection."""
 
 import json
+import threading
+import time
 
 
 from cascade.tools.schema import callable_to_tool_def, _annotation_to_schema
-from cascade.tools.executor import ToolExecutor
+from cascade.tools.executor import ToolExecutor, ConcurrentToolExecutor
 from cascade.tools.reflection import (
     reflect,
     get_reflection_log,
@@ -309,3 +311,188 @@ class TestReflectionPlugin:
         tools = plugin.get_tools()
         assert "reflect" in tools
         assert callable(tools["reflect"])
+
+
+class TestConcurrencySafe:
+    """Tests for the ToolDef concurrency classification."""
+
+    def _tool(self, **flags):
+        def fn(x: str) -> str:
+            return x
+
+        return callable_to_tool_def("fn", fn, **flags)
+
+    def test_read_only_is_concurrency_safe(self):
+        td = self._tool(read_only=True)
+        assert td.is_read_only is True
+        assert td.concurrency_safe is True
+
+    def test_explicit_concurrent_is_concurrency_safe(self):
+        td = self._tool(concurrent=True)
+        assert td.is_concurrent is True
+        assert td.concurrency_safe is True
+
+    def test_default_tool_is_not_concurrency_safe(self):
+        td = self._tool()
+        assert td.concurrency_safe is False
+
+    def test_destructive_tool_is_not_concurrency_safe(self):
+        td = self._tool(destructive=True)
+        assert td.is_destructive is True
+        assert td.concurrency_safe is False
+
+    def test_destructive_overrides_read_only(self):
+        td = self._tool(read_only=True, destructive=True)
+        assert td.concurrency_safe is False
+
+    def test_flags_default_off_for_existing_callers(self):
+        td = self._tool()
+        assert (td.is_read_only, td.is_concurrent, td.is_destructive) == (False, False, False)
+
+
+class _ConcurrencyProbe:
+    """Records the peak number of overlapping tool invocations."""
+
+    def __init__(self, hold: float = 0.05):
+        self._lock = threading.Lock()
+        self._hold = hold
+        self.active = 0
+        self.max_active = 0
+
+    def run(self, tag: str) -> str:
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(self._hold)
+            return tag
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
+class TestConcurrentToolExecutor:
+    """Tests for batch execution with concurrency control."""
+
+    @staticmethod
+    def _results(raw: list[str]) -> list:
+        return [json.loads(r).get("result", json.loads(r)) for r in raw]
+
+    def test_safe_calls_run_in_parallel(self):
+        probe = _ConcurrencyProbe(hold=0.05)
+
+        def read(tag: str) -> str:
+            return probe.run(tag)
+
+        tools = {"read": callable_to_tool_def("read", read, read_only=True)}
+        executor = ConcurrentToolExecutor(tools)
+        calls = [("read", {"tag": t}) for t in ("a", "b", "c")]
+
+        results = executor.execute_batch(calls)
+
+        assert self._results(results) == ["a", "b", "c"]
+        # At least two read-only calls were inside the tool at the same time.
+        assert probe.max_active >= 2
+
+    def test_unsafe_calls_are_serialised(self):
+        probe = _ConcurrencyProbe(hold=0.02)
+
+        def write(tag: str) -> str:
+            return probe.run(tag)
+
+        tools = {"write": callable_to_tool_def("write", write)}
+        executor = ConcurrentToolExecutor(tools)
+        calls = [("write", {"tag": t}) for t in ("a", "b", "c")]
+
+        results = executor.execute_batch(calls)
+
+        assert self._results(results) == ["a", "b", "c"]
+        # Mutating calls never overlapped.
+        assert probe.max_active == 1
+
+    def test_mixed_batch_preserves_request_order(self):
+        def read(x: str) -> str:
+            return f"r:{x}"
+
+        def write(x: str) -> str:
+            return f"w:{x}"
+
+        tools = {
+            "read": callable_to_tool_def("read", read, read_only=True),
+            "write": callable_to_tool_def("write", write),
+        }
+        executor = ConcurrentToolExecutor(tools)
+        calls = [
+            ("read", {"x": "1"}),
+            ("read", {"x": "2"}),
+            ("write", {"x": "3"}),
+            ("read", {"x": "4"}),
+        ]
+
+        results = self._results(executor.execute_batch(calls))
+
+        assert results == ["r:1", "r:2", "w:3", "r:4"]
+
+    def test_unsafe_call_is_an_ordering_barrier(self):
+        # The write must be ordered after the first read and before the second,
+        # so the reads observe state from before and after the mutation.
+        state = {"v": "initial"}
+
+        def read() -> str:
+            return state["v"]
+
+        def write(value: str) -> bool:
+            state["v"] = value
+            return True
+
+        tools = {
+            "read": callable_to_tool_def("read", read, read_only=True),
+            "write": callable_to_tool_def("write", write),
+        }
+        executor = ConcurrentToolExecutor(tools)
+        calls = [
+            ("read", {}),
+            ("write", {"value": "updated"}),
+            ("read", {}),
+        ]
+
+        results = self._results(executor.execute_batch(calls))
+
+        assert results == ["initial", True, "updated"]
+
+    def test_unknown_tool_returns_error_in_its_slot(self):
+        def read(x: str) -> str:
+            return x
+
+        tools = {"read": callable_to_tool_def("read", read, read_only=True)}
+        executor = ConcurrentToolExecutor(tools)
+        calls = [("read", {"x": "ok"}), ("missing", {}), ("read", {"x": "fine"})]
+
+        results = [json.loads(r) for r in executor.execute_batch(calls)]
+
+        assert results[0]["result"] == "ok"
+        assert "Unknown tool" in results[1]["error"]
+        assert results[2]["result"] == "fine"
+
+    def test_batch_reuses_hook_lifecycle(self):
+        from cascade.hooks import HookEvent, HookDefinition, HookResult, HookRunner
+
+        def read(x: str) -> str:
+            return x
+
+        def blocker(ctx):
+            return HookResult(block=True, reason="Dangerous")
+
+        tools = {"read": callable_to_tool_def("read", read, read_only=True)}
+        runner = HookRunner(
+            hooks=(HookDefinition(name="b", event=HookEvent.TOOL_CALL, handler=blocker),),
+        )
+        executor = ConcurrentToolExecutor(tools, hook_runner=runner)
+
+        results = [json.loads(r) for r in executor.execute_batch([("read", {"x": "a"})])]
+
+        assert "blocked" in results[0]["error"].lower()
+
+    def test_empty_batch_returns_empty_list(self):
+        executor = ConcurrentToolExecutor({})
+        assert executor.execute_batch([]) == []

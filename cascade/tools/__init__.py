@@ -4,7 +4,7 @@ Builds a unified tool registry from all registered plugins.
 """
 
 from .schema import ToolDef, callable_to_tool_def
-from .executor import ToolExecutor
+from .executor import ToolExecutor, ConcurrentToolExecutor
 
 
 def build_tool_registry() -> dict[str, ToolDef]:
@@ -25,5 +25,6 @@ __all__ = [
     "ToolDef",
     "callable_to_tool_def",
     "ToolExecutor",
+    "ConcurrentToolExecutor",
     "build_tool_registry",
 ]

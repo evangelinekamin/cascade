@@ -25,10 +25,14 @@ class WorkspaceTools:
     def build(self) -> dict[str, ToolDef]:
         description = "Read, write, append, and list files inside the isolated coding worktree"
         return {
-            "read_file": callable_to_tool_def("read_file", self.read_file, description=description),
+            "read_file": callable_to_tool_def(
+                "read_file", self.read_file, description=description, read_only=True,
+            ),
             "write_file": callable_to_tool_def("write_file", self.write_file, description=description),
             "append_file": callable_to_tool_def("append_file", self.append_file, description=description),
-            "list_files": callable_to_tool_def("list_files", self.list_files, description=description),
+            "list_files": callable_to_tool_def(
+                "list_files", self.list_files, description=description, read_only=True,
+            ),
         }
 
     def _resolve(self, path: str) -> Path:
