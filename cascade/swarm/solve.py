@@ -42,6 +42,7 @@ class SolveResult:
     diff_stat: str = ""
     diff_excerpt: str = ""
     changed_files: tuple[str, ...] = ()
+    models_used: tuple[str, ...] = ()
     error: str = ""
 
 
@@ -79,6 +80,8 @@ def run_solve(
     provider_name: Optional[str] = None,
     *,
     max_iterations: int = 3,
+    escalate: bool = True,
+    escalate_after: int = 1,
     timeout: int = 300,
     on_progress: ProgressCallback = None,
 ) -> SolveResult:
@@ -88,6 +91,10 @@ def run_solve(
     runs inside that worktree each iteration, and failures are fed back until the
     tests pass or ``max_iterations`` is reached. The worktree is left in place so
     its diff can be inspected; the caller's working tree is untouched.
+
+    When ``escalate`` is set, the first ``escalate_after`` iteration(s) run on the
+    provider's fast (bulk) model and later iterations escalate to its full
+    (frontier) model -- bulk-first, frontier-on-failure, all in one worktree.
     """
     provider_name = provider_name or app.config.get_default_provider()
     provider = app.providers.get(provider_name)
@@ -103,7 +110,18 @@ def run_solve(
         )
 
     test_cmd = _test_command(app)
+    frontier_model = app.config.get_model_for(provider_name, fast=False)
+    bulk_model = (
+        app.config.get_model_for(provider_name, fast=True) if escalate else frontier_model
+    )
     manager = WorktreeManager()
+    models_used: list[str] = []
+    state = {"iteration": 0}
+
+    def _model_for(iteration: int) -> str:
+        if escalate and iteration > escalate_after:
+            return frontier_model
+        return bulk_model
 
     def prepare() -> str:
         path = manager.prepare(provider_name).path
@@ -112,9 +130,17 @@ def run_solve(
         return path
 
     def run_agent(prompt: str, path: str) -> str:
+        state["iteration"] += 1
+        model = _model_for(state["iteration"])
+        models_used.append(model)
         if on_progress:
-            on_progress("editing", f"{provider_name} working")
-        return run_agent_in_worktree(provider, prompt, path, system=_WORKER_SYSTEM)
+            on_progress("editing", f"{provider_name}: {model}")
+        original_model = provider.config.model
+        provider.config.model = model
+        try:
+            return run_agent_in_worktree(provider, prompt, path, system=_WORKER_SYSTEM)
+        finally:
+            provider.config.model = original_model
 
     def run_tests(path: str) -> "tuple[str, int]":
         if on_progress:
@@ -142,6 +168,7 @@ def run_solve(
             diff_stat=snapshot.diff_stat,
             diff_excerpt=snapshot.diff_excerpt,
             changed_files=snapshot.changed_files,
+            models_used=tuple(models_used),
         )
     except Exception as exc:
         return SolveResult(

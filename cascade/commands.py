@@ -1551,6 +1551,12 @@ class CommandHandler:
                     f"Solve {outcome} after {result.iterations} "
                     f"iteration(s) on {result.provider}"
                 ]
+                if result.models_used:
+                    seq: list[str] = []
+                    for m in result.models_used:
+                        if not seq or seq[-1] != m:
+                            seq.append(m)
+                    lines.append("Models: " + " -> ".join(seq))
                 if result.error:
                     lines.append(f"Error: {result.error}")
                 if result.changed_files:

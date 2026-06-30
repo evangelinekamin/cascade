@@ -1,5 +1,6 @@
 """Tests for the run_solve assembly (the runnable verified worker)."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import cascade.swarm.solve as solve_mod
@@ -97,3 +98,56 @@ def test_run_solve_retries_until_tests_pass(monkeypatch):
 
     assert result.passed is True
     assert result.iterations == 2
+
+
+def _tiered_app(bulk="bulk-x", frontier="frontier-x"):
+    app = MagicMock()
+    prov = MagicMock()
+    prov.config = SimpleNamespace(model=frontier)
+    app.providers = {"openai": prov}
+    app.config.get_default_provider.return_value = "openai"
+    app.config.get_model_for = MagicMock(
+        side_effect=lambda name, mode_name=None, fast=False: bulk if fast else frontier
+    )
+    app.config.data = {"workflows": {"verify": {"test": "pytest"}}}
+    return app, prov
+
+
+def _patch_solve(monkeypatch, observed, test_results):
+    def fake_agent(provider, prompt, path, system=None):
+        observed.append(provider.config.model)
+        return "edited"
+
+    fm = MagicMock()
+    fm.prepare.return_value = SimpleNamespace(path="/tmp/wt")
+    fm.capture_snapshot.return_value = SimpleNamespace(
+        diff_stat="", diff_excerpt="", changed_files=()
+    )
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", fake_agent)
+    monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: next(test_results))
+    monkeypatch.setattr(solve_mod, "WorktreeManager", lambda *a, **k: fm)
+
+
+def test_escalates_to_frontier_after_first_failure(monkeypatch):
+    app, prov = _tiered_app()
+    observed: list[str] = []
+    _patch_solve(monkeypatch, observed, iter([("fail", 1), ("ok", 0)]))
+
+    result = run_solve(app, "x", escalate=True, escalate_after=1, max_iterations=3)
+
+    # iteration 1 ran the bulk model; iteration 2 escalated to the frontier model
+    assert observed == ["bulk-x", "frontier-x"]
+    assert result.models_used == ("bulk-x", "frontier-x")
+    # the provider's model is restored to its original value afterward
+    assert prov.config.model == "frontier-x"
+
+
+def test_no_escalation_uses_frontier_throughout(monkeypatch):
+    app, prov = _tiered_app()
+    observed: list[str] = []
+    _patch_solve(monkeypatch, observed, iter([("fail", 1), ("ok", 0)]))
+
+    result = run_solve(app, "x", escalate=False, max_iterations=3)
+
+    assert observed == ["frontier-x", "frontier-x"]
+    assert set(result.models_used) == {"frontier-x"}
