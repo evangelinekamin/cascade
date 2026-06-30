@@ -59,8 +59,8 @@ class ConfigManager:
                 "claude": {
                     "enabled": False,
                     "api_key": "${CLAUDE_API_KEY}",
-                    "model": "claude-opus-4-6",
-                    "fast_model": "claude-sonnet-4-6",
+                    "model": "claude-opus-4-8",
+                    "fast_model": "claude-sonnet-5",
                     "temperature": 0.7,
                 },
                 "openrouter": {
@@ -141,7 +141,7 @@ class ConfigManager:
         # Default models per provider
         default_models = {
             "gemini": "gemini-3.1-pro-preview",
-            "claude": "claude-opus-4-6",
+            "claude": "claude-opus-4-8",
             "openai": "gpt-5.3-codex",
             "openrouter": "qwen/qwen3.5-9b",
         }

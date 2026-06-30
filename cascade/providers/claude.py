@@ -13,6 +13,15 @@ if TYPE_CHECKING:
     from ..tools.schema import ToolDef
 
 
+# Opus 4.7+, Sonnet 5, and the Fable/Mythos family reject sampling params
+# (temperature / top_p / top_k) with a 400. Older models still accept them.
+_NO_SAMPLING_TAGS = ("opus-4-7", "opus-4-8", "sonnet-5", "fable-5", "mythos")
+
+
+def _accepts_sampling(model: str) -> bool:
+    return not any(tag in model for tag in _NO_SAMPLING_TAGS)
+
+
 @register_provider("claude")
 class ClaudeProvider(BaseProvider):
     """Anthropic Claude API provider.
@@ -37,7 +46,8 @@ class ClaudeProvider(BaseProvider):
     def get_fallback_model(self) -> Optional[str]:
         """Fall back from Claude Opus to Sonnet on rate limits."""
         if "opus" in self.config.model:
-            return self.config.model.replace("opus", "sonnet")
+            # Newer Opus (4.7/4.8) has no matching Sonnet version -- use the current Sonnet.
+            return "claude-sonnet-5"
         return None
 
     def _headers(self) -> dict:
@@ -106,11 +116,11 @@ class ClaudeProvider(BaseProvider):
             payload = {
                 "model": self.config.model,
                 "max_tokens": self.config.max_tokens or 2048,
-                "temperature": self.config.temperature,
                 "stream": True,
                 "messages": api_messages,
             }
-
+            if _accepts_sampling(self.config.model):
+                payload["temperature"] = self.config.temperature
             if system:
                 payload["system"] = system
 
@@ -173,10 +183,11 @@ class ClaudeProvider(BaseProvider):
             payload = {
                 "model": self.config.model,
                 "max_tokens": self.config.max_tokens or 2048,
-                "temperature": self.config.temperature,
                 "messages": api_messages,
                 "tools": tool_defs,
             }
+            if _accepts_sampling(self.config.model):
+                payload["temperature"] = self.config.temperature
             if system:
                 payload["system"] = system
 
