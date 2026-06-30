@@ -6,6 +6,7 @@ from cascade.hooks.events import HookEvent, EVENT_MAP
 from cascade.hooks.context import HookContext, HookResult
 from cascade.hooks.runner import HookDefinition, HookRunner
 from cascade.hooks.loader import load_hooks_from_config
+from cascade.hooks.matchers import compile_matcher, matches_any
 
 
 class TestHookEvents:
@@ -346,3 +347,98 @@ class TestLoaderV2:
         desc = runner.describe()
         assert desc[0]["type"] == "shell"
         assert desc[1]["type"] == "python"
+
+
+class TestToolMatchers:
+    """Tests for Claude Code-style tool pattern matching (``if:`` filters)."""
+
+    def test_colon_prefix_matches_command_start(self):
+        m = compile_matcher("Bash(git:*)")
+        assert m.matches("Bash", {"command": "git status"}) is True
+        assert m.matches("Bash", {"command": "git log --oneline"}) is True
+
+    def test_colon_prefix_does_not_match_other_command(self):
+        m = compile_matcher("Bash(git:*)")
+        assert m.matches("Bash", {"command": "npm install"}) is False
+
+    def test_colon_prefix_requires_prefix_at_start(self):
+        # "git" appears but not at the start -> no match.
+        m = compile_matcher("Bash(git:*)")
+        assert m.matches("Bash", {"command": "sudo git push"}) is False
+
+    def test_wildcard_anywhere_still_matches(self):
+        m = compile_matcher("Bash(*rm*)")
+        assert m.matches("Bash", {"command": "rm -rf x"}) is True
+        assert m.matches("Bash", {"command": "ls -la"}) is False
+
+    def test_tool_name_must_match(self):
+        m = compile_matcher("Bash(git:*)")
+        assert m.matches("Write", {"command": "git status"}) is False
+
+    def test_no_arg_pattern_matches_any_arguments(self):
+        m = compile_matcher("Bash")
+        assert m.matches("Bash", {"command": "anything at all"}) is True
+        assert m.matches("Bash", None) is True
+
+    def test_star_matches_any_tool(self):
+        m = compile_matcher("*")
+        assert m.matches("Bash", {"command": "git status"}) is True
+        assert m.matches("Write", {"path": "/tmp/x"}) is True
+
+    def test_colon_prefix_no_match_when_arguments_missing(self):
+        m = compile_matcher("Bash(git:*)")
+        assert m.matches("Bash", None) is False
+
+    def test_matches_any_across_matchers(self):
+        matchers = (compile_matcher("Bash(git:*)"), compile_matcher("Write"))
+        assert matches_any(matchers, "Write", {"path": "/tmp/x"}) is True
+        assert matches_any(matchers, "Bash", {"command": "git status"}) is True
+        assert matches_any(matchers, "Bash", {"command": "npm install"}) is False
+
+
+class TestToolFilterIntegration:
+    """Tests for ``tool_filter`` wiring through HookDefinition, loader, runner."""
+
+    def test_hook_without_filter_matches_every_tool(self):
+        hook = HookDefinition(name="all", event=HookEvent.TOOL_CALL, command="echo hi")
+        assert hook.tool_filter is None
+        assert hook.matches_tool("Bash", {"command": "git status"}) is True
+        assert hook.matches_tool("Write", {"path": "/tmp/x"}) is True
+        assert hook.matches_tool("AnyTool") is True
+
+    def test_loader_compiles_if_filter(self):
+        data = [
+            {
+                "name": "git_audit",
+                "event": "tool_call",
+                "if": "Bash(git:*)",
+                "command": "echo git",
+            },
+        ]
+        hooks = load_hooks_from_config(data)
+        assert len(hooks) == 1
+        hook = hooks[0]
+        assert hook.tool_filter is not None
+        assert hook.matches_tool("Bash", {"command": "git status"}) is True
+        assert hook.matches_tool("Bash", {"command": "npm install"}) is False
+
+    def test_runner_filters_hooks_by_tool(self):
+        data = [
+            {
+                "name": "git_only",
+                "event": "tool_call",
+                "if": "Bash(git:*)",
+                "command": "echo git",
+            },
+        ]
+        runner = HookRunner(hooks=load_hooks_from_config(data))
+        # Selected for a git command...
+        selected = runner.hooks_for_event(
+            HookEvent.TOOL_CALL, tool_name="Bash", tool_args={"command": "git status"}
+        )
+        assert len(selected) == 1
+        # ...but filtered out for a non-git command.
+        filtered = runner.hooks_for_event(
+            HookEvent.TOOL_CALL, tool_name="Bash", tool_args={"command": "npm install"}
+        )
+        assert len(filtered) == 0

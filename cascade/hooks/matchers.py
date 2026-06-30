@@ -2,8 +2,8 @@
 
 Supports Claude Code-style tool matchers:
     "Bash"              - matches tool name exactly
-    "Bash(git:*)"       - matches tool name + argument content pattern
-    "Bash(*rm*)"        - wildcard anywhere in arguments
+    "Bash(git:*)"       - tool name + argument value starting with "git"
+    "Bash(*rm*)"        - wildcard match anywhere in an argument value
     "*"                 - matches any tool
     "mcp__server__tool" - exact MCP tool name
 
@@ -21,7 +21,7 @@ class ToolMatcher:
     """Compiled matcher for a single tool pattern."""
 
     tool_pattern: str   # fnmatch pattern for tool name
-    arg_pattern: str    # fnmatch pattern for argument content (empty = any)
+    arg_pattern: str    # argument-content pattern, "prefix:glob" or glob (empty = any)
     raw: str            # original pattern string
 
     def matches(self, tool_name: str, arguments: dict[str, Any] | None = None) -> bool:
@@ -35,19 +35,11 @@ class ToolMatcher:
         if arguments is None:
             return False
 
-        # Match the arg pattern against each value individually and
-        # against the full flattened string. This handles both
-        # "Bash(git:*)" matching a command value and broader patterns.
-        for value in arguments.values():
-            val_str = str(value)
-            if fnmatch.fnmatch(val_str, self.arg_pattern):
-                return True
-            # Also try with key prefix for "key:value" patterns
-            for key, val in arguments.items():
-                if fnmatch.fnmatch(f"{key}:{val}", self.arg_pattern):
-                    return True
-
-        return False
+        # The arg pattern matches the call if it matches any argument value.
+        return any(
+            _arg_matches(str(value), self.arg_pattern)
+            for value in arguments.values()
+        )
 
 
 # Regex for parsing "ToolName(content:pattern)" syntax
@@ -82,12 +74,19 @@ def matches_any(
     return any(m.matches(tool_name, arguments) for m in matchers)
 
 
-def _flatten_args(arguments: dict[str, Any]) -> str:
-    """Flatten arguments dict into a colon-separated searchable string.
+def _arg_matches(value: str, pattern: str) -> bool:
+    """Match a single argument value against an arg-content pattern.
 
-    Example: {"command": "git commit -m 'fix'"} -> "command:git commit -m 'fix'"
+    Two forms are supported:
+
+        "prefix:glob"  Claude Code convention -- the value must start with
+                       ``prefix`` and the remainder must match ``glob``.
+                       ``git:*`` matches any value beginning with "git"
+                       (e.g. "git status") but not "npm install".
+        "glob"         a plain fnmatch pattern applied to the whole value,
+                       so ``*rm*`` matches "rm" appearing anywhere.
     """
-    parts = []
-    for key, value in arguments.items():
-        parts.append(f"{key}:{value}")
-    return " ".join(parts)
+    if ":" in pattern:
+        prefix, glob = pattern.split(":", 1)
+        return value.startswith(prefix) and fnmatch.fnmatch(value[len(prefix):], glob)
+    return fnmatch.fnmatch(value, pattern)
