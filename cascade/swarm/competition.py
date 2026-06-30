@@ -6,12 +6,10 @@ import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import nullcontext
-from pathlib import Path
 from typing import Callable, Optional, TYPE_CHECKING
 
-from ..tools.schema import ToolDef, callable_to_tool_def
 from .schema import CompetitionEntry, CompetitionJudgment, CompetitionResult
+from .workspace import run_agent_in_worktree
 from .worktree import WorktreeManager, WorktreeSnapshot
 
 if TYPE_CHECKING:
@@ -65,67 +63,6 @@ Your final response must summarize:
 
 _JUDGE_PREFERENCE = ("claude", "gemini", "openai", "openrouter")
 ProgressCallback = Optional[Callable[[str, str], None]]
-
-
-class _WorkspaceTools:
-    """Restricted file tools rooted at a single worktree path."""
-
-    def __init__(self, root: str):
-        self._root = Path(root).resolve()
-
-    def build(self) -> dict[str, ToolDef]:
-        description = "Read, write, append, and list files inside the isolated coding worktree"
-        return {
-            "read_file": callable_to_tool_def("read_file", self.read_file, description=description),
-            "write_file": callable_to_tool_def("write_file", self.write_file, description=description),
-            "append_file": callable_to_tool_def("append_file", self.append_file, description=description),
-            "list_files": callable_to_tool_def("list_files", self.list_files, description=description),
-        }
-
-    def _resolve(self, path: str) -> Path:
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute():
-            candidate = self._root / candidate
-        resolved = candidate.resolve()
-        if resolved != self._root and self._root not in resolved.parents:
-            raise ValueError(f"Path escapes workspace: {path}")
-        return resolved
-
-    def read_file(self, path: str) -> str:
-        """Read file contents from the worktree."""
-        try:
-            return self._resolve(path).read_text()
-        except Exception as exc:
-            return f"Error reading file: {exc}"
-
-    def write_file(self, path: str, content: str) -> bool:
-        """Write file contents inside the worktree."""
-        try:
-            target = self._resolve(path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content)
-            return True
-        except Exception:
-            return False
-
-    def append_file(self, path: str, content: str) -> bool:
-        """Append file contents inside the worktree."""
-        try:
-            target = self._resolve(path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("a") as handle:
-                handle.write(content)
-            return True
-        except Exception:
-            return False
-
-    def list_files(self, path: str = ".") -> list[str]:
-        """List immediate children under a worktree path."""
-        try:
-            target = self._resolve(path)
-            return sorted(str(item) for item in target.iterdir())
-        except Exception as exc:
-            return [f"Error: {exc}"]
 
 
 class CompetitionOrchestrator:
@@ -351,13 +288,6 @@ class CompetitionOrchestrator:
             "you call file tools."
         )
 
-    @staticmethod
-    def _workspace_context(provider, worktree_path: str):
-        workdir = getattr(provider, "working_directory", None)
-        if callable(workdir):
-            return provider.working_directory(worktree_path)
-        return nullcontext()
-
     def _execute_code_provider(
         self,
         provider_name: str,
@@ -385,15 +315,7 @@ class CompetitionOrchestrator:
         try:
             system = self._build_competition_system(_CODE_SYSTEM)
             prompt = self._build_code_prompt(objective, worktree_path)
-            with self._workspace_context(provider, worktree_path):
-                if getattr(provider, "_use_cli_proxy", False):
-                    response = provider.ask_single(prompt, system=system)
-                else:
-                    response, _tool_log = provider.ask_with_tools(
-                        [{"role": "user", "content": prompt}],
-                        _WorkspaceTools(worktree_path).build(),
-                        system=system,
-                    )
+            response = run_agent_in_worktree(provider, prompt, worktree_path, system=system)
             usage = provider.last_usage or (0, 0)
             snapshot = self._safe_snapshot(manager, worktree_path)
             if not self._has_code_changes(snapshot):
