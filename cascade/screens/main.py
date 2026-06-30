@@ -105,6 +105,43 @@ class MainScreen(Screen):
             if handler is not None:
                 handler()
 
+    # ------------------------------------------------------------------
+    # Chord actions (ctrl+x prefix)
+    # ------------------------------------------------------------------
+
+    def _post_system_message(self, text: str) -> None:
+        """Post a system message via the command handler, with a toast fallback."""
+        if self._cmd_handler is not None:
+            self._cmd_handler._post_system(text)
+        else:
+            self.app.notify(text)
+
+    def action_kill_workers(self) -> None:
+        """Cancel running background workers (ctrl+x ctrl+k)."""
+        try:
+            self.workers.cancel_all()
+        except Exception:
+            pass
+        self._post_system_message("Cancelled running background workers.")
+
+    def action_export_session(self) -> None:
+        """Export the current session via the existing /export path (ctrl+x ctrl+e)."""
+        if self._cmd_handler is not None:
+            self._cmd_handler._cmd_export([])
+        else:
+            self.app.notify("Export unavailable: command handler not ready.")
+
+    def action_toggle_hooks(self) -> None:
+        """Toggle the hooks system on or off (ctrl+x ctrl+h)."""
+        cli_app = getattr(self.app, "cli_app", None)
+        runner = getattr(cli_app, "hook_runner", None)
+        if runner is None:
+            self._post_system_message("Hooks unavailable: no hook runner on this session.")
+            return
+        runner.enabled = not runner.enabled
+        state = "enabled" if runner.enabled else "disabled"
+        self._post_system_message(f"Hooks {state} ({runner.hook_count} registered).")
+
     def compose(self) -> ComposeResult:
         yield WelcomeHeader(
             active_provider=self._active_provider,

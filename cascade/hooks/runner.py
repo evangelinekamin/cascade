@@ -67,8 +67,9 @@ class HookRunner:
     Python hooks can inspect, transform, and block at each lifecycle point.
     """
 
-    def __init__(self, hooks: tuple[HookDefinition, ...] = ()):
+    def __init__(self, hooks: tuple[HookDefinition, ...] = (), *, enabled: bool = True):
         self._hooks = hooks
+        self.enabled = enabled
 
     @property
     def hook_count(self) -> int:
@@ -76,7 +77,7 @@ class HookRunner:
 
     def add_hook(self, hook: HookDefinition) -> "HookRunner":
         """Return a new runner with the hook added. Immutable."""
-        return HookRunner(self._hooks + (hook,))
+        return HookRunner(self._hooks + (hook,), enabled=self.enabled)
 
     def hooks_for_event(
         self,
@@ -86,8 +87,11 @@ class HookRunner:
     ) -> tuple[HookDefinition, ...]:
         """Return all enabled hooks for a given event, sorted by priority.
 
-        For tool-related events, filters by tool_filter pattern.
+        For tool-related events, filters by tool_filter pattern. Returns an
+        empty tuple while the runner is disabled (runtime master switch).
         """
+        if not self.enabled:
+            return ()
         hooks = []
         for h in self._hooks:
             if h.event != event or not h.enabled:
