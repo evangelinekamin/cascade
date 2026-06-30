@@ -87,3 +87,13 @@ def test_attempt_records_agent_response_and_output():
     assert attempt.agent_response == "I changed foo.py"
     assert attempt.test_output == "pytest: 1 passed"
     assert attempt.iteration == 1
+
+
+def test_on_attempt_called_once_per_iteration():
+    seen = []
+    test_results = iter([("fail", 1), ("ok", 0)])
+    worker = _worker(lambda prompt, path: "edited", lambda path: next(test_results))
+
+    worker.run("task", on_attempt=lambda a: seen.append((a.iteration, a.passed)))
+
+    assert seen == [(1, False), (2, True)]

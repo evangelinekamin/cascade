@@ -15,7 +15,7 @@ fed back into the next prompt, up to ``max_iterations``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 
 @dataclass(frozen=True)
@@ -83,8 +83,16 @@ class VerifiedWorker:
         self._prepare_worktree = prepare_worktree
         self._max_iterations = max_iterations
 
-    def run(self, task: str) -> WorkerResult:
-        """Drive the loop until tests pass or iterations are exhausted."""
+    def run(
+        self,
+        task: str,
+        on_attempt: Optional[Callable[[VerifyAttempt], None]] = None,
+    ) -> WorkerResult:
+        """Drive the loop until tests pass or iterations are exhausted.
+
+        ``on_attempt`` is invoked with each VerifyAttempt as it completes, for
+        progress reporting.
+        """
         path = self._prepare_worktree()
         attempts: List[VerifyAttempt] = []
 
@@ -92,14 +100,15 @@ class VerifiedWorker:
             prompt = self._build_prompt(task, attempts)
             response = self._run_agent(prompt, path)
             output, returncode = self._run_tests(path)
-            attempts.append(
-                VerifyAttempt(
-                    iteration=i,
-                    passed=returncode == 0,
-                    test_output=output,
-                    agent_response=response,
-                )
+            attempt = VerifyAttempt(
+                iteration=i,
+                passed=returncode == 0,
+                test_output=output,
+                agent_response=response,
             )
+            attempts.append(attempt)
+            if on_attempt is not None:
+                on_attempt(attempt)
             if returncode == 0:
                 break
 
