@@ -58,6 +58,7 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("export", "/export [id]", "Export session messages to a file"),
     CommandDef("swarm", "/swarm <task>", "Multi-model swarm dispatch"),
     CommandDef("solve", "/solve <task>", "Code a task in an isolated worktree, verified by tests"),
+    CommandDef("pipeline", "/pipeline <objective>", "Decompose a build into ordered steps, each verified by tests"),
     CommandDef(
         "compete",
         "/compete [--providers a,b] [--judge x] <task>",
@@ -134,6 +135,7 @@ class CommandHandler:
             "export": self._cmd_export,
             "swarm": self._cmd_swarm,
             "solve": self._cmd_solve,
+            "pipeline": self._cmd_pipeline,
             "compete": self._cmd_compete,
             "compete-code": self._cmd_compete_code,
             "episodes": self._cmd_episodes,
@@ -1579,6 +1581,84 @@ class CommandHandler:
                 _call_ui(self._clear_progress_indicator, progress)
                 _call_ui(self._post_system, f"Solve error: {e}")
                 _call_ui(self._record_history_message, "system", f"Solve error: {e}")
+
+        screen = self.app.screen
+        screen.run_worker(_worker, thread=True, exclusive=False)
+
+    def _cmd_pipeline(self, args: list[str]) -> None:
+        """Decompose a build into ordered steps, each run as a verified worker."""
+        if not args:
+            self._post_system("Usage: /pipeline <objective>")
+            return
+
+        objective = " ".join(args)
+        cli_app = getattr(self.app, "cli_app", None)
+        if cli_app is None:
+            self._post_system("Pipeline requires CLI app.")
+            return
+
+        provider = getattr(getattr(self.app, "state", None), "active_provider", None)
+
+        self._post_system(f"Pipeline: {objective}")
+        self._record_command_line(f"/pipeline {objective}", title=f"[Pipeline] {objective}")
+        progress = self._mount_progress_indicator(f"pipeline: {objective[:60]}")
+
+        def _call_ui(fn, *call_args) -> None:
+            caller = getattr(self.app, "call_from_thread", None)
+            if callable(caller):
+                caller(fn, *call_args)
+            else:
+                fn(*call_args)
+
+        def _on_progress(stage: str, detail: str) -> None:
+            label = f"{stage}: {detail}"
+            label = label[:100] if len(label) > 100 else label
+            if progress is None:
+                _call_ui(self._post_system, f"[{stage}] {detail}")
+            else:
+                _call_ui(self._set_progress_indicator_label, progress, label)
+
+        def _worker() -> None:
+            try:
+                from .swarm.pipeline import run_pipeline
+
+                result = run_pipeline(
+                    cli_app, objective, provider_name=provider, on_progress=_on_progress
+                )
+
+                passed_steps = sum(1 for s in result.steps if s.passed)
+                outcome = "PASSED" if result.passed else "FAILED"
+                lines = [
+                    f"Pipeline {outcome}: {passed_steps}/{len(result.steps)} "
+                    f"steps verified on {result.provider}"
+                ]
+                if result.error:
+                    lines.append(f"Error: {result.error}")
+                for step in result.steps:
+                    mark = "OK" if step.passed else "FAIL"
+                    lines.append(
+                        f"  [{step.id}] {mark} ({step.iterations} iter): {step.description}"
+                    )
+                if result.changed_files:
+                    lines.append("Files: " + ", ".join(result.changed_files[:8]))
+                if result.diff_stat:
+                    lines.append(result.diff_stat)
+                if result.worktree_path:
+                    lines.append(f"Worktree: {result.worktree_path}")
+                if result.diff_excerpt:
+                    lines.append("")
+                    lines.append("--- Verified diff ---")
+                    lines.append(result.diff_excerpt)
+
+                final = "\n".join(lines)
+                _call_ui(self._clear_progress_indicator, progress)
+                _call_ui(self._post_system, final)
+                _call_ui(self._record_history_message, "system", final)
+                _call_ui(self.app.state.add_message, "system", f"[Pipeline] {objective}")
+            except Exception as e:
+                _call_ui(self._clear_progress_indicator, progress)
+                _call_ui(self._post_system, f"Pipeline error: {e}")
+                _call_ui(self._record_history_message, "system", f"Pipeline error: {e}")
 
         screen = self.app.screen
         screen.run_worker(_worker, thread=True, exclusive=False)

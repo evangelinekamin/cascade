@@ -12,7 +12,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from .verify_loop import VerifiedWorker, VerifyAttempt
+from .verify_loop import VerifiedWorker, VerifyAttempt, WorkerResult
 from .workspace import run_agent_in_worktree
 from .worktree import WorktreeManager
 
@@ -74,6 +74,64 @@ def _run_tests_in(cmd: str, cwd: str, timeout: int) -> "tuple[str, int]":
         return f"[tests timed out after {timeout}s]", -1
 
 
+def run_verified_task(
+    provider,
+    worktree_path: str,
+    task: str,
+    test_cmd: str,
+    *,
+    bulk_model: str,
+    frontier_model: str,
+    max_iterations: int = 3,
+    escalate: bool = True,
+    escalate_after: int = 1,
+    timeout: int = 300,
+    on_progress: ProgressCallback = None,
+) -> "tuple[WorkerResult, list[str]]":
+    """Run the escalating verified loop for one task against an existing worktree.
+
+    Bulk-first model tiering: the first ``escalate_after`` iteration(s) use
+    ``bulk_model`` and continued test failure escalates to ``frontier_model`` --
+    all in ``worktree_path``. Returns (WorkerResult, models used per iteration).
+    """
+    models_used: list[str] = []
+    state = {"iteration": 0}
+
+    def _model_for(iteration: int) -> str:
+        if escalate and iteration > escalate_after:
+            return frontier_model
+        return bulk_model
+
+    def run_agent(prompt: str, path: str) -> str:
+        state["iteration"] += 1
+        model = _model_for(state["iteration"])
+        models_used.append(model)
+        if on_progress:
+            on_progress("editing", model)
+        original_model = provider.config.model
+        provider.config.model = model
+        try:
+            return run_agent_in_worktree(provider, prompt, path, system=_WORKER_SYSTEM)
+        finally:
+            provider.config.model = original_model
+
+    def run_tests(path: str) -> "tuple[str, int]":
+        if on_progress:
+            on_progress("verifying", f"running: {test_cmd}")
+        return _run_tests_in(test_cmd, path, timeout)
+
+    def on_attempt(attempt: VerifyAttempt) -> None:
+        if on_progress:
+            outcome = "passed" if attempt.passed else "failed"
+            on_progress("verified", f"iteration {attempt.iteration}: tests {outcome}")
+
+    worker = VerifiedWorker(
+        run_agent, run_tests, lambda: worktree_path, max_iterations=max_iterations
+    )
+    result = worker.run(task, on_attempt=on_attempt)
+    return result, models_used
+
+
 def run_solve(
     app,
     task: str,
@@ -115,56 +173,32 @@ def run_solve(
         app.config.get_model_for(provider_name, fast=True) if escalate else frontier_model
     )
     manager = WorktreeManager()
-    models_used: list[str] = []
-    state = {"iteration": 0}
 
-    def _model_for(iteration: int) -> str:
-        if escalate and iteration > escalate_after:
-            return frontier_model
-        return bulk_model
-
-    def prepare() -> str:
+    try:
         path = manager.prepare(provider_name).path
         if on_progress:
             on_progress("workspace", path)
-        return path
-
-    def run_agent(prompt: str, path: str) -> str:
-        state["iteration"] += 1
-        model = _model_for(state["iteration"])
-        models_used.append(model)
-        if on_progress:
-            on_progress("editing", f"{provider_name}: {model}")
-        original_model = provider.config.model
-        provider.config.model = model
-        try:
-            return run_agent_in_worktree(provider, prompt, path, system=_WORKER_SYSTEM)
-        finally:
-            provider.config.model = original_model
-
-    def run_tests(path: str) -> "tuple[str, int]":
-        if on_progress:
-            on_progress("verifying", f"running: {test_cmd}")
-        return _run_tests_in(test_cmd, path, timeout)
-
-    def on_attempt(attempt: VerifyAttempt) -> None:
-        if on_progress:
-            outcome = "passed" if attempt.passed else "failed"
-            on_progress("verified", f"iteration {attempt.iteration}: tests {outcome}")
-
-    try:
-        worker = VerifiedWorker(
-            run_agent, run_tests, prepare, max_iterations=max_iterations
+        result, models_used = run_verified_task(
+            provider,
+            path,
+            task,
+            test_cmd,
+            bulk_model=bulk_model,
+            frontier_model=frontier_model,
+            max_iterations=max_iterations,
+            escalate=escalate,
+            escalate_after=escalate_after,
+            timeout=timeout,
+            on_progress=on_progress,
         )
-        result = worker.run(task, on_attempt=on_attempt)
-        snapshot = manager.capture_snapshot(result.worktree_path)
+        snapshot = manager.capture_snapshot(path)
         return SolveResult(
             task=task,
             provider=provider_name,
             passed=result.passed,
             iterations=result.iterations,
             attempts=result.attempts,
-            worktree_path=result.worktree_path,
+            worktree_path=path,
             diff_stat=snapshot.diff_stat,
             diff_excerpt=snapshot.diff_excerpt,
             changed_files=snapshot.changed_files,
