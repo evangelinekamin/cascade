@@ -8,8 +8,10 @@ the caller's working tree is never touched.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
 from .verify_loop import VerifiedWorker, VerifyAttempt, WorkerResult
@@ -49,8 +51,53 @@ class SolveResult:
     error: str = ""
 
 
+def _find_project_config(start: Optional[str] = None) -> Optional[Path]:
+    """Find a project-local .cascade.yml, walking up to (and not past) the git root."""
+    current = Path(start or os.getcwd()).resolve()
+    for directory in (current, *current.parents):
+        candidate = directory / ".cascade.yml"
+        if candidate.is_file():
+            return candidate
+        if (directory / ".git").exists():
+            break  # stay inside the repo
+    return None
+
+
+def _project_verify_test() -> Optional[str]:
+    """Read the verify/test command from a project-local .cascade.yml, if any.
+
+    Accepts either the global-config shape (``workflows.verify.test``) or a
+    terser top-level ``verify.test``.
+    """
+    path = _find_project_config()
+    if path is None:
+        return None
+    try:
+        import yaml
+
+        data = yaml.safe_load(path.read_text()) or {}
+    except Exception:
+        return None
+    workflows = data.get("workflows", {})
+    nested = workflows.get("verify", {}) if isinstance(workflows, dict) else {}
+    for section in (nested, data.get("verify", {})):
+        if isinstance(section, dict):
+            test = section.get("test")
+            if isinstance(test, str) and test.strip():
+                return test.strip()
+    return None
+
+
 def _test_command(app) -> str:
-    """Resolve the verify/test command from config, falling back to a default."""
+    """Resolve the verify/test command.
+
+    Project-local ``.cascade.yml`` wins over the global config, which wins over
+    the built-in default -- so a repo can pin its own runner (e.g. ``uv run
+    pytest``) without changing the user's global settings.
+    """
+    project = _project_verify_test()
+    if project:
+        return project
     try:
         verify = app.config.data.get("workflows", {}).get("verify", {})
         return verify.get("test") or DEFAULT_TEST_CMD
