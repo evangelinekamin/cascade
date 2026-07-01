@@ -31,6 +31,38 @@ def test_test_command_falls_back_to_default():
     assert _test_command(_fake_app()) == DEFAULT_TEST_CMD
 
 
+def test_test_command_prefers_project_local_cascade_yml(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".cascade.yml").write_text(
+        "workflows:\n  verify:\n    test: uv run pytest tests/ -q\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    # the global config says one thing; the project-local file must win
+    assert _test_command(_fake_app("python -m pytest -x -q")) == "uv run pytest tests/ -q"
+
+
+def test_test_command_supports_toplevel_verify_shape(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".cascade.yml").write_text("verify:\n  test: uv run pytest -q\n")
+    monkeypatch.chdir(tmp_path)
+    assert _test_command(_fake_app("global")) == "uv run pytest -q"
+
+
+def test_project_config_found_from_subdirectory(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".cascade.yml").write_text("verify:\n  test: pytest-from-root\n")
+    sub = tmp_path / "pkg" / "mod"
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+    assert _test_command(_fake_app("global")) == "pytest-from-root"
+
+
+def test_test_command_falls_back_to_global_without_project_file(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.chdir(tmp_path)  # no .cascade.yml present
+    assert _test_command(_fake_app("ruff && pytest")) == "ruff && pytest"
+
+
 def test_run_tests_in_reports_pass_and_fail(tmp_path):
     _out, rc = _run_tests_in("true", str(tmp_path), 10)
     assert rc == 0

@@ -1590,8 +1590,9 @@ class CommandHandler:
                     lines.append(f"Error: {result.error}")
                     if "did not run" in result.error:
                         lines.append(
-                            "Hint: set workflows.verify.test to a command that runs "
-                            "in this project (e.g. 'uv run pytest' for uv projects)."
+                            "Hint: add a .cascade.yml with 'verify: {test: ...}' in "
+                            "this repo (or set workflows.verify.test globally) to a "
+                            "command that runs here, e.g. 'uv run pytest'."
                         )
                 if result.changed_files:
                     lines.append("Files: " + ", ".join(result.changed_files[:8]))
