@@ -158,16 +158,20 @@ def test_gemini_get_fallback_model_flash_returns_none():
 
 
 def test_claude_get_fallback_model_opus_to_sonnet():
-    """Test ClaudeProvider.get_fallback_model() returns sonnet for opus models."""
+    """Opus falls back to the current Sonnet; Sonnet itself has no fallback."""
     from cascade.providers.claude import ClaudeProvider
 
     config = ProviderConfig(api_key="fake-key", model="claude-sonnet-4-20250514")
     provider_sonnet = ClaudeProvider(config)
     assert provider_sonnet.get_fallback_model() is None
 
-    config_opus = ProviderConfig(api_key="fake-key", model="claude-opus-4-20250514")
-    provider_opus = ClaudeProvider(config_opus)
-    assert provider_opus.get_fallback_model() == "claude-sonnet-4-20250514"
+    # Any Opus falls back to the current Sonnet -- not a version-mangled string
+    # like "claude-sonnet-4-8" (what naive opus->sonnet replacement would yield).
+    for opus_model in ("claude-opus-4-20250514", "claude-opus-4-8"):
+        provider_opus = ClaudeProvider(
+            ProviderConfig(api_key="fake-key", model=opus_model)
+        )
+        assert provider_opus.get_fallback_model() == "claude-sonnet-5"
 
 
 def test_openrouter_get_fallback_model_defaults_to_minimax():

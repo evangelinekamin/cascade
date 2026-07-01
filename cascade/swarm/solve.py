@@ -17,6 +17,7 @@ from .workspace import run_agent_in_worktree
 from .worktree import WorktreeManager
 
 ProgressCallback = Optional[Callable[[str, str], None]]
+TokensCallback = Optional[Callable[[int, int], None]]
 
 DEFAULT_TEST_CMD = "python -m pytest -x -q"
 
@@ -43,6 +44,8 @@ class SolveResult:
     diff_excerpt: str = ""
     changed_files: tuple[str, ...] = ()
     models_used: tuple[str, ...] = ()
+    input_tokens: int = 0
+    output_tokens: int = 0
     error: str = ""
 
 
@@ -74,6 +77,44 @@ def _run_tests_in(cmd: str, cwd: str, timeout: int) -> "tuple[str, int]":
         return f"[tests timed out after {timeout}s]", -1
 
 
+# Signatures that mean the verify command never actually ran -- an environment
+# problem (missing interpreter, missing pytest, nothing collected) that a coding
+# agent cannot fix by editing code. Distinct from "tests ran and reported failures".
+_INFRA_FAILURE_SIGNATURES = (
+    "command not found",
+    "no module named pytest",
+    "no module named 'pytest'",
+    "no tests ran",
+    "no tests were collected",
+    "is not recognized as an internal or external command",
+)
+
+
+def _is_infra_failure(output: str, returncode: int) -> bool:
+    """True when the verify command failed to RUN, not merely failed its tests."""
+    if returncode in (126, 127):  # shell: not executable / command not found
+        return True
+    if returncode == 5:  # pytest exit code for "no tests collected"
+        return True
+    low = output.lower()
+    return any(signature in low for signature in _INFRA_FAILURE_SIGNATURES)
+
+
+def _preflight_gate(test_cmd: str, cwd: str, timeout: int) -> Optional[str]:
+    """Confirm the verify command can execute before spending agent iterations.
+
+    Returns a human-readable error when the command does not run at all (an
+    environment/config problem the agent cannot fix); returns None when the gate
+    is healthy -- whether or not its tests currently pass.
+    """
+    output, returncode = _run_tests_in(test_cmd, cwd, timeout)
+    if _is_infra_failure(output, returncode):
+        stripped = output.strip()
+        detail = stripped.splitlines()[-1] if stripped else f"exit code {returncode}"
+        return f"verify command did not run ({test_cmd!r}): {detail}"
+    return None
+
+
 def run_verified_task(
     provider,
     worktree_path: str,
@@ -87,6 +128,7 @@ def run_verified_task(
     escalate_after: int = 1,
     timeout: int = 300,
     on_progress: ProgressCallback = None,
+    on_tokens: TokensCallback = None,
 ) -> "tuple[WorkerResult, list[str]]":
     """Run the escalating verified loop for one task against an existing worktree.
 
@@ -111,7 +153,15 @@ def run_verified_task(
         original_model = provider.config.model
         provider.config.model = model
         try:
-            return run_agent_in_worktree(provider, prompt, path, system=_WORKER_SYSTEM)
+            response = run_agent_in_worktree(provider, prompt, path, system=_WORKER_SYSTEM)
+            if on_tokens is not None:
+                usage = getattr(provider, "last_usage", None)
+                if isinstance(usage, tuple) and len(usage) == 2:
+                    try:
+                        on_tokens(int(usage[0]), int(usage[1]))
+                    except (TypeError, ValueError):
+                        pass
+            return response
         finally:
             provider.config.model = original_model
 
@@ -124,6 +174,20 @@ def run_verified_task(
         if on_progress:
             outcome = "passed" if attempt.passed else "failed"
             on_progress("verified", f"iteration {attempt.iteration}: tests {outcome}")
+
+    gate_error = _preflight_gate(test_cmd, worktree_path, timeout)
+    if gate_error is not None:
+        if on_progress:
+            on_progress("aborted", gate_error)
+        aborted = WorkerResult(
+            task=task,
+            passed=False,
+            iterations=0,
+            attempts=(),
+            worktree_path=worktree_path,
+            error=gate_error,
+        )
+        return aborted, []
 
     worker = VerifiedWorker(
         run_agent, run_tests, lambda: worktree_path, max_iterations=max_iterations
@@ -142,6 +206,7 @@ def run_solve(
     escalate_after: int = 1,
     timeout: int = 300,
     on_progress: ProgressCallback = None,
+    on_tokens: TokensCallback = None,
 ) -> SolveResult:
     """Run *task* to a verified diff in an isolated worktree.
 
@@ -173,6 +238,13 @@ def run_solve(
         app.config.get_model_for(provider_name, fast=True) if escalate else frontier_model
     )
     manager = WorktreeManager()
+    token_totals = [0, 0]
+
+    def _accumulate_tokens(in_tokens: int, out_tokens: int) -> None:
+        token_totals[0] += in_tokens
+        token_totals[1] += out_tokens
+        if on_tokens is not None:
+            on_tokens(in_tokens, out_tokens)
 
     try:
         path = manager.prepare(provider_name).path
@@ -190,6 +262,7 @@ def run_solve(
             escalate_after=escalate_after,
             timeout=timeout,
             on_progress=on_progress,
+            on_tokens=_accumulate_tokens,
         )
         snapshot = manager.capture_snapshot(path)
         return SolveResult(
@@ -203,6 +276,9 @@ def run_solve(
             diff_excerpt=snapshot.diff_excerpt,
             changed_files=snapshot.changed_files,
             models_used=tuple(models_used),
+            input_tokens=token_totals[0],
+            output_tokens=token_totals[1],
+            error=result.error,
         )
     except Exception as exc:
         return SolveResult(
