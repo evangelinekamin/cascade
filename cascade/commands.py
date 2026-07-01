@@ -1540,27 +1540,59 @@ class CommandHandler:
             else:
                 _call_ui(self._set_progress_indicator_label, progress, label)
 
+        def _on_tokens(in_tokens: int, out_tokens: int) -> None:
+            def _apply() -> None:
+                state = getattr(self.app, "state", None)
+                if state is None or not provider:
+                    return
+                state.update_tokens(provider, in_tokens, out_tokens)
+                try:
+                    from .widgets.status_bar import StatusBar
+                    self.app.screen.query_one(StatusBar).update_tokens(
+                        state.provider_tokens
+                    )
+                except Exception:
+                    pass
+            _call_ui(_apply)
+
         def _worker() -> None:
             try:
                 from .swarm.solve import run_solve
 
                 result = run_solve(
-                    cli_app, objective, provider_name=provider, on_progress=_on_progress
+                    cli_app,
+                    objective,
+                    provider_name=provider,
+                    on_progress=_on_progress,
+                    on_tokens=_on_tokens,
                 )
 
-                outcome = "PASSED" if result.passed else "FAILED"
-                lines = [
-                    f"Solve {outcome} after {result.iterations} "
-                    f"iteration(s) on {result.provider}"
-                ]
+                if result.error and result.iterations == 0 and not result.passed:
+                    lines = [f"Solve could not start on {result.provider}"]
+                else:
+                    outcome = "PASSED" if result.passed else "FAILED"
+                    lines = [
+                        f"Solve {outcome} after {result.iterations} "
+                        f"iteration(s) on {result.provider}"
+                    ]
                 if result.models_used:
                     seq: list[str] = []
                     for m in result.models_used:
                         if not seq or seq[-1] != m:
                             seq.append(m)
                     lines.append("Models: " + " -> ".join(seq))
+                if result.input_tokens or result.output_tokens:
+                    lines.append(
+                        f"Tokens: {result.input_tokens:,} in / "
+                        f"{result.output_tokens:,} out"
+                    )
                 if result.error:
                     lines.append(f"Error: {result.error}")
+                    if "did not run" in result.error:
+                        lines.append(
+                            "Hint: set workflows.verify.test to a command that runs "
+                            "in this project (e.g. 'uv run pytest' for uv projects)."
+                        )
                 if result.changed_files:
                     lines.append("Files: " + ", ".join(result.changed_files[:8]))
                 if result.diff_stat:

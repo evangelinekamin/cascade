@@ -38,6 +38,50 @@ def test_run_tests_in_reports_pass_and_fail(tmp_path):
     assert rc != 0
 
 
+def test_is_infra_failure_flags_commands_that_did_not_run():
+    # command missing, pytest missing, or nothing collected -- none of which an
+    # agent can fix by editing code.
+    assert solve_mod._is_infra_failure("/bin/sh: 1: python: not found", 127) is True
+    assert solve_mod._is_infra_failure("/usr/bin/python: No module named pytest", 1) is True
+    assert solve_mod._is_infra_failure("no tests ran in 0.01s", 5) is True
+
+
+def test_is_infra_failure_false_for_genuine_test_failures():
+    assert solve_mod._is_infra_failure("1 failed, 3 passed in 0.2s", 1) is False
+    assert solve_mod._is_infra_failure("2 passed in 0.1s", 0) is False
+
+
+def test_run_solve_aborts_immediately_on_a_broken_gate(monkeypatch):
+    # A verify command that cannot execute must abort at once -- no agent
+    # iteration, no escalation -- with a clear "did not run" error.
+    app = _fake_app("python -m pytest -x -q")
+    fm = MagicMock()
+    fm.prepare.return_value = SimpleNamespace(path="/tmp/wt-broken")
+    fm.capture_snapshot.return_value = SimpleNamespace(
+        diff_stat="", diff_excerpt="", changed_files=()
+    )
+    monkeypatch.setattr(solve_mod, "WorktreeManager", lambda *a, **k: fm)
+
+    agent_calls: list[int] = []
+    monkeypatch.setattr(
+        solve_mod,
+        "run_agent_in_worktree",
+        lambda *a, **k: agent_calls.append(1) or "edited",
+    )
+    monkeypatch.setattr(
+        solve_mod,
+        "_run_tests_in",
+        lambda cmd, cwd, timeout: ("/bin/sh: python: command not found", 127),
+    )
+
+    result = run_solve(app, "fix the validator")
+
+    assert result.passed is False
+    assert result.iterations == 0
+    assert agent_calls == []  # no agent iteration wasted on a broken gate
+    assert "did not run" in result.error.lower()
+
+
 def test_run_solve_missing_provider_returns_error():
     app = _fake_app()
     app.providers = {}
@@ -90,6 +134,7 @@ def test_run_solve_retries_until_tests_pass(monkeypatch):
     )
     monkeypatch.setattr(solve_mod, "WorktreeManager", lambda *a, **k: fake_manager)
     monkeypatch.setattr(solve_mod, "run_agent_in_worktree", lambda *a, **k: "edited")
+    monkeypatch.setattr(solve_mod, "_preflight_gate", lambda *a, **k: None)
 
     results = iter([("FAILED", 1), ("ok", 0)])
     monkeypatch.setattr(solve_mod, "_run_tests_in", lambda cmd, cwd, timeout: next(results))
@@ -125,6 +170,7 @@ def _patch_solve(monkeypatch, observed, test_results):
     )
     monkeypatch.setattr(solve_mod, "run_agent_in_worktree", fake_agent)
     monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: next(test_results))
+    monkeypatch.setattr(solve_mod, "_preflight_gate", lambda *a, **k: None)
     monkeypatch.setattr(solve_mod, "WorktreeManager", lambda *a, **k: fm)
 
 
@@ -140,6 +186,37 @@ def test_escalates_to_frontier_after_first_failure(monkeypatch):
     assert result.models_used == ("bulk-x", "frontier-x")
     # the provider's model is restored to its original value afterward
     assert prov.config.model == "frontier-x"
+
+
+def test_run_solve_accumulates_and_reports_token_usage(monkeypatch):
+    app = MagicMock()
+    prov = MagicMock()
+    prov.config = SimpleNamespace(model="frontier")
+    prov.last_usage = (100, 40)  # each agent iteration reports this usage
+    app.providers = {"openai": prov}
+    app.config.get_default_provider.return_value = "openai"
+    app.config.get_model_for = MagicMock(
+        side_effect=lambda name, mode_name=None, fast=False: "bulk" if fast else "frontier"
+    )
+    app.config.data = {"workflows": {"verify": {"test": "pytest"}}}
+
+    fm = MagicMock()
+    fm.prepare.return_value = SimpleNamespace(path="/tmp/wt")
+    fm.capture_snapshot.return_value = SimpleNamespace(
+        diff_stat="", diff_excerpt="", changed_files=()
+    )
+    monkeypatch.setattr(solve_mod, "WorktreeManager", lambda *a, **k: fm)
+    monkeypatch.setattr(solve_mod, "_preflight_gate", lambda *a, **k: None)
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", lambda *a, **k: "edited")
+    results = iter([("FAIL", 1), ("ok", 0)])  # fail then pass -> 2 agent iterations
+    monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: next(results))
+
+    reported: list[tuple[int, int]] = []
+    result = run_solve(app, "x", on_tokens=lambda i, o: reported.append((i, o)))
+
+    assert result.input_tokens == 200  # 2 iterations x 100
+    assert result.output_tokens == 80  # 2 iterations x 40
+    assert reported == [(100, 40), (100, 40)]  # reported live, once per iteration
 
 
 def test_no_escalation_uses_frontier_throughout(monkeypatch):
