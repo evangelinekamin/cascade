@@ -76,6 +76,24 @@ class ConfigManager:
                     "model": "gpt-5.3-codex",
                     "temperature": 0.7,
                 },
+                "local": {
+                    # Keyless OpenAI-compatible model on THIS machine (fast tier).
+                    # Flip enabled to true to use it -- no API key required.
+                    "enabled": False,
+                    "requires_key": False,
+                    "base_url": "http://127.0.0.1:8080/v1",
+                    "model": "qwen36",
+                    "temperature": 0.7,
+                },
+                "glm": {
+                    # Keyless OpenAI-compatible model on a remote box (strong tier).
+                    # local -> glm escalation is handled by routing (see roadmap).
+                    "enabled": False,
+                    "requires_key": False,
+                    "base_url": "http://512s2.netbird.cloud:52415/v1",
+                    "model": "pipenetwork/GLM-5.2-MLX-8bit",
+                    "temperature": 0.7,
+                },
             },
             "defaults": {
                 "provider": "gemini",
@@ -161,7 +179,8 @@ class ConfigManager:
             return None
 
         api_key = self._resolve_env_var(provider_data.get("api_key", ""))
-        if not api_key:
+        # Self-hosted / local endpoints can opt out of the key requirement.
+        if not api_key and provider_data.get("requires_key", True):
             return None
 
         return ProviderConfig(
