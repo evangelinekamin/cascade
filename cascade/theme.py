@@ -117,6 +117,24 @@ PROVIDERS: Dict[str, ProviderTheme] = {
         default_mode="test",
         label="test mode",
     ),
+    "local": ProviderTheme(
+        name="local",
+        accent="#4c8dff",
+        accent_shimmer="#7dabff",
+        dim="#16233d",
+        abbreviation="loc",
+        default_mode="build",
+        label="build mode",
+    ),
+    "glm": ProviderTheme(
+        name="glm",
+        accent="#20c9b5",
+        accent_shimmer="#5fe0d0",
+        dim="#12332e",
+        abbreviation="glm",
+        default_mode="build",
+        label="build mode",
+    ),
 }
 
 _NEUTRAL = ProviderTheme(

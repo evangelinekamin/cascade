@@ -145,6 +145,40 @@ def test_apply_credential_new_provider():
         assert config.api_key == "sk-test-token"
 
 
+def test_get_provider_config_allows_keyless_when_requires_key_false():
+    """A provider marked requires_key: false works with no API key (self-hosted)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        manager.data["providers"]["local"] = {
+            "enabled": True,
+            "requires_key": False,
+            "base_url": "http://example.local/v1",
+            "model": "some/model",
+        }
+
+        config = manager.get_provider_config("local")
+        assert config is not None
+        assert config.api_key == ""
+        assert config.base_url == "http://example.local/v1"
+        assert config.model == "some/model"
+
+
+def test_get_provider_config_still_requires_key_by_default():
+    """Keyless is opt-in: without requires_key: false, a missing key still gates."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        manager.data["providers"]["custom"] = {
+            "enabled": True,
+            "model": "some/model",
+        }
+
+        assert manager.get_provider_config("custom") is None
+
+
 def test_memory_config_defaults():
     """Memory config should expose safe defaults."""
     with tempfile.TemporaryDirectory() as tmpdir:
