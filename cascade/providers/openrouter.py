@@ -148,6 +148,7 @@ class OpenRouterProvider(BaseProvider):
                 max_rounds=max_rounds,
                 on_tool_event=on_tool_event,
                 on_usage=lambda usage: setattr(self, "_last_usage", usage),
+                context_window=self.config.context_window,
             )
         except RuntimeError as exc:
             fallback_model = self.get_fallback_model()
@@ -170,6 +171,7 @@ class OpenRouterProvider(BaseProvider):
                     max_rounds=max_rounds,
                     on_tool_event=on_tool_event,
                     on_usage=lambda usage: setattr(self, "_last_usage", usage),
+                    context_window=self.config.context_window,
                 )
             raise
 

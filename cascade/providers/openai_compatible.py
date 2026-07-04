@@ -148,6 +148,7 @@ class OpenAICompatibleProvider(BaseProvider):
             max_rounds=max_rounds,
             on_tool_event=on_tool_event,
             on_usage=lambda usage: setattr(self, "_last_usage", usage),
+            context_window=self.config.context_window,
         )
 
     def compare(self, prompt: str, system: Optional[str] = None) -> dict:

@@ -84,6 +84,9 @@ class ConfigManager:
                     "base_url": "http://127.0.0.1:8080/v1",
                     "model": "qwen36",
                     "temperature": 0.7,
+                    # Self-hosted small window -- keeps the agentic loop from
+                    # overflowing a 32K-context local model.
+                    "context_window": 32768,
                 },
                 "glm": {
                     # Keyless OpenAI-compatible model on a remote box (strong tier).
@@ -93,6 +96,7 @@ class ConfigManager:
                     "base_url": "http://512s2.netbird.cloud:52415/v1",
                     "model": "pipenetwork/GLM-5.2-MLX-8bit",
                     "temperature": 0.7,
+                    "context_window": 32768,
                 },
             },
             "defaults": {
@@ -190,6 +194,7 @@ class ConfigManager:
             temperature=provider_data.get("temperature", 0.7),
             max_tokens=provider_data.get("max_tokens"),
             fallback_model=provider_data.get("fallback_model"),
+            context_window=provider_data.get("context_window", 128000),
         )
 
     def _resolve_env_var(self, value: str) -> str:
