@@ -9,6 +9,7 @@ file tools rooted at the worktree.
 
 from __future__ import annotations
 
+import subprocess
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
@@ -16,11 +17,25 @@ from typing import Optional
 from ..tools.schema import ToolDef, callable_to_tool_def
 
 
+# Command output is capped to its tail: errors and test summaries live at the
+# end, and an uncapped dump would blow a small local model's context window.
+_OUTPUT_CAP = 4000
+_TRUNCATION_MARKER = "[...truncated...]"
+
+
+def _truncate_tail(text: str, cap: int = _OUTPUT_CAP) -> str:
+    """Cap *text* to its last *cap* chars, marking that the head was dropped."""
+    if len(text) <= cap:
+        return text
+    return f"{_TRUNCATION_MARKER}\n{text[-cap:]}"
+
+
 class WorkspaceTools:
     """Restricted file tools rooted at a single worktree path."""
 
-    def __init__(self, root: str):
+    def __init__(self, root: str, command_timeout: float = 120.0):
         self._root = Path(root).resolve()
+        self._command_timeout = command_timeout
 
     def build(self) -> dict[str, ToolDef]:
         description = "Read, write, append, and list files inside the isolated coding worktree"
@@ -32,6 +47,10 @@ class WorkspaceTools:
             "append_file": callable_to_tool_def("append_file", self.append_file, description=description),
             "list_files": callable_to_tool_def(
                 "list_files", self.list_files, description=description, read_only=True,
+            ),
+            "run_command": callable_to_tool_def(
+                "run_command", self.run_command,
+                description="Run a shell command in the workspace root",
             ),
         }
 
@@ -80,18 +99,55 @@ class WorkspaceTools:
         except Exception as exc:
             return [f"Error: {exc}"]
 
+    def run_command(self, command: str) -> str:
+        """Run a shell command in the workspace root and return its output.
+
+        Runs *command* through the shell with the worktree as the working
+        directory and returns the exit code followed by the combined
+        stdout+stderr. Use it to run tests (e.g. ``uv run pytest tests/test_x.py
+        -q``), grep the tree, or run throwaway Python -- then read the output and
+        iterate instead of editing blind. Long output is truncated to its tail.
+
+        Args:
+            command: The shell command to run in the workspace root.
+        """
+        # cwd is the isolated worktree (a throwaway copy under
+        # ~/.cache/cascade/worktrees), so this cannot touch the user's real tree
+        # -- the same trust model as the CLI-proxy providers, which already drive
+        # full bash. v1 deliberately does no further sandboxing.
+        try:
+            completed = subprocess.run(
+                command,
+                shell=True,
+                cwd=self._root,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=self._command_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return f"Command timed out after {self._command_timeout:g}s"
+        except Exception as exc:
+            return f"Error running command: {exc}"
+
+        combined = (completed.stdout or "") + (completed.stderr or "")
+        return f"Exit code: {completed.returncode}\n{_truncate_tail(combined)}"
+
 
 def run_agent_in_worktree(
     provider,
     prompt: str,
     worktree_path: str,
     system: Optional[str] = None,
+    max_rounds: int = 15,
 ) -> str:
     """Run *provider* as a tool-using agent rooted at *worktree_path*.
 
     Returns the provider's final response text. CLI-proxy providers edit files
     directly through their native agent (driven into the worktree via
-    ``working_directory``); API providers receive sandboxed ``WorkspaceTools``.
+    ``working_directory``); API providers receive sandboxed ``WorkspaceTools``
+    and up to ``max_rounds`` tool-calling round trips -- higher than the plain
+    ``ask_with_tools`` default so a model can read several files before it writes.
     """
     workdir = getattr(provider, "working_directory", None)
     ctx = provider.working_directory(worktree_path) if callable(workdir) else nullcontext()
@@ -102,5 +158,6 @@ def run_agent_in_worktree(
             [{"role": "user", "content": prompt}],
             WorkspaceTools(worktree_path).build(),
             system=system,
+            max_rounds=max_rounds,
         )
         return response
