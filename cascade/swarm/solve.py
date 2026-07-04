@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import subprocess
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -105,6 +106,32 @@ def _test_command(app) -> str:
         return DEFAULT_TEST_CMD
 
 
+def _worktree_change_summary(path: str, cap: int = 1500) -> str:
+    """Return a capped ``git diff --stat`` of the worker's changes so far, or ''.
+
+    Diffs against the worktree's baseline commit (its HEAD, into which the
+    manager folded any pre-existing dirt) and marks new files intent-to-add so
+    freshly created files also appear. Best-effort: any git error yields ''. Fed
+    into retry prompts so a re-running agent builds on prior work, not cold.
+    """
+    def _git(args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args], cwd=path, capture_output=True, text=True, timeout=30
+        )
+
+    try:
+        _git(["add", "-N", "."])
+        result = _git(["diff", "--stat", "HEAD"])
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    out = (result.stdout or "").strip()
+    if len(out) > cap:
+        out = out[-cap:]
+    return out
+
+
 def _run_tests_in(cmd: str, cwd: str, timeout: int) -> "tuple[str, int]":
     """Run *cmd* inside *cwd*; return (combined output, returncode)."""
     try:
@@ -162,6 +189,57 @@ def _preflight_gate(test_cmd: str, cwd: str, timeout: int) -> Optional[str]:
     return None
 
 
+# The verified loop OWNS the scaffolded tests -- they are the contract the worker
+# is graded against -- so it protects them here rather than in the generic
+# WorkspaceTools layer, which cannot know which tests are the contract.
+_TEST_DIR_SEGMENTS = frozenset({"tests", "test"})
+
+
+def _is_test_file(rel_path: Path) -> bool:
+    """True when *rel_path* (relative to the worktree) is a gating test file.
+
+    A file counts as a test if its basename matches ``test_*.py``, ``*_test.py``,
+    or ``conftest.py``, or if any parent directory segment is ``tests`` or ``test``.
+    """
+    name = rel_path.name
+    if fnmatch(name, "test_*.py") or fnmatch(name, "*_test.py") or name == "conftest.py":
+        return True
+    return any(segment in _TEST_DIR_SEGMENTS for segment in rel_path.parent.parts)
+
+
+def _snapshot_test_files(worktree_path: str) -> dict[str, str]:
+    """Capture path -> content for every test file currently in the worktree.
+
+    Taken before the worker runs; restored before each verification so worker
+    edits to the gating tests never count. Binary or unreadable files are skipped
+    (only text that can be faithfully restored is recorded).
+    """
+    root = Path(worktree_path)
+    snapshot: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or not _is_test_file(path.relative_to(root)):
+            continue
+        try:
+            snapshot[str(path)] = path.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+    return snapshot
+
+
+def _restore_files(mapping: dict[str, str]) -> None:
+    """Restore each recorded path to its snapshotted content, overwriting edits.
+
+    Only paths present in *mapping* (all of which existed at snapshot time) are
+    touched; worker-created new files and the worker's implementation are left
+    untouched.
+    """
+    for path, content in mapping.items():
+        try:
+            Path(path).write_text(content)
+        except OSError:
+            continue
+
+
 def run_verified_task(
     provider,
     worktree_path: str,
@@ -171,6 +249,7 @@ def run_verified_task(
     bulk_model: str,
     frontier_model: str,
     max_iterations: int = 3,
+    max_rounds: int = 15,
     escalate: bool = True,
     escalate_after: int = 1,
     timeout: int = 300,
@@ -200,7 +279,9 @@ def run_verified_task(
         original_model = provider.config.model
         provider.config.model = model
         try:
-            response = run_agent_in_worktree(provider, prompt, path, system=_WORKER_SYSTEM)
+            response = run_agent_in_worktree(
+                provider, prompt, path, system=_WORKER_SYSTEM, max_rounds=max_rounds
+            )
             if on_tokens is not None:
                 usage = getattr(provider, "last_usage", None)
                 if isinstance(usage, tuple) and len(usage) == 2:
@@ -213,6 +294,10 @@ def run_verified_task(
             provider.config.model = original_model
 
     def run_tests(path: str) -> "tuple[str, int]":
+        # Restore the scaffolded gating tests (snapshotted below, once the
+        # preflight gate passes) before every verification, so any worker edits
+        # to them are reverted and cannot weaken the spec that grades the worker.
+        _restore_files(test_snapshot)
         if on_progress:
             on_progress("verifying", f"running: {test_cmd}")
         return _run_tests_in(test_cmd, path, timeout)
@@ -236,8 +321,17 @@ def run_verified_task(
         )
         return aborted, []
 
+    # Snapshot the scaffolded tests now -- after the gate proves them healthy and
+    # before the worker touches anything -- so run_tests can restore them each
+    # cycle, making the contract immutable to the worker.
+    test_snapshot = _snapshot_test_files(worktree_path)
+
     worker = VerifiedWorker(
-        run_agent, run_tests, lambda: worktree_path, max_iterations=max_iterations
+        run_agent,
+        run_tests,
+        lambda: worktree_path,
+        max_iterations=max_iterations,
+        describe_changes=_worktree_change_summary,
     )
     result = worker.run(task, on_attempt=on_attempt)
     return result, models_used
@@ -249,6 +343,7 @@ def run_solve(
     provider_name: Optional[str] = None,
     *,
     max_iterations: int = 3,
+    max_rounds: int = 15,
     escalate: bool = True,
     escalate_after: int = 1,
     timeout: int = 300,
@@ -305,6 +400,7 @@ def run_solve(
             bulk_model=bulk_model,
             frontier_model=frontier_model,
             max_iterations=max_iterations,
+            max_rounds=max_rounds,
             escalate=escalate,
             escalate_after=escalate_after,
             timeout=timeout,

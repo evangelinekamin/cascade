@@ -1,5 +1,6 @@
 """Tests for the run_solve assembly (the runnable verified worker)."""
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -10,6 +11,7 @@ from cascade.swarm.solve import (
     _run_tests_in,
     _test_command,
     run_solve,
+    run_verified_task,
 )
 
 
@@ -191,7 +193,7 @@ def _tiered_app(bulk="bulk-x", frontier="frontier-x"):
 
 
 def _patch_solve(monkeypatch, observed, test_results):
-    def fake_agent(provider, prompt, path, system=None):
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None):
         observed.append(provider.config.model)
         return "edited"
 
@@ -260,3 +262,224 @@ def test_no_escalation_uses_frontier_throughout(monkeypatch):
 
     assert observed == ["frontier-x", "frontier-x"]
     assert set(result.models_used) == {"frontier-x"}
+
+
+# --- Fix 1: the agentic build loop must raise the tool-call budget --------------
+
+
+def _capture_max_rounds(monkeypatch):
+    """Patch the solve internals and return a list capturing forwarded max_rounds."""
+    captured: list[int] = []
+
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None):
+        captured.append(max_rounds)
+        return "edited"
+
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", fake_agent)
+    monkeypatch.setattr(solve_mod, "_preflight_gate", lambda *a, **k: None)
+    monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: ("ok", 0))
+    return captured
+
+
+def _prov():
+    prov = MagicMock()
+    prov.config = SimpleNamespace(model="m")
+    return prov
+
+
+def test_run_verified_task_defaults_max_rounds_to_15(monkeypatch):
+    captured = _capture_max_rounds(monkeypatch)
+    run_verified_task(
+        _prov(), "/tmp/wt", "task", "pytest", bulk_model="b", frontier_model="f"
+    )
+    assert captured == [15]
+
+
+def test_run_verified_task_threads_max_rounds_override(monkeypatch):
+    captured = _capture_max_rounds(monkeypatch)
+    run_verified_task(
+        _prov(),
+        "/tmp/wt",
+        "task",
+        "pytest",
+        bulk_model="b",
+        frontier_model="f",
+        max_rounds=42,
+    )
+    assert captured == [42]
+
+
+def test_run_solve_defaults_max_rounds_to_15(monkeypatch):
+    app = _fake_app("pytest")
+    captured = _capture_max_rounds(monkeypatch)
+    fm = MagicMock()
+    fm.prepare.return_value = SimpleNamespace(path="/tmp/wt")
+    fm.capture_snapshot.return_value = SimpleNamespace(
+        diff_stat="", diff_excerpt="", changed_files=()
+    )
+    monkeypatch.setattr(solve_mod, "WorktreeManager", lambda *a, **k: fm)
+
+    run_solve(app, "x")
+    assert captured == [15]
+
+
+def test_run_solve_threads_max_rounds_override(monkeypatch):
+    app = _fake_app("pytest")
+    captured = _capture_max_rounds(monkeypatch)
+    fm = MagicMock()
+    fm.prepare.return_value = SimpleNamespace(path="/tmp/wt")
+    fm.capture_snapshot.return_value = SimpleNamespace(
+        diff_stat="", diff_excerpt="", changed_files=()
+    )
+    monkeypatch.setattr(solve_mod, "WorktreeManager", lambda *a, **k: fm)
+
+    run_solve(app, "x", max_rounds=7)
+    assert captured == [7]
+
+
+# --- Fix 2: the scaffolded gating tests must be immutable to the worker ----------
+
+
+def test_snapshot_test_files_detects_by_all_rules(tmp_path):
+    # by basename
+    (tmp_path / "test_foo.py").write_text("a")
+    (tmp_path / "bar_test.py").write_text("b")
+    (tmp_path / "conftest.py").write_text("c")
+    # by directory segment (non-test basenames still count under tests/ or test/)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "helpers.py").write_text("d")
+    (tmp_path / "pkg" / "test").mkdir(parents=True)
+    (tmp_path / "pkg" / "test" / "data.txt").write_text("e")
+    # non-test files that must be excluded
+    (tmp_path / "feature.py").write_text("impl")
+    (tmp_path / "README.md").write_text("doc")
+    (tmp_path / "pkg" / "module.py").write_text("mod")
+
+    snap = solve_mod._snapshot_test_files(str(tmp_path))
+
+    got = {Path(p).relative_to(tmp_path).as_posix() for p in snap}
+    assert got == {
+        "test_foo.py",
+        "bar_test.py",
+        "conftest.py",
+        "tests/helpers.py",
+        "pkg/test/data.txt",
+    }
+    # content is captured verbatim
+    assert snap[str(tmp_path / "test_foo.py")] == "a"
+
+
+def test_restore_files_overwrites_only_mapped_paths(tmp_path):
+    protected = tmp_path / "test_spec.py"
+    protected.write_text("ORIGINAL")
+    other = tmp_path / "impl.py"
+    other.write_text("IMPL")
+
+    snapshot = {str(protected): "ORIGINAL"}
+    protected.write_text("TAMPERED")  # worker weakens the gate
+    other.write_text("CHANGED")  # legitimate worker edit
+
+    solve_mod._restore_files(snapshot)
+
+    assert protected.read_text() == "ORIGINAL"  # restored to the contract
+    assert other.read_text() == "CHANGED"  # not in mapping -> left alone
+
+
+def test_verified_task_restores_tampered_tests_but_keeps_impl_and_new_files(
+    tmp_path, monkeypatch
+):
+    # A scaffolded gating test exists before the worker runs.
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_feature.py").write_text("SPEC = 'original'\n")
+
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None):
+        root = Path(path)
+        # worker tampers with the gating test (reward hacking)...
+        (root / "tests" / "test_feature.py").write_text("SPEC = 'HACKED'\n")
+        # ...writes a legitimate implementation (a non-test file)...
+        (root / "feature.py").write_text("def feature():\n    return 1\n")
+        # ...and creates brand-new files, including a new test file.
+        (root / "tests" / "test_extra.py").write_text("EXTRA = 1\n")
+        (root / "notes.txt").write_text("scratch\n")
+        return "edited"
+
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", fake_agent)
+    monkeypatch.setattr(solve_mod, "_preflight_gate", lambda *a, **k: None)
+    monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: ("ok", 0))
+
+    result, _models = run_verified_task(
+        _prov(), str(tmp_path), "add feature", "pytest", bulk_model="b", frontier_model="f"
+    )
+
+    # The gating test is restored to its scaffolded content...
+    assert (tmp_path / "tests" / "test_feature.py").read_text() == "SPEC = 'original'\n"
+    # ...while the worker's implementation and any new files are left intact.
+    assert (tmp_path / "feature.py").read_text() == "def feature():\n    return 1\n"
+    assert (tmp_path / "tests" / "test_extra.py").read_text() == "EXTRA = 1\n"
+    assert (tmp_path / "notes.txt").read_text() == "scratch\n"
+    assert result.passed is True
+
+
+# --- Light iteration memory: the worker is told what it already changed ----------
+
+
+def _init_repo_with_baseline(tmp_path):
+    import subprocess
+
+    def git(*args):
+        subprocess.run(
+            ["git", "-c", "user.name=T", "-c", "user.email=t@t", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    git("init")
+    git("commit", "--allow-empty", "-m", "baseline")
+
+
+def test_worktree_change_summary_lists_new_and_modified_files(tmp_path):
+    _init_repo_with_baseline(tmp_path)
+    (tmp_path / "impl.py").write_text("def f():\n    return 1\n")  # brand-new file
+
+    summary = solve_mod._worktree_change_summary(str(tmp_path))
+
+    assert "impl.py" in summary  # new files show up (via intent-to-add)
+
+
+def test_worktree_change_summary_is_capped(tmp_path):
+    _init_repo_with_baseline(tmp_path)
+    for i in range(20):
+        (tmp_path / f"file_{i}.py").write_text("x = 1\n")
+
+    summary = solve_mod._worktree_change_summary(str(tmp_path), cap=60)
+    assert len(summary) <= 60
+
+
+def test_worktree_change_summary_empty_outside_a_git_repo(tmp_path):
+    assert solve_mod._worktree_change_summary(str(tmp_path)) == ""
+
+
+def test_run_verified_task_feeds_prior_changes_into_the_retry(monkeypatch):
+    prompts: list[str] = []
+
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None):
+        prompts.append(prompt)
+        return "edited"
+
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", fake_agent)
+    monkeypatch.setattr(solve_mod, "_preflight_gate", lambda *a, **k: None)
+    monkeypatch.setattr(
+        solve_mod, "_worktree_change_summary", lambda path, **k: "MEMO_DIFFSTAT impl.py | 3 +++"
+    )
+    results = iter([("FAILED test_x", 1), ("ok", 0)])
+    monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: next(results))
+
+    run_verified_task(
+        _prov(), "/tmp/wt", "task", "pytest", bulk_model="b", frontier_model="f"
+    )
+
+    assert "MEMO_DIFFSTAT" not in prompts[0]  # first pass has no prior work
+    assert "MEMO_DIFFSTAT" in prompts[1]  # retry builds on what already changed
