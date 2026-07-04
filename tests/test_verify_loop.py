@@ -5,15 +5,21 @@ run_tests, prepare_worktree), so its logic is testable without real providers
 or subprocesses.
 """
 
-from cascade.swarm.verify_loop import VerifiedWorker, WorkerResult, VerifyAttempt
+from cascade.swarm.verify_loop import (
+    VerifiedWorker,
+    WorkerResult,
+    VerifyAttempt,
+    _compact_test_output,
+)
 
 
-def _worker(run_agent, run_tests, *, max_iterations=3, path="/tmp/wt"):
+def _worker(run_agent, run_tests, *, max_iterations=3, path="/tmp/wt", describe_changes=None):
     return VerifiedWorker(
         run_agent=run_agent,
         run_tests=run_tests,
         prepare_worktree=lambda: path,
         max_iterations=max_iterations,
+        describe_changes=describe_changes,
     )
 
 
@@ -97,3 +103,117 @@ def test_on_attempt_called_once_per_iteration():
     worker.run("task", on_attempt=lambda a: seen.append((a.iteration, a.passed)))
 
     assert seen == [(1, False), (2, True)]
+
+
+# --- Test-output compaction (feedback stays small on every retry) ---------------
+
+
+def test_compact_test_output_passes_short_output_through():
+    out = "1 failed, 3 passed in 0.2s"
+    assert _compact_test_output(out, cap=4000) == out
+
+
+def test_compact_test_output_keeps_the_failures_section():
+    head = "collecting ...\n" + "NOISE_PREAMBLE line\n" * 2000  # long, irrelevant
+    failures = (
+        "=================================== FAILURES ===================================\n"
+        "____________________________ test_widget ____________________________\n"
+        "    assert result == 42\n"
+        "E   assert 7 == 42\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_widget.py::test_widget - assert 7 == 42\n"
+        "1 failed, 3 passed in 0.30s\n"
+    )
+    compacted = _compact_test_output(head + failures, cap=4000)
+
+    assert "FAILURES" in compacted
+    assert "E   assert 7 == 42" in compacted
+    assert "1 failed, 3 passed" in compacted
+    assert "NOISE_PREAMBLE" not in compacted  # the verbose preamble is dropped
+    assert len(compacted) <= 4000
+
+
+def test_compact_test_output_falls_back_to_tail_without_a_section():
+    body = "".join(f"line {i}\n" for i in range(5000))
+    tail_marker = "FINAL_SUMMARY_LINE 2 failed\n"
+    compacted = _compact_test_output(body + tail_marker, cap=1000)
+
+    assert tail_marker.strip() in compacted  # the salient tail is preserved
+    assert len(compacted) <= 1000 + len(tail_marker)
+
+
+def test_retry_prompt_uses_compacted_output_not_the_full_dump():
+    huge_failure = "NOISE_PREAMBLE line\n" * 5000 + (
+        "=================================== FAILURES ===================================\n"
+        "E   assert TOKEN_XYZ\n"
+        "1 failed in 0.1s\n"
+    )
+    prompts: list[str] = []
+
+    def agent(prompt, path):
+        prompts.append(prompt)
+        return "edited"
+
+    results = iter([(huge_failure, 1), ("ok", 0)])
+    worker = _worker(agent, lambda path: next(results))
+    worker.run("fix parser")
+
+    retry = prompts[1]
+    assert "TOKEN_XYZ" in retry  # the salient failure reached the agent
+    assert "NOISE_PREAMBLE" not in retry  # the verbose dump did not
+    assert len(retry) < len(huge_failure)
+
+
+# --- Light iteration memory (build on prior work, don't restart cold) -----------
+
+
+def test_retry_prompt_includes_change_summary_when_available():
+    prompts: list[str] = []
+
+    def agent(prompt, path):
+        prompts.append(prompt)
+        return "edited"
+
+    results = iter([("FAILED", 1), ("ok", 0)])
+    worker = _worker(
+        agent,
+        lambda path: next(results),
+        describe_changes=lambda path: "SENTINEL_DIFFSTAT feature.py | 12 +++++",
+    )
+    worker.run("build feature")
+
+    assert "SENTINEL_DIFFSTAT" not in prompts[0]  # nothing changed yet on iter 1
+    assert "SENTINEL_DIFFSTAT" in prompts[1]  # iter 2 is told what already changed
+
+
+def test_change_summary_is_omitted_when_describer_returns_empty():
+    prompts: list[str] = []
+
+    def agent(prompt, path):
+        prompts.append(prompt)
+        return "edited"
+
+    results = iter([("FAILED thing", 1), ("ok", 0)])
+    worker = _worker(
+        agent,
+        lambda path: next(results),
+        describe_changes=lambda path: "",  # e.g. no diff / not a git repo
+    )
+    worker.run("build feature")
+
+    # A retry still happens and still carries the failure, just no memory block.
+    assert "FAILED thing" in prompts[1]
+
+
+def test_change_summary_describer_errors_do_not_break_the_loop():
+    def boom(path):
+        raise RuntimeError("git exploded")
+
+    results = iter([("FAILED", 1), ("ok", 0)])
+    worker = _worker(
+        lambda prompt, path: "edited",
+        lambda path: next(results),
+        describe_changes=boom,
+    )
+    result = worker.run("build feature")
+    assert result.passed is True  # a broken describer must not sink the run
