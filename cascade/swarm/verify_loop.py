@@ -39,6 +39,7 @@ class WorkerResult:
     attempts: tuple[VerifyAttempt, ...]
     worktree_path: str
     error: str = ""
+    guardrail_fired: bool = False
 
 
 RunAgent = Callable[[str, str], str]

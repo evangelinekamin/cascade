@@ -1575,6 +1575,11 @@ class CommandHandler:
                         f"Solve {outcome} after {result.iterations} "
                         f"iteration(s) on {result.provider}"
                     ]
+                if result.guardrail_fired:
+                    lines.append(
+                        "Guardrail: reverted the worker's needless edits to shared "
+                        "code to keep the suite green"
+                    )
                 if result.models_used:
                     seq: list[str] = []
                     for m in result.models_used:
