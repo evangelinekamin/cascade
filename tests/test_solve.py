@@ -483,3 +483,336 @@ def test_run_verified_task_feeds_prior_changes_into_the_retry(monkeypatch):
 
     assert "MEMO_DIFFSTAT" not in prompts[0]  # first pass has no prior work
     assert "MEMO_DIFFSTAT" in prompts[1]  # retry builds on what already changed
+
+
+# --- Fix 3: blast-radius guardrail (drop a careless model's needless edits) -------
+
+
+def _git_repo(tmp_path, files: dict[str, str]) -> None:
+    """Init a git repo at *tmp_path* and commit *files* (rel path -> content)."""
+    import subprocess
+
+    def git(*args):
+        subprocess.run(
+            ["git", "-c", "user.name=T", "-c", "user.email=t@t", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    git("init")
+    for rel, content in files.items():
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content)
+    git("add", "-A")
+    git("commit", "-m", "baseline")
+
+
+def _git_diff(tmp_path, ref: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", "diff", ref], cwd=tmp_path, capture_output=True, text=True
+    ).stdout
+
+
+def _pytest_rc(tmp_path) -> int:
+    import subprocess
+
+    return subprocess.run(
+        ["python3", "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    ).returncode
+
+
+# A shared helper file with f() at the top and enough padding that a rewrite of
+# f() and an appended g() land in two separate diff hunks (one non-additive, one
+# additive) -- the exact shape of the dogfooded regression.
+_SHARED_BASELINE = (
+    "def f():\n    return 1\n\n\n"
+    "PAD_A = 1\nPAD_B = 2\nPAD_C = 3\nPAD_D = 4\nPAD_E = 5\n"
+    "PAD_F = 6\nPAD_G = 7\nPAD_H = 8\nPAD_I = 9\nPAD_J = 10\n"
+)
+_SHARED_WORKER = (
+    "def f():\n    return 999\n\n\n"  # needless rewrite of a pre-existing line
+    "PAD_A = 1\nPAD_B = 2\nPAD_C = 3\nPAD_D = 4\nPAD_E = 5\n"
+    "PAD_F = 6\nPAD_G = 7\nPAD_H = 8\nPAD_I = 9\nPAD_J = 10\n\n\n"
+    "def g():\n    return 2\n"  # the feature: a purely additive new function
+)
+
+
+_ADDITIVE_DIFF = (
+    "diff --git a/new.py b/new.py\n"
+    "new file mode 100644\n"
+    "index 0000000..1111111\n"
+    "--- /dev/null\n"
+    "+++ b/new.py\n"
+    "@@ -0,0 +1,2 @@\n"
+    "+def g():\n"
+    "+    return 2\n"
+)
+
+_NONADDITIVE_DIFF = (
+    "diff --git a/shared.py b/shared.py\n"
+    "index a465610..0a510f3 100644\n"
+    "--- a/shared.py\n"
+    "+++ b/shared.py\n"
+    "@@ -1,3 +1,3 @@\n"
+    " def f():\n"
+    "-    return 1\n"
+    "+    return 999\n"
+    " END\n"
+)
+
+# The real two-hunk diff git emits for _SHARED_BASELINE -> _SHARED_WORKER.
+_MIXED_DIFF = (
+    "diff --git a/shared.py b/shared.py\n"
+    "index a465610..0a510f3 100644\n"
+    "--- a/shared.py\n"
+    "+++ b/shared.py\n"
+    "@@ -1,5 +1,5 @@\n"
+    " def f():\n"
+    "-    return 1\n"
+    "+    return 999\n"
+    " \n"
+    " \n"
+    " PAD_A = 1\n"
+    "@@ -12,3 +12,7 @@ PAD_G = 7\n"
+    " PAD_H = 8\n"
+    " PAD_I = 9\n"
+    " PAD_J = 10\n"
+    "+\n"
+    "+\n"
+    "+def g():\n"
+    "+    return 2\n"
+)
+
+
+def test_hunk_is_additive_for_pure_additions():
+    files = solve_mod._parse_file_diffs(_ADDITIVE_DIFF)
+    assert len(files) == 1
+    assert len(files[0].hunks) == 1
+    assert files[0].hunks[0].is_additive is True
+
+
+def test_hunk_is_nonadditive_when_a_line_is_removed_or_changed():
+    files = solve_mod._parse_file_diffs(_NONADDITIVE_DIFF)
+    assert files[0].hunks[0].is_additive is False
+
+
+def test_parse_classifies_each_hunk_of_a_mixed_file():
+    files = solve_mod._parse_file_diffs(_MIXED_DIFF)
+    assert len(files) == 1
+    hunks = files[0].hunks
+    assert len(hunks) == 2
+    assert hunks[0].is_additive is False  # the f() rewrite
+    assert hunks[1].is_additive is True  # the appended g()
+
+
+def test_hunk_body_respects_declared_counts_when_content_looks_like_a_marker():
+    # A content line that itself begins with "@@" / "diff --git" must not split
+    # the hunk -- the declared line counts keep the parse honest.
+    tricky = (
+        "diff --git a/doc.py b/doc.py\n"
+        "--- a/doc.py\n"
+        "+++ b/doc.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " keep\n"
+        "-old = '@@ not a header'\n"
+        "+new = 'diff --git also not a header'\n"
+    )
+    files = solve_mod._parse_file_diffs(tricky)
+    assert len(files) == 1
+    assert len(files[0].hunks) == 1  # not fooled into starting a second hunk
+    assert files[0].hunks[0].is_additive is False
+
+
+def test_nonadditive_patch_keeps_only_the_changed_hunk():
+    files = solve_mod._parse_file_diffs(_MIXED_DIFF)
+    patch, affected = solve_mod._nonadditive_patch(files)
+    assert affected == ("shared.py",)
+    assert "-    return 1" in patch and "+    return 999" in patch  # the change hunk
+    assert "def g()" not in patch  # the additive hunk is excluded
+
+
+def test_nonadditive_patch_is_empty_for_a_pure_additive_diff():
+    files = solve_mod._parse_file_diffs(_ADDITIVE_DIFF)
+    patch, affected = solve_mod._nonadditive_patch(files)
+    assert patch == ""
+    assert affected == ()
+
+
+def test_nonadditive_patch_skips_whole_file_deletions():
+    deletion = (
+        "diff --git a/gone.py b/gone.py\n"
+        "deleted file mode 100644\n"
+        "index a465610..0000000\n"
+        "--- a/gone.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n"
+        "-def f():\n"
+        "-    return 1\n"
+    )
+    patch, affected = solve_mod._nonadditive_patch(solve_mod._parse_file_diffs(deletion))
+    assert patch == ""  # no current file to restore into -> left for the loop
+    assert affected == ()
+
+
+def test_revert_nonadditive_hunks_keeps_addition_and_restores_line(tmp_path):
+    # The revert mechanism in isolation: a single file with both an added function
+    # and a changed pre-existing line -- reverting must leave the addition and
+    # restore the original line.
+    import subprocess
+
+    _git_repo(tmp_path, {"shared.py": _SHARED_BASELINE})
+    baseline = solve_mod._establish_guardrail_baseline(str(tmp_path))
+    assert baseline
+    (tmp_path / "shared.py").write_text(_SHARED_WORKER)
+
+    patch, affected = solve_mod._nonadditive_patch(
+        solve_mod._parse_file_diffs(_git_diff(tmp_path, baseline))
+    )
+    assert affected == ("shared.py",)
+    rc = subprocess.run(
+        ["git", "apply", "--reverse", "--whitespace=nowarn", "-"],
+        cwd=tmp_path,
+        input=patch,
+        capture_output=True,
+        text=True,
+    ).returncode
+    assert rc == 0
+
+    result = (tmp_path / "shared.py").read_text()
+    assert "return 1" in result  # pre-existing line restored
+    assert "return 999" not in result  # needless change dropped
+    assert "def g():" in result  # the addition is kept
+
+
+def test_establish_baseline_returns_none_outside_a_git_repo(tmp_path):
+    assert solve_mod._establish_guardrail_baseline(str(tmp_path)) is None
+
+
+def test_minimize_returns_false_outside_a_git_repo(tmp_path):
+    # git diff fails -> graceful fallback, no crash.
+    assert solve_mod._minimize_blast_radius(str(tmp_path), "HEAD", "true", 10) is False
+
+
+def test_minimize_is_a_noop_when_the_worker_only_added(tmp_path):
+    _git_repo(tmp_path, {"shared.py": "def f():\n    return 1\n"})
+    baseline = solve_mod._establish_guardrail_baseline(str(tmp_path))
+    # a purely additive change to a tracked file (appended function)
+    (tmp_path / "shared.py").write_text(
+        "def f():\n    return 1\n\n\ndef g():\n    return 2\n"
+    )
+    # even against a failing command, there is nothing non-additive to revert
+    assert solve_mod._minimize_blast_radius(str(tmp_path), baseline, "false", 5) is False
+    assert "def g():" in (tmp_path / "shared.py").read_text()  # append left intact
+
+
+def test_guardrail_greens_the_suite_by_dropping_a_needless_modification(
+    tmp_path, monkeypatch
+):
+    # The money test: a worker builds the feature (adds g) but needlessly rewrites
+    # a shared helper (f), reddening an unrelated test. The guardrail must drop the
+    # needless rewrite, keep the feature, and end green.
+    _git_repo(
+        tmp_path,
+        {
+            "shared.py": _SHARED_BASELINE,
+            "test_keep.py": "import shared\n\n\ndef test_keep():\n    assert shared.f() == 1\n",
+            "test_new.py": "import shared\n\n\ndef test_new():\n    assert shared.g() == 2\n",
+        },
+    )
+
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None):
+        (Path(path) / "shared.py").write_text(_SHARED_WORKER)
+        return "edited shared.py"
+
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", fake_agent)
+
+    result, _models = run_verified_task(
+        _prov(),
+        str(tmp_path),
+        "add g()",
+        "python3 -m pytest -q -p no:cacheprovider",
+        bulk_model="b",
+        frontier_model="f",
+        max_iterations=1,
+    )
+
+    assert result.passed is True
+    assert result.guardrail_fired is True
+    shared = (tmp_path / "shared.py").read_text()
+    assert "def g():" in shared  # the feature is kept
+    assert "return 1" in shared and "return 999" not in shared  # f() restored
+    assert _pytest_rc(tmp_path) == 0  # the suite is genuinely green
+
+
+def test_guardrail_reports_progress_when_it_fires(tmp_path, monkeypatch):
+    _git_repo(
+        tmp_path,
+        {
+            "shared.py": _SHARED_BASELINE,
+            "test_keep.py": "import shared\n\n\ndef test_keep():\n    assert shared.f() == 1\n",
+            "test_new.py": "import shared\n\n\ndef test_new():\n    assert shared.g() == 2\n",
+        },
+    )
+    monkeypatch.setattr(
+        solve_mod,
+        "run_agent_in_worktree",
+        lambda *a, **k: (Path(a[2]) / "shared.py").write_text(_SHARED_WORKER) or "edited",
+    )
+    stages: list[str] = []
+    run_verified_task(
+        _prov(),
+        str(tmp_path),
+        "add g()",
+        "python3 -m pytest -q -p no:cacheprovider",
+        bulk_model="b",
+        frontier_model="f",
+        max_iterations=1,
+        on_progress=lambda stage, detail: stages.append(stage),
+    )
+    assert "guardrail" in stages
+
+
+def test_guardrail_restores_worker_changes_when_the_revert_breaks_the_target(
+    tmp_path, monkeypatch
+):
+    # A worker whose modification of existing code is NECESSARY for the target:
+    # reverting it breaks the target, so the guardrail cannot reach green. It must
+    # restore the worker's changes and must NOT claim green.
+    _git_repo(
+        tmp_path,
+        {
+            "shared.py": "def f():\n    return 1\n",
+            "test_keep.py": "import shared\n\n\ndef test_keep():\n    assert shared.f() == 1\n",
+            "test_new.py": "import shared\n\n\ndef test_new():\n    assert shared.f() == 2\n",
+        },
+    )
+
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None):
+        # the only way to satisfy test_new is to change f() -- which breaks test_keep
+        (Path(path) / "shared.py").write_text("def f():\n    return 2\n")
+        return "edited"
+
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", fake_agent)
+
+    result, _models = run_verified_task(
+        _prov(),
+        str(tmp_path),
+        "make f return 2",
+        "python3 -m pytest -q -p no:cacheprovider",
+        bulk_model="b",
+        frontier_model="f",
+        max_iterations=1,
+    )
+
+    assert result.passed is False
+    assert result.guardrail_fired is False
+    # the worker's (load-bearing) change is restored, not left reverted
+    assert "return 2" in (tmp_path / "shared.py").read_text()
