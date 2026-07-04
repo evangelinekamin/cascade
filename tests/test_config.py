@@ -179,6 +179,54 @@ def test_get_provider_config_still_requires_key_by_default():
         assert manager.get_provider_config("custom") is None
 
 
+def test_provider_config_reads_context_window_default_128k():
+    """A provider without an explicit context_window defaults to 128000."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        manager.apply_credential("openai", "sk-test-token")
+        config = manager.get_provider_config("openai")
+        assert config.context_window == 128000
+
+
+def test_provider_config_reads_explicit_context_window():
+    """An explicit context_window in provider_data is threaded onto the config."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        manager.data["providers"]["custom"] = {
+            "enabled": True,
+            "requires_key": False,
+            "base_url": "http://example.local/v1",
+            "model": "some/model",
+            "context_window": 8192,
+        }
+        config = manager.get_provider_config("custom")
+        assert config.context_window == 8192
+
+
+def test_default_template_gives_local_and_glm_small_windows():
+    """Self-hosted local/glm providers ship with a 32K window in the template."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        assert manager.data["providers"]["local"]["context_window"] == 32768
+        assert manager.data["providers"]["glm"]["context_window"] == 32768
+
+
+def test_default_template_leaves_big_api_providers_at_default_window():
+    """Large API providers do not pin a small window in the template."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        for name in ("claude", "gemini", "openai", "openrouter"):
+            assert "context_window" not in manager.data["providers"][name]
+
+
 def test_memory_config_defaults():
     """Memory config should expose safe defaults."""
     with tempfile.TemporaryDirectory() as tmpdir:

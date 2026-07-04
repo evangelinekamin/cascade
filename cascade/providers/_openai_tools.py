@@ -16,6 +16,124 @@ if TYPE_CHECKING:
     from ..tools.schema import ToolDef
 
 
+# Keep tool-call context under this fraction of the model's window, leaving
+# headroom for the response. Small-context local models (e.g. a 32K Qwen)
+# otherwise 400 (context-length-exceeded) after a handful of file reads.
+_CONTEXT_BUDGET_FRACTION = 0.7
+
+# Recent messages eviction must never touch -- roughly the last couple of
+# tool-calling rounds -- so the model always sees its latest work in full.
+_KEEP_RECENT_MESSAGES = 6
+
+# chars-per-token heuristic, mirroring cascade.conversation.estimate_tokens.
+_CHARS_PER_TOKEN = 4
+
+
+def _estimate_tokens(messages: list[dict]) -> int:
+    """Rough token count for OpenAI api_message dicts (~1 token / 4 chars).
+
+    Counts string content plus tool-call function names and arguments (where
+    large writes accumulate). Robust to the ``content: None`` that assistant
+    tool-call messages carry.
+    """
+    chars = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            chars += len(content)
+        for call in message.get("tool_calls") or ():
+            function = call.get("function", {}) or {}
+            chars += len(function.get("name", "") or "")
+            chars += len(function.get("arguments", "") or "")
+    return chars // _CHARS_PER_TOKEN
+
+
+def _tool_names_by_call_id(messages: list[dict]) -> dict[str, str]:
+    """Map each tool_call_id to the tool name that issued it."""
+    names: dict[str, str] = {}
+    for message in messages:
+        for call in message.get("tool_calls") or ():
+            call_id = call.get("id")
+            if not call_id:
+                continue
+            function = call.get("function", {}) or {}
+            names[call_id] = function.get("name") or "tool"
+    return names
+
+
+def _protected_indices(messages: list[dict], keep_recent: int) -> set[int]:
+    """Indices eviction must never elide: system, first task, and recent tail."""
+    protected: set[int] = set()
+    for idx, message in enumerate(messages):
+        if message.get("role") == "system":
+            protected.add(idx)
+            break
+    for idx, message in enumerate(messages):
+        if message.get("role") == "user":
+            protected.add(idx)
+            break
+    if keep_recent > 0:
+        protected.update(range(max(0, len(messages) - keep_recent), len(messages)))
+    return protected
+
+
+def _compact_messages_to_budget(
+    messages: list[dict],
+    budget: int,
+    keep_recent: int = 3,
+) -> list[dict]:
+    """Elide old, large tool results so *messages* fits within *budget* tokens.
+
+    Walks oldest -> newest, replacing large ``tool``-role result contents with a
+    short stub and recomputing until the estimate is under budget. Never touches
+    the system message, the original first user task message, or the most recent
+    ``keep_recent`` messages -- those always stay full. Eliding only content (not
+    removing messages) keeps every tool_call_id paired with its result, so the
+    OpenAI message contract stays valid.
+
+    Pure: returns a new list of new dicts; the input is never mutated. Idempotent
+    once nothing further can be beneficially elided.
+    """
+    if _estimate_tokens(messages) <= budget:
+        return [dict(message) for message in messages]
+
+    names = _tool_names_by_call_id(messages)
+    protected = _protected_indices(messages, keep_recent)
+    result = [dict(message) for message in messages]
+
+    for idx, message in enumerate(result):
+        if _estimate_tokens(result) <= budget:
+            break
+        if idx in protected or message.get("role") != "tool":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        name = names.get(message.get("tool_call_id"), "tool")
+        stub = f"[elided to fit context: {name} result, {len(content)} chars]"
+        if len(stub) >= len(content):
+            continue  # eliding would not save anything
+        result[idx] = {**message, "content": stub}
+
+    return result
+
+
+def _read_dedup_key(tool_name: str, tool_args: dict) -> Optional[tuple[str, str]]:
+    """Return a ``(tool, path)`` key for a read-style call, else ``None``.
+
+    A call counts as a read when its name starts with ``read`` and it targets a
+    concrete path argument -- the shape we can safely serve from a prior result
+    instead of re-appending the full file content again.
+    """
+    if not tool_name.startswith("read"):
+        return None
+    for key in ("path", "file", "filename", "file_path"):
+        value = tool_args.get(key)
+        if isinstance(value, str) and value:
+            return (tool_name, value)
+    return None
+
+
 def openai_ask_with_tools(
     client: httpx.Client,
     url: str,
@@ -29,6 +147,7 @@ def openai_ask_with_tools(
     max_rounds: int = 5,
     on_tool_event: ToolEventCallback = None,
     on_usage: Optional[Callable[[tuple[int, int]], None]] = None,
+    context_window: int = 128000,
 ) -> tuple[str, list[dict]]:
     """OpenAI-compatible tool calling loop.
 
@@ -43,6 +162,9 @@ def openai_ask_with_tools(
         tools: Mapping of tool_name -> ToolDef.
         system: Optional system prompt.
         max_rounds: Maximum tool-calling round trips.
+        context_window: The model's real context window in tokens. Tool context
+            is kept under a fraction of this before each request so small-window
+            local models do not overflow as file reads accumulate.
 
     Returns:
         Tuple of (final_text_response, tool_calls_log).
@@ -76,6 +198,8 @@ def openai_ask_with_tools(
     content = ""
     total_input_tokens = 0
     total_output_tokens = 0
+    budget = int(context_window * _CONTEXT_BUDGET_FRACTION)
+    seen_reads: set[tuple[str, str]] = set()
 
     def _capture_usage(data: dict) -> None:
         nonlocal total_input_tokens, total_output_tokens
@@ -93,6 +217,11 @@ def openai_ask_with_tools(
             on_usage((total_input_tokens, total_output_tokens))
 
     for round_num in range(max_rounds):
+        # Bound the running context before every request: evict old, large tool
+        # results so accumulated file reads cannot overflow the model's window.
+        api_messages = _compact_messages_to_budget(
+            api_messages, budget, keep_recent=_KEEP_RECENT_MESSAGES
+        )
         payload = {
             "model": model,
             "messages": api_messages,
@@ -150,7 +279,15 @@ def openai_ask_with_tools(
                     tool_input=tool_args,
                 ))
 
-            result = executor.execute(tool_name, tool_args)
+            # Read de-duplication: serve a repeat read of an already-read path
+            # from a short stub instead of re-appending the full file content.
+            dedup_key = _read_dedup_key(tool_name, tool_args)
+            if dedup_key is not None and dedup_key in seen_reads:
+                result = f"[already read above: {dedup_key[1]}]"
+            else:
+                result = executor.execute(tool_name, tool_args)
+                if dedup_key is not None:
+                    seen_reads.add(dedup_key)
             tool_log.append({
                 "tool": tool_name,
                 "input": tool_args,

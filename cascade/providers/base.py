@@ -42,6 +42,9 @@ class ProviderConfig:
     temperature: float = 0.7
     max_tokens: Optional[int] = None
     fallback_model: Optional[str] = None
+    # The model's real context window in tokens. Drives tool-loop eviction so
+    # small-window self-hosted models (local/glm at 32K) do not overflow.
+    context_window: int = 128000
 
 
 class BaseProvider(ABC):
