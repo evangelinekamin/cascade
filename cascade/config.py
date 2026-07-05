@@ -262,6 +262,21 @@ class ConfigManager:
 
         return str(provider_data.get("model", "") or "").strip()
 
+    def get_bulk_model(self, provider_name: str, mode_name: Optional[str] = None) -> str:
+        """Resolve the bulk (cheap-tier) model for /solve's early iterations.
+
+        Prefers an explicit ``bulk_model``; otherwise uses the provider's frontier
+        ``model``. It deliberately does NOT fall back to ``fast_model`` -- that slot
+        is the /ultrafast speed lane (often a fast-but-flaky model), which must never
+        become /solve's builder. Set ``bulk_model`` to run a cheaper model first and
+        escalate to ``model`` on failure.
+        """
+        provider_data = self.data.get("providers", {}).get(provider_name, {})
+        bulk_model = str(provider_data.get("bulk_model", "") or "").strip()
+        if bulk_model:
+            return bulk_model
+        return self.get_model_for(provider_name, mode_name, fast=False)
+
     def get_default_mode_for_provider(self, provider_name: str) -> str:
         """Return the first configured mode that maps to the given provider."""
         for mode_name in MODE_CYCLE:

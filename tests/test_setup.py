@@ -80,3 +80,30 @@ def test_openrouter_setup_prompts_for_custom_model(tmp_path):
     provider_cfg = config.data["providers"]["openrouter"]
     assert provider_cfg["model"] == "qwen/qwen3-coder-next"
     assert provider_cfg["fallback_model"] == "minimax/minimax-m2.5"
+
+
+def test_wizard_default_models_match_config_defaults():
+    """Wizard default models must not drift back to stale values."""
+    from cascade.setup_flow import _DEFAULT_MODELS
+
+    assert _DEFAULT_MODELS["claude"] == "claude-opus-4-8"
+    assert _DEFAULT_MODELS["gemini"] == "gemini-3.1-pro-preview"
+
+
+def test_configure_provider_does_not_plant_max_tokens(tmp_path):
+    """The wizard must not seed max_tokens -- it truncates /solve's agentic edits."""
+    config = ConfigManager(config_path=str(tmp_path / "config.yaml"))
+    wizard = SetupWizard(config=config)
+
+    class _StubProvider:
+        def __init__(self, provider_config):
+            self.config = provider_config
+
+        def ping(self):
+            return True
+
+    wizard.registry = {"openai": _StubProvider}
+    with patch.object(wizard, "_prompt", side_effect=["y"]):
+        assert wizard._configure_provider("openai", "sk-test") is True
+
+    assert "max_tokens" not in config.data["providers"]["openai"]

@@ -701,9 +701,7 @@ def run_solve(
 
     test_cmd = _test_command(app)
     frontier_model = app.config.get_model_for(provider_name, fast=False)
-    bulk_model = (
-        app.config.get_model_for(provider_name, fast=True) if escalate else frontier_model
-    )
+    bulk_model = app.config.get_bulk_model(provider_name) if escalate else frontier_model
     escalation_provider, escalation_name, escalation_model = _resolve_escalation(
         app, escalate_to
     )
