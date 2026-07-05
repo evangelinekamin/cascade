@@ -413,3 +413,47 @@ def test_openai_provider_forwards_context_window():
     with patcher:
         prov.ask_with_tools([{"role": "user", "content": "hi"}], tools={})
     assert captured["context_window"] == 200000
+
+
+# --------------------------------------------------------------------------- #
+# provider_preferences threading (OpenRouter upstream-host pinning)
+# --------------------------------------------------------------------------- #
+
+
+def test_loop_pins_provider_field_when_preferences_set():
+    prefs = {"order": ["Baidu", "Fireworks", "Alibaba"], "allow_fallbacks": True}
+    client = _FakeClient([_final_response("done")])
+    text, _log = openai_ask_with_tools(
+        client=client,
+        url="http://x/v1/chat/completions",
+        headers={},
+        model="qwen",
+        temperature=0.0,
+        max_tokens=None,
+        messages=[{"role": "user", "content": "hi"}],
+        tools={},
+        system="SYS",
+        max_rounds=3,
+        context_window=200000,
+        provider_preferences=prefs,
+    )
+    assert text == "done"
+    assert client.payloads[0]["provider"] == prefs
+
+
+def test_loop_omits_provider_field_when_preferences_none():
+    client = _FakeClient([_final_response("done")])
+    openai_ask_with_tools(
+        client=client,
+        url="http://x/v1/chat/completions",
+        headers={},
+        model="qwen",
+        temperature=0.0,
+        max_tokens=None,
+        messages=[{"role": "user", "content": "hi"}],
+        tools={},
+        system="SYS",
+        max_rounds=3,
+        context_window=200000,
+    )
+    assert "provider" not in client.payloads[0]

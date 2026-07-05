@@ -69,6 +69,13 @@ class ConfigManager:
                     "model": "qwen/qwen3.5-9b",
                     "fallback_model": "minimax/minimax-m2.5",
                     "temperature": 0.7,
+                    # Pin good-quant fast upstream hosts. Throughput-sorted
+                    # routing silently truncates completions, so prefer known
+                    # solid-quant providers and still allow fallbacks.
+                    "provider_preferences": {
+                        "order": ["Baidu", "Fireworks", "Alibaba"],
+                        "allow_fallbacks": True,
+                    },
                 },
                 "openai": {
                     "enabled": False,
@@ -195,6 +202,7 @@ class ConfigManager:
             max_tokens=provider_data.get("max_tokens"),
             fallback_model=provider_data.get("fallback_model"),
             context_window=provider_data.get("context_window", 128000),
+            provider_preferences=provider_data.get("provider_preferences"),
         )
 
     def _resolve_env_var(self, value: str) -> str:
