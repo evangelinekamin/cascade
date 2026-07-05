@@ -408,7 +408,7 @@ def test_verified_task_restores_tampered_tests_but_keeps_impl_and_new_files(
     monkeypatch.setattr(solve_mod, "_preflight_gate", lambda *a, **k: None)
     monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: ("ok", 0))
 
-    result, _models = run_verified_task(
+    result, _models, _providers = run_verified_task(
         _prov(), str(tmp_path), "add feature", "pytest", bulk_model="b", frontier_model="f"
     )
 
@@ -734,7 +734,7 @@ def test_guardrail_greens_the_suite_by_dropping_a_needless_modification(
 
     monkeypatch.setattr(solve_mod, "run_agent_in_worktree", fake_agent)
 
-    result, _models = run_verified_task(
+    result, _models, _providers = run_verified_task(
         _prov(),
         str(tmp_path),
         "add g()",
@@ -802,7 +802,7 @@ def test_guardrail_restores_worker_changes_when_the_revert_breaks_the_target(
 
     monkeypatch.setattr(solve_mod, "run_agent_in_worktree", fake_agent)
 
-    result, _models = run_verified_task(
+    result, _models, _providers = run_verified_task(
         _prov(),
         str(tmp_path),
         "make f return 2",
@@ -816,3 +816,201 @@ def test_guardrail_restores_worker_changes_when_the_revert_breaks_the_target(
     assert result.guardrail_fired is False
     # the worker's (load-bearing) change is restored, not left reverted
     assert "return 2" in (tmp_path / "shared.py").read_text()
+
+
+# --- Cross-provider escalation: a stronger provider takes over on stall ----------
+#
+# The frontier-directs-bulk payoff: a cheap bulk model does the volume, and only
+# when it keeps failing does a stronger *provider* (not merely a stronger model on
+# the same provider) take over the remaining iterations.
+
+
+def _run_agent_recorder(seen):
+    """A run_agent_in_worktree stub recording (provider, active model) per call."""
+
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None):
+        seen.append((provider, provider.config.model))
+        return "edited"
+
+    return fake_agent
+
+
+def test_run_verified_task_escalates_to_a_different_provider(monkeypatch):
+    # With an escalation_provider set, iterations past escalate_after run on that
+    # second provider and its model -- not the bulk provider.
+    primary = _prov()  # config.model == "m"
+    escalation = MagicMock()
+    escalation.config = SimpleNamespace(model="glm-default")
+    seen: list = []
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", _run_agent_recorder(seen))
+    monkeypatch.setattr(solve_mod, "_preflight_gate", lambda *a, **k: None)
+    results = iter([("fail", 1), ("fail", 1), ("ok", 0)])
+    monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: next(results))
+
+    result, models_used, providers_used = run_verified_task(
+        primary,
+        "/tmp/wt",
+        "task",
+        "pytest",
+        bulk_model="bulk",
+        frontier_model="frontier",
+        escalate=True,
+        escalate_after=1,
+        escalation_provider=escalation,
+        escalation_model="glm-4.6",
+        provider_label="deepseek",
+        escalation_label="glm",
+        max_iterations=3,
+    )
+
+    assert seen[0] == (primary, "bulk")  # iteration 1: primary + bulk
+    assert seen[1] == (escalation, "glm-4.6")  # iteration 2: hand off to glm
+    assert seen[2] == (escalation, "glm-4.6")  # iteration 3: stays on glm
+    assert models_used == ["bulk", "glm-4.6", "glm-4.6"]
+    assert providers_used == ["deepseek", "glm", "glm"]
+    assert result.passed is True
+    # both providers' models are restored to their originals afterward
+    assert primary.config.model == "m"
+    assert escalation.config.model == "glm-default"
+
+
+def test_escalation_provider_falls_back_to_its_own_model_when_none(monkeypatch):
+    # escalation_model omitted -> use the escalation provider's own configured model.
+    primary = _prov()
+    escalation = MagicMock()
+    escalation.config = SimpleNamespace(model="glm-default")
+    seen: list = []
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", _run_agent_recorder(seen))
+    monkeypatch.setattr(solve_mod, "_preflight_gate", lambda *a, **k: None)
+    results = iter([("fail", 1), ("ok", 0)])
+    monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: next(results))
+
+    _result, models_used, _providers = run_verified_task(
+        primary,
+        "/tmp/wt",
+        "task",
+        "pytest",
+        bulk_model="bulk",
+        frontier_model="frontier",
+        escalate_after=1,
+        escalation_provider=escalation,
+        escalation_model=None,
+        max_iterations=2,
+    )
+
+    assert seen[1] == (escalation, "glm-default")
+    assert models_used == ["bulk", "glm-default"]
+
+
+def test_run_verified_task_without_escalation_provider_is_unchanged(monkeypatch):
+    # No escalation_provider: escalation stays within the same provider, lifting
+    # bulk -> frontier exactly as before (full backward compat).
+    prov = _prov()
+    seen: list = []
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", _run_agent_recorder(seen))
+    monkeypatch.setattr(solve_mod, "_preflight_gate", lambda *a, **k: None)
+    results = iter([("fail", 1), ("ok", 0)])
+    monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: next(results))
+
+    _result, models_used, providers_used = run_verified_task(
+        prov,
+        "/tmp/wt",
+        "task",
+        "pytest",
+        bulk_model="bulk",
+        frontier_model="frontier",
+        escalate=True,
+        escalate_after=1,
+        provider_label="openai",
+        max_iterations=3,
+    )
+
+    assert seen == [(prov, "bulk"), (prov, "frontier")]
+    assert models_used == ["bulk", "frontier"]
+    assert providers_used == ["openai", "openai"]  # one provider throughout
+
+
+def _dual_app(bulk="bulk-x", frontier="frontier-x", glm_model="glm-4.6"):
+    """An app with a cheap primary ('deepseek') and a stronger escalation ('glm')."""
+    app = MagicMock()
+    primary = MagicMock()
+    primary.config = SimpleNamespace(model=frontier)
+    glm = MagicMock()
+    glm.config = SimpleNamespace(model=glm_model)
+    app.providers = {"deepseek": primary, "glm": glm}
+    app.config.get_default_provider.return_value = "deepseek"
+
+    def _model_for(name, mode_name=None, fast=False):
+        if name == "glm":
+            return glm_model
+        return bulk if fast else frontier
+
+    app.config.get_model_for = MagicMock(side_effect=_model_for)
+    app.config.data = {"workflows": {"verify": {"test": "pytest"}}}
+    return app, primary, glm
+
+
+def _patch_dual_solve(monkeypatch, seen, test_results):
+    fm = MagicMock()
+    fm.prepare.return_value = SimpleNamespace(path="/tmp/wt")
+    fm.capture_snapshot.return_value = SimpleNamespace(
+        diff_stat="", diff_excerpt="", changed_files=()
+    )
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", _run_agent_recorder(seen))
+    monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: next(test_results))
+    monkeypatch.setattr(solve_mod, "_preflight_gate", lambda *a, **k: None)
+    monkeypatch.setattr(solve_mod, "WorktreeManager", lambda *a, **k: fm)
+
+
+def test_run_solve_escalate_to_hands_off_to_another_provider(monkeypatch):
+    app, primary, glm = _dual_app()
+    seen: list = []
+    _patch_dual_solve(monkeypatch, seen, iter([("fail", 1), ("ok", 0)]))
+
+    result = run_solve(
+        app, "x", escalate=True, escalate_after=1, escalate_to="glm", max_iterations=3
+    )
+
+    assert seen[0] == (primary, "bulk-x")  # bulk builds first
+    assert seen[1] == (glm, "glm-4.6")  # glm finishes on stall
+    assert result.models_used == ("bulk-x", "glm-4.6")
+    assert result.providers_used == ("deepseek", "glm")
+
+
+def test_run_solve_escalate_to_accepts_provider_model_tuple(monkeypatch):
+    app, _primary, glm = _dual_app()
+    seen: list = []
+    _patch_dual_solve(monkeypatch, seen, iter([("fail", 1), ("ok", 0)]))
+
+    result = run_solve(
+        app, "x", escalate_after=1, escalate_to=("glm", "glm-air"), max_iterations=3
+    )
+
+    assert seen[1] == (glm, "glm-air")  # the explicit model in the tuple wins
+    assert result.models_used == ("bulk-x", "glm-air")
+    assert result.providers_used == ("deepseek", "glm")
+
+
+def test_run_solve_escalate_to_unknown_provider_stays_within_primary(monkeypatch):
+    # An escalate_to that names no available provider degrades gracefully to the
+    # original within-provider frontier escalation.
+    app, primary, _glm = _dual_app()
+    seen: list = []
+    _patch_dual_solve(monkeypatch, seen, iter([("fail", 1), ("ok", 0)]))
+
+    result = run_solve(app, "x", escalate_after=1, escalate_to="ghost", max_iterations=3)
+
+    assert seen == [(primary, "bulk-x"), (primary, "frontier-x")]
+    assert result.models_used == ("bulk-x", "frontier-x")
+    assert result.providers_used == ("deepseek", "deepseek")
+
+
+def test_run_solve_without_escalate_to_is_unchanged(monkeypatch):
+    app, primary, _glm = _dual_app()
+    seen: list = []
+    _patch_dual_solve(monkeypatch, seen, iter([("fail", 1), ("ok", 0)]))
+
+    result = run_solve(app, "x", escalate_after=1, max_iterations=3)
+
+    assert seen == [(primary, "bulk-x"), (primary, "frontier-x")]
+    assert result.providers_used == ("deepseek", "deepseek")

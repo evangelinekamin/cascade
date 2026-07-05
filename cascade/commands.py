@@ -1586,6 +1586,13 @@ class CommandHandler:
                         if not seq or seq[-1] != m:
                             seq.append(m)
                     lines.append("Models: " + " -> ".join(seq))
+                # Only surface the provider line on an actual cross-provider handoff.
+                if len(set(result.providers_used)) > 1:
+                    pseq: list[str] = []
+                    for p in result.providers_used:
+                        if not pseq or pseq[-1] != p:
+                            pseq.append(p)
+                    lines.append("Providers: " + " -> ".join(pseq))
                 if result.input_tokens or result.output_tokens:
                     lines.append(
                         f"Tokens: {result.input_tokens:,} in / "
