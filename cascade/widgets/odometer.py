@@ -30,7 +30,7 @@ class OdometerCounter(Static):
         self._animating = True
         self._timer = None
         self._started_at = 0.0
-        self._duration = 0.9 if target_value < 100_000 else 1.2
+        self._duration = 1.3 if target_value < 100_000 else 1.7
 
     def on_mount(self) -> None:
         if self._target > 0:

@@ -520,6 +520,7 @@ def run_verified_task(
     timeout: int = 300,
     on_progress: ProgressCallback = None,
     on_tokens: TokensCallback = None,
+    on_tool_event=None,
 ) -> "tuple[WorkerResult, list[str], list[str]]":
     """Run the escalating verified loop for one task against an existing worktree.
 
@@ -558,7 +559,8 @@ def run_verified_task(
         agent.config.model = model
         try:
             response = run_agent_in_worktree(
-                agent, prompt, path, system=_WORKER_SYSTEM, max_rounds=max_rounds
+                agent, prompt, path, system=_WORKER_SYSTEM, max_rounds=max_rounds,
+                on_tool_event=on_tool_event,
             )
             if on_tokens is not None:
                 usage = getattr(agent, "last_usage", None)
@@ -669,6 +671,7 @@ def run_solve(
     timeout: int = 300,
     on_progress: ProgressCallback = None,
     on_tokens: TokensCallback = None,
+    on_tool_event=None,
 ) -> SolveResult:
     """Run *task* to a verified diff in an isolated worktree.
 
@@ -736,6 +739,7 @@ def run_solve(
             timeout=timeout,
             on_progress=on_progress,
             on_tokens=_accumulate_tokens,
+            on_tool_event=on_tool_event,
         )
         snapshot = manager.capture_snapshot(path)
         return SolveResult(

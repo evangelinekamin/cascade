@@ -140,6 +140,7 @@ def run_agent_in_worktree(
     worktree_path: str,
     system: Optional[str] = None,
     max_rounds: int = 15,
+    on_tool_event=None,
 ) -> str:
     """Run *provider* as a tool-using agent rooted at *worktree_path*.
 
@@ -159,5 +160,6 @@ def run_agent_in_worktree(
             WorkspaceTools(worktree_path).build(),
             system=system,
             max_rounds=max_rounds,
+            on_tool_event=on_tool_event,
         )
         return response
