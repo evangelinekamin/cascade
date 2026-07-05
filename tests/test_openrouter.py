@@ -140,3 +140,81 @@ def test_openrouter_stream_falls_back_on_retryable_status():
     second_call = mock_stream.call_args_list[1].kwargs["json"]
     assert first_call["model"] == "qwen/qwen3.5-9b"
     assert second_call["model"] == "minimax/minimax-m2.5"
+
+
+def _ok_stream_context():
+    """A one-line successful chat-completions stream context manager."""
+
+    class _SuccessResponse:
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"OK"}}]}'
+            yield "data: [DONE]"
+
+    class _SuccessContext:
+        def __enter__(self):
+            return _SuccessResponse()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    return _SuccessContext()
+
+
+def test_provider_config_defaults_provider_preferences_to_none():
+    """A ProviderConfig without explicit preferences leaves them unset."""
+    config = ProviderConfig(api_key="k", model="m")
+    assert config.provider_preferences is None
+
+
+def test_openrouter_stream_pins_provider_when_preferences_set():
+    """The streaming payload carries the configured upstream 'provider' order."""
+    prefs = {"order": ["Baidu", "Fireworks", "Alibaba"], "allow_fallbacks": True}
+    config = ProviderConfig(
+        api_key="test-key",
+        model="qwen/qwen3.5-9b",
+        provider_preferences=prefs,
+    )
+    provider = OpenRouterProvider(config)
+
+    with patch.object(provider.client, "stream", return_value=_ok_stream_context()) as mock_stream:
+        list(provider.stream_single("Reply with exactly OK."))
+
+    payload = mock_stream.call_args.kwargs["json"]
+    assert payload["provider"] == prefs
+
+
+def test_openrouter_stream_omits_provider_when_preferences_none():
+    """With no preferences, the streaming payload has no 'provider' field."""
+    config = ProviderConfig(api_key="test-key", model="qwen/qwen3.5-9b")
+    provider = OpenRouterProvider(config)
+
+    with patch.object(provider.client, "stream", return_value=_ok_stream_context()) as mock_stream:
+        list(provider.stream_single("Reply with exactly OK."))
+
+    payload = mock_stream.call_args.kwargs["json"]
+    assert "provider" not in payload
+
+
+def test_openrouter_ask_with_tools_forwards_provider_preferences():
+    """ask_with_tools threads the configured preferences into the shared loop."""
+    prefs = {"order": ["Baidu", "Fireworks", "Alibaba"], "allow_fallbacks": True}
+    config = ProviderConfig(
+        api_key="test-key",
+        model="qwen/qwen3.5-9b",
+        provider_preferences=prefs,
+    )
+    provider = OpenRouterProvider(config)
+
+    captured: dict = {}
+
+    def fake_loop(**kwargs):
+        captured.update(kwargs)
+        return ("ok", [])
+
+    with patch("cascade.providers.openrouter.openai_ask_with_tools", fake_loop):
+        provider.ask_with_tools([{"role": "user", "content": "hi"}], tools={})
+
+    assert captured["provider_preferences"] == prefs

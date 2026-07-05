@@ -227,6 +227,47 @@ def test_default_template_leaves_big_api_providers_at_default_window():
             assert "context_window" not in manager.data["providers"][name]
 
 
+def test_default_template_openrouter_pins_good_quant_hosts():
+    """The openrouter template pins good-quant fast upstream hosts."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        prefs = manager.data["providers"]["openrouter"]["provider_preferences"]
+        assert prefs == {
+            "order": ["Baidu", "Fireworks", "Alibaba"],
+            "allow_fallbacks": True,
+        }
+
+
+def test_get_provider_config_reads_provider_preferences():
+    """provider_preferences from provider_data is threaded onto the config."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        manager.data["providers"]["openrouter"]["enabled"] = True
+        manager.data["providers"]["openrouter"]["api_key"] = "sk-test"
+
+        config = manager.get_provider_config("openrouter")
+        assert config is not None
+        assert config.provider_preferences == {
+            "order": ["Baidu", "Fireworks", "Alibaba"],
+            "allow_fallbacks": True,
+        }
+
+
+def test_provider_config_defaults_provider_preferences_to_none():
+    """A provider without provider_preferences leaves the field as None."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        manager.apply_credential("openai", "sk-test-token")
+        config = manager.get_provider_config("openai")
+        assert config.provider_preferences is None
+
+
 def test_memory_config_defaults():
     """Memory config should expose safe defaults."""
     with tempfile.TemporaryDirectory() as tmpdir:

@@ -70,6 +70,8 @@ class OpenRouterProvider(BaseProvider):
         }
         if self.config.max_tokens:
             payload["max_tokens"] = self.config.max_tokens
+        if self.config.provider_preferences:
+            payload["provider"] = self.config.provider_preferences
 
         with self.client.stream("POST", url, json=payload, headers=self._headers()) as response:
             response.raise_for_status()
@@ -149,6 +151,7 @@ class OpenRouterProvider(BaseProvider):
                 on_tool_event=on_tool_event,
                 on_usage=lambda usage: setattr(self, "_last_usage", usage),
                 context_window=self.config.context_window,
+                provider_preferences=self.config.provider_preferences,
             )
         except RuntimeError as exc:
             fallback_model = self.get_fallback_model()
@@ -172,6 +175,7 @@ class OpenRouterProvider(BaseProvider):
                     on_tool_event=on_tool_event,
                     on_usage=lambda usage: setattr(self, "_last_usage", usage),
                     context_window=self.config.context_window,
+                    provider_preferences=self.config.provider_preferences,
                 )
             raise
 

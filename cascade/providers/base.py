@@ -45,6 +45,11 @@ class ProviderConfig:
     # The model's real context window in tokens. Drives tool-loop eviction so
     # small-window self-hosted models (local/glm at 32K) do not overflow.
     context_window: int = 128000
+    # OpenRouter upstream-host routing preferences, passed straight through as
+    # the request's "provider" field (e.g. {"order": [...], "allow_fallbacks":
+    # True}). Pins good-quant hosts so throughput-sorted routing cannot silently
+    # truncate completions. None means send no routing hint.
+    provider_preferences: Optional[dict] = None
 
 
 class BaseProvider(ABC):

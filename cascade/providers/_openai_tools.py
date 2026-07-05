@@ -148,6 +148,7 @@ def openai_ask_with_tools(
     on_tool_event: ToolEventCallback = None,
     on_usage: Optional[Callable[[tuple[int, int]], None]] = None,
     context_window: int = 128000,
+    provider_preferences: Optional[dict] = None,
 ) -> tuple[str, list[dict]]:
     """OpenAI-compatible tool calling loop.
 
@@ -165,6 +166,8 @@ def openai_ask_with_tools(
         context_window: The model's real context window in tokens. Tool context
             is kept under a fraction of this before each request so small-window
             local models do not overflow as file reads accumulate.
+        provider_preferences: Optional OpenRouter upstream-host routing hint,
+            passed through as the request's "provider" field. None omits it.
 
     Returns:
         Tuple of (final_text_response, tool_calls_log).
@@ -230,6 +233,8 @@ def openai_ask_with_tools(
         }
         if max_tokens:
             payload["max_tokens"] = max_tokens
+        if provider_preferences:
+            payload["provider"] = provider_preferences
 
         try:
             response = client.post(url, json=payload, headers=headers)
