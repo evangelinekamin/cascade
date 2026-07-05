@@ -68,6 +68,9 @@ class ConfigManager:
                     "api_key": "${OPENROUTER_API_KEY}",
                     "model": "qwen/qwen3.5-9b",
                     "fallback_model": "minimax/minimax-m2.5",
+                    # Speed-over-quality one-shot tier (/ultrafast, /fast): a very
+                    # fast, deliberately flaky diffusion LM.
+                    "fast_model": "inception/mercury-2",
                     "temperature": 0.7,
                     # Pin good-quant fast upstream hosts. Throughput-sorted
                     # routing silently truncates completions, so prefer known
@@ -180,6 +183,7 @@ class ConfigManager:
         entry.setdefault("model", default_models.get(provider_name, ""))
         if provider_name == "openrouter":
             entry.setdefault("fallback_model", "minimax/minimax-m2.5")
+            entry.setdefault("fast_model", "inception/mercury-2")
         entry.setdefault("temperature", 0.7)
 
     def get_provider_config(self, provider_name: str) -> Optional[ProviderConfig]:
