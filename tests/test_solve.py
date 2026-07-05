@@ -194,7 +194,7 @@ def _tiered_app(bulk="bulk-x", frontier="frontier-x"):
 
 
 def _patch_solve(monkeypatch, observed, test_results):
-    def fake_agent(provider, prompt, path, system=None, max_rounds=None):
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None, on_tool_event=None):
         observed.append(provider.config.model)
         return "edited"
 
@@ -235,6 +235,25 @@ def test_solve_bulk_tier_resolves_via_get_bulk_model(monkeypatch):
     run_solve(app, "x", escalate=True, escalate_after=1, max_iterations=3)
 
     assert observed[0] == "dedicated-bulk"
+
+
+def test_run_agent_in_worktree_forwards_tool_events(tmp_path):
+    """API-provider agents forward tool events so /solve can show live activity."""
+    from contextlib import nullcontext
+    from cascade.swarm.workspace import run_agent_in_worktree
+
+    prov = MagicMock()
+    prov._use_cli_proxy = False
+    prov.working_directory = MagicMock(return_value=nullcontext())
+    prov.ask_with_tools = MagicMock(return_value=("ok", []))
+
+    def cb(event):
+        return None
+
+    result = run_agent_in_worktree(prov, "task", str(tmp_path), on_tool_event=cb)
+
+    assert result == "ok"
+    assert prov.ask_with_tools.call_args.kwargs["on_tool_event"] is cb
 
 
 def test_run_solve_accumulates_and_reports_token_usage(monkeypatch):
@@ -287,7 +306,7 @@ def _capture_max_rounds(monkeypatch):
     """Patch the solve internals and return a list capturing forwarded max_rounds."""
     captured: list[int] = []
 
-    def fake_agent(provider, prompt, path, system=None, max_rounds=None):
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None, on_tool_event=None):
         captured.append(max_rounds)
         return "edited"
 
@@ -409,7 +428,7 @@ def test_verified_task_restores_tampered_tests_but_keeps_impl_and_new_files(
     tests_dir.mkdir()
     (tests_dir / "test_feature.py").write_text("SPEC = 'original'\n")
 
-    def fake_agent(provider, prompt, path, system=None, max_rounds=None):
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None, on_tool_event=None):
         root = Path(path)
         # worker tampers with the gating test (reward hacking)...
         (root / "tests" / "test_feature.py").write_text("SPEC = 'HACKED'\n")
@@ -481,7 +500,7 @@ def test_worktree_change_summary_empty_outside_a_git_repo(tmp_path):
 def test_run_verified_task_feeds_prior_changes_into_the_retry(monkeypatch):
     prompts: list[str] = []
 
-    def fake_agent(provider, prompt, path, system=None, max_rounds=None):
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None, on_tool_event=None):
         prompts.append(prompt)
         return "edited"
 
@@ -744,7 +763,7 @@ def test_guardrail_greens_the_suite_by_dropping_a_needless_modification(
         },
     )
 
-    def fake_agent(provider, prompt, path, system=None, max_rounds=None):
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None, on_tool_event=None):
         (Path(path) / "shared.py").write_text(_SHARED_WORKER)
         return "edited shared.py"
 
@@ -811,7 +830,7 @@ def test_guardrail_restores_worker_changes_when_the_revert_breaks_the_target(
         },
     )
 
-    def fake_agent(provider, prompt, path, system=None, max_rounds=None):
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None, on_tool_event=None):
         # the only way to satisfy test_new is to change f() -- which breaks test_keep
         (Path(path) / "shared.py").write_text("def f():\n    return 2\n")
         return "edited"
@@ -844,7 +863,7 @@ def test_guardrail_restores_worker_changes_when_the_revert_breaks_the_target(
 def _run_agent_recorder(seen):
     """A run_agent_in_worktree stub recording (provider, active model) per call."""
 
-    def fake_agent(provider, prompt, path, system=None, max_rounds=None):
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None, on_tool_event=None):
         seen.append((provider, provider.config.model))
         return "edited"
 

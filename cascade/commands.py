@@ -1585,6 +1585,20 @@ class CommandHandler:
                     pass
             _call_ui(_apply)
 
+        def _on_tool_event(event) -> None:
+            # Surface the agent's live tool activity on the progress line -- what
+            # file it's reading, what command it's running -- instead of a static
+            # "editing: <model>". Only the start of each call, to keep it legible.
+            if progress is None or getattr(event, "kind", "") != "tool_start":
+                return
+            name = getattr(event, "tool_name", "") or "tool"
+            tool_input = getattr(event, "tool_input", None) or {}
+            detail = ""
+            if isinstance(tool_input, dict):
+                detail = str(tool_input.get("path") or tool_input.get("command") or "")
+            label = f"{name} {detail}".strip()[:100]
+            _call_ui(self._set_progress_indicator_label, progress, label)
+
         def _worker() -> None:
             try:
                 from .swarm.solve import run_solve
@@ -1596,6 +1610,7 @@ class CommandHandler:
                     escalate_to=cli_app.config.get_escalation_target(provider),
                     on_progress=_on_progress,
                     on_tokens=_on_tokens,
+                    on_tool_event=_on_tool_event,
                 )
 
                 if result.error and result.iterations == 0 and not result.passed:
