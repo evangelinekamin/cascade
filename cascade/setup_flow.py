@@ -29,6 +29,11 @@ _DEFAULT_FALLBACK_MODELS = {
     "openrouter": "minimax/minimax-m2.5",
 }
 
+# Speed-over-quality one-shot models reachable via /ultrafast and /fast.
+_DEFAULT_FAST_MODELS = {
+    "openrouter": "inception/mercury-2",
+}
+
 
 def detect_env_keys() -> dict[str, str]:
     """Detect which API keys are available from environment variables.
@@ -150,6 +155,7 @@ class SetupWizard:
         # Resolve provider model before validation.
         model = self._select_model(name, _DEFAULT_MODELS.get(name, ""))
         fallback_model = _DEFAULT_FALLBACK_MODELS.get(name)
+        fast_model = _DEFAULT_FAST_MODELS.get(name)
 
         # Validate with a ping
         provider_cls = self.registry.get(name)
@@ -178,6 +184,8 @@ class SetupWizard:
         providers[name]["model"] = model
         if fallback_model:
             providers[name]["fallback_model"] = fallback_model
+        if fast_model:
+            providers[name]["fast_model"] = fast_model
         providers[name].setdefault("temperature", 0.7)
         providers[name].setdefault("max_tokens", 2048)
         return True

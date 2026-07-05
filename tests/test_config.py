@@ -50,6 +50,34 @@ def test_get_model_for_respects_mode_override():
         assert manager.get_model_for("openrouter", "test") == "qwen/qwen3.5-9b"
 
 
+def test_openrouter_default_exposes_ultrafast_fast_model():
+    """OpenRouter ships a fast_model so /ultrafast and /fast can reach mercury-2."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        assert (
+            manager.data["providers"]["openrouter"]["fast_model"]
+            == "inception/mercury-2"
+        )
+        assert (
+            manager.get_model_for("openrouter", "test", fast=True)
+            == "inception/mercury-2"
+        )
+
+
+def test_apply_credential_openrouter_sets_ultrafast_fast_model():
+    """Syncing an OpenRouter credential seeds the ultrafast fast_model."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        manager.apply_credential("openrouter", "sk-or-test-token")
+
+        entry = manager.data["providers"]["openrouter"]
+        assert entry["fast_model"] == "inception/mercury-2"
+
+
 def test_get_available_modes_uses_configured_mode_providers():
     """Mode availability should follow configured mode providers, not hardcoded defaults."""
     with tempfile.TemporaryDirectory() as tmpdir:

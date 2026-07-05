@@ -6,7 +6,7 @@ import pytest
 from textual.message_pump import active_app
 
 from cascade.app import CascadeTUI
-from cascade.commands import CommandHandler
+from cascade.commands import COMMANDS, CommandHandler
 from cascade.config import ConfigManager
 from cascade.hooks import HookEvent
 from cascade.history import BranchingSession, HistoryDB
@@ -466,6 +466,69 @@ def test_mode_model_command_applies_immediately_for_active_mode(tmp_path):
     assert config.data["modes"]["test"]["model"] == "kwaipilot/kat-coder-pro-v2"
     assert openrouter.config.model == "kwaipilot/kat-coder-pro-v2"
     app.notify.assert_called_once_with("test mode now uses kwaipilot/kat-coder-pro-v2")
+
+
+def test_ultrafast_command_registered():
+    names = [c.name for c in COMMANDS]
+    assert "ultrafast" in names
+
+
+def _make_ultrafast_app(tmp_path):
+    config = ConfigManager(str(tmp_path / "config.yaml"))
+    openrouter = MagicMock()
+    openrouter.config.model = "qwen/qwen3.5-9b"
+
+    app = MagicMock()
+    app.cli_app = MagicMock()
+    app.cli_app.providers = {"openrouter": openrouter}
+    app.cli_app.config = config
+    app.state = CascadeState()
+    app.screen = MagicMock()
+    app.notify = MagicMock()
+    return app, openrouter
+
+
+def test_ultrafast_command_switches_to_mercury(tmp_path):
+    app, openrouter = _make_ultrafast_app(tmp_path)
+
+    handler = CommandHandler(app)
+    handler._cmd_ultrafast([])
+
+    assert app.state.active_provider == "openrouter"
+    assert app.state.fast_mode is True
+    assert openrouter.config.model == "inception/mercury-2"
+    app.notify.assert_called_once()
+    assert "inception/mercury-2" in app.notify.call_args.args[0]
+
+
+def test_ultrafast_command_dispatches_through_handle(tmp_path):
+    app, openrouter = _make_ultrafast_app(tmp_path)
+
+    handler = CommandHandler(app)
+    handled = handler.handle("/ultrafast")
+
+    assert handled is True
+    assert app.state.active_provider == "openrouter"
+    assert app.state.fast_mode is True
+    assert openrouter.config.model == "inception/mercury-2"
+
+
+def test_ultrafast_command_reports_when_openrouter_missing():
+    app = MagicMock()
+    app.cli_app = MagicMock()
+    app.cli_app.providers = {"claude": MagicMock()}
+    app.state = CascadeState()
+    app.screen = MagicMock()
+    app.notify = MagicMock()
+
+    handler = CommandHandler(app)
+    handler._cmd_ultrafast([])
+
+    app.notify.assert_called_once_with(
+        "Provider 'openrouter' is not configured. Available: claude"
+    )
+    assert app.state.active_provider == "gemini"
+    assert app.state.fast_mode is False
 
 
 def test_cycle_mode_skips_unconfigured_providers():

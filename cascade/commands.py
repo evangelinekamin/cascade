@@ -34,6 +34,7 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("exit", "/exit", "Exit cascade"),
     CommandDef("quit", "/quit", "Exit cascade"),
     CommandDef("fast", "/fast", "Toggle fast model for current provider"),
+    CommandDef("ultrafast", "/ultrafast", "Switch to the ultrafast model (mercury-2 via openrouter)"),
     CommandDef("model", "/model <provider|reset>", "Switch active provider"),
     CommandDef("mode", "/mode <name>", "Switch mode (design, plan, build, test)"),
     CommandDef("mode-provider", "/mode-provider <mode> <provider>", "Assign a provider to a mode"),
@@ -79,6 +80,11 @@ COMMANDS: tuple[CommandDef, ...] = (
 
 _PROGRESS_DETAIL_RE = re.compile(r"^\[(?P<provider>[^\]]+)\]\s*(?P<message>.*)$")
 
+# Provider that /ultrafast jumps to. The concrete model slug lives in that
+# provider's fast_model config, so ultrafast rides the existing fast-model
+# plumbing rather than hardcoding a model here.
+_ULTRAFAST_PROVIDER = "openrouter"
+
 
 def get_matching_commands(prefix: str) -> list[CommandDef]:
     """Return commands whose name starts with prefix (without the /)."""
@@ -110,6 +116,7 @@ class CommandHandler:
             "exit": self._cmd_exit,
             "quit": self._cmd_exit,
             "fast": self._cmd_fast,
+            "ultrafast": self._cmd_ultrafast,
             "model": self._cmd_model,
             "mode": self._cmd_mode,
             "mode-provider": self._cmd_mode_provider,
@@ -624,6 +631,29 @@ class CommandHandler:
         mode_name = self._mode_for_provider(cli_app, name)
         self._set_active_mode_and_provider(name, mode_name, fast=False)
         self.app.notify(f"Switched to {name} ({mode_name} mode)")
+
+    def _cmd_ultrafast(self, args: list[str]) -> None:
+        """Switch to the ultrafast model for quick, speed-over-quality one-shots.
+
+        Reuses the provider-switch plumbing: jumps to the ultrafast provider
+        (openrouter) with its fast_model (mercury-2) engaged. Deliberately fast
+        and flaky -- a speed-not-reliability mode.
+        """
+        provider_name = _ULTRAFAST_PROVIDER
+        cli_app = getattr(self.app, "cli_app", None)
+        configured = self._configured_providers(cli_app)
+        if configured and provider_name not in configured:
+            self.app.notify(
+                f"Provider '{provider_name}' is not configured. "
+                f"Available: {', '.join(configured)}"
+            )
+            return
+        mode_name = self._mode_for_provider(cli_app, provider_name)
+        self._set_active_mode_and_provider(provider_name, mode_name, fast=True)
+        model = ""
+        if cli_app is not None and hasattr(cli_app, "config"):
+            model = cli_app.config.get_model_for(provider_name, mode_name, fast=True)
+        self.app.notify(f"Ultrafast: {model or provider_name} ({mode_name} mode)")
 
     def _cmd_mode(self, args: list[str]) -> None:
         if not args:
