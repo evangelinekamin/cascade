@@ -243,6 +243,45 @@ class TestOpenAIToolCalling:
         assert prov.last_usage == (7, 2)
 
 
+class TestToolLoopExhaustion:
+    """The tool loop must never hand back a silent empty string on round exhaustion."""
+
+    def test_exhaustion_returns_guidance_not_empty(self):
+        """When the model tool-calls until the budget is spent without finishing,
+        surface a clear message (pointing at /solve), not ''."""
+        from cascade.providers.openai_provider import OpenAIProvider
+
+        prov = OpenAIProvider(_make_config())
+        tools = _make_tools()
+
+        # Every round is a tool call with empty content -- the model never finishes.
+        tool_round = MagicMock()
+        tool_round.status_code = 200
+        tool_round.json.return_value = {
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5},
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {"name": "echo", "arguments": '{"message": "x"}'},
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+        tool_round.raise_for_status = MagicMock()
+
+        with patch.object(prov.client, "post", return_value=tool_round):
+            result, log = prov.ask_with_tools(
+                _msgs("do a big multi-step task"), tools, max_rounds=2
+            )
+
+        assert result.strip()      # not the silent empty that looked like "stopped"
+        assert "/solve" in result  # points at the right tool
+        assert len(log) == 2       # ran the tool each round until the budget was spent
+
+
 class TestOpenRouterToolCalling:
     """Test OpenRouter provider uses same format as OpenAI."""
 

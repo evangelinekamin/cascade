@@ -316,4 +316,14 @@ def openai_ask_with_tools(
             })
 
     _finalize_usage()
+    if not content.strip():
+        # The loop spent its whole round budget still tool-calling and never
+        # produced a final answer. Returning "" here is what looked like the model
+        # "just stopping" -- surface it instead, and point at the right tool.
+        content = (
+            f"[Stopped after {max_rounds} tool rounds without finishing -- this needs "
+            f"more steps than a chat turn allows. For a multi-step build (edit, test, "
+            f"commit), run /solve: it works in an isolated worktree behind your test "
+            f"gate with a larger round budget.]"
+        )
     return content, tool_log
