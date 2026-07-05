@@ -112,7 +112,7 @@ def test_run_pipeline_runs_each_step_in_one_worktree(monkeypatch):
 
     def fake_task(provider, worktree_path, prompt, test_cmd, **kw):
         seen_paths.append(worktree_path)
-        return SimpleNamespace(passed=True, iterations=1), ["fast"]
+        return SimpleNamespace(passed=True, iterations=1), ["fast"], ["openai"]
 
     monkeypatch.setattr(pipe, "run_verified_task", fake_task)
 
@@ -140,8 +140,8 @@ def test_run_pipeline_passed_reflects_final_step(monkeypatch):
     )
     monkeypatch.setattr(pipe, "WorktreeManager", lambda *a, **k: fm)
     outcomes = iter([
-        (SimpleNamespace(passed=True, iterations=1), ["m"]),
-        (SimpleNamespace(passed=False, iterations=3), ["m"]),
+        (SimpleNamespace(passed=True, iterations=1), ["m"], ["openai"]),
+        (SimpleNamespace(passed=False, iterations=3), ["m"], ["openai"]),
     ])
     monkeypatch.setattr(pipe, "run_verified_task", lambda *a, **k: next(outcomes))
 

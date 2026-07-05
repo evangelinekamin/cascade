@@ -189,7 +189,7 @@ def run_pipeline(
         for task in tasks:
             if on_progress:
                 on_progress("step", f"{task.id}: {task.description}")
-            result, models_used = run_verified_task(
+            result, models_used, _providers_used = run_verified_task(
                 provider,
                 path,
                 _step_prompt(objective, task, completed),

@@ -48,6 +48,7 @@ class SolveResult:
     diff_excerpt: str = ""
     changed_files: tuple[str, ...] = ()
     models_used: tuple[str, ...] = ()
+    providers_used: tuple[str, ...] = ()
     input_tokens: int = 0
     output_tokens: int = 0
     guardrail_fired: bool = False
@@ -512,38 +513,55 @@ def run_verified_task(
     max_rounds: int = 15,
     escalate: bool = True,
     escalate_after: int = 1,
+    escalation_provider=None,
+    escalation_model: Optional[str] = None,
+    provider_label: str = "",
+    escalation_label: str = "",
     timeout: int = 300,
     on_progress: ProgressCallback = None,
     on_tokens: TokensCallback = None,
-) -> "tuple[WorkerResult, list[str]]":
+) -> "tuple[WorkerResult, list[str], list[str]]":
     """Run the escalating verified loop for one task against an existing worktree.
 
-    Bulk-first model tiering: the first ``escalate_after`` iteration(s) use
-    ``bulk_model`` and continued test failure escalates to ``frontier_model`` --
-    all in ``worktree_path``. Returns (WorkerResult, models used per iteration).
+    Bulk-first tiering: the first ``escalate_after`` iteration(s) use
+    ``bulk_model`` on ``provider``; continued test failure escalates. When an
+    ``escalation_provider`` is supplied the escalation hands the whole iteration
+    to that *second provider* (running ``escalation_model``, or its own configured
+    model when that is None) -- the cross-provider handoff. Without one, escalation
+    stays on ``provider`` and merely lifts the model to ``frontier_model`` (the
+    original within-provider behavior). ``provider_label``/``escalation_label``
+    name each provider for the returned handoff record.
+
+    Returns (WorkerResult, models used per iteration, providers used per iteration).
     """
     models_used: list[str] = []
+    providers_used: list[str] = []
     state = {"iteration": 0}
 
-    def _model_for(iteration: int) -> str:
+    def _agent_for(iteration: int) -> "tuple[object, str, str]":
+        """Resolve the (provider, model, provider label) that runs *iteration*."""
         if escalate and iteration > escalate_after:
-            return frontier_model
-        return bulk_model
+            if escalation_provider is not None:
+                model = escalation_model or escalation_provider.config.model
+                return escalation_provider, model, (escalation_label or provider_label)
+            return provider, frontier_model, provider_label
+        return provider, bulk_model, provider_label
 
     def run_agent(prompt: str, path: str) -> str:
         state["iteration"] += 1
-        model = _model_for(state["iteration"])
+        agent, model, label = _agent_for(state["iteration"])
         models_used.append(model)
+        providers_used.append(label)
         if on_progress:
             on_progress("editing", model)
-        original_model = provider.config.model
-        provider.config.model = model
+        original_model = agent.config.model
+        agent.config.model = model
         try:
             response = run_agent_in_worktree(
-                provider, prompt, path, system=_WORKER_SYSTEM, max_rounds=max_rounds
+                agent, prompt, path, system=_WORKER_SYSTEM, max_rounds=max_rounds
             )
             if on_tokens is not None:
-                usage = getattr(provider, "last_usage", None)
+                usage = getattr(agent, "last_usage", None)
                 if isinstance(usage, tuple) and len(usage) == 2:
                     try:
                         on_tokens(int(usage[0]), int(usage[1]))
@@ -551,7 +569,7 @@ def run_verified_task(
                         pass
             return response
         finally:
-            provider.config.model = original_model
+            agent.config.model = original_model
 
     def run_tests(path: str) -> "tuple[str, int]":
         # Restore the scaffolded gating tests (snapshotted below, once the
@@ -579,7 +597,7 @@ def run_verified_task(
             worktree_path=worktree_path,
             error=gate_error,
         )
-        return aborted, []
+        return aborted, [], []
 
     # Snapshot the scaffolded tests now -- after the gate proves them healthy and
     # before the worker touches anything -- so run_tests can restore them each
@@ -609,7 +627,33 @@ def run_verified_task(
                 on_progress("guardrail", "reverted needless edits to shared code; suite green")
             result = replace(result, passed=True, guardrail_fired=True)
 
-    return result, models_used
+    return result, models_used, providers_used
+
+
+def _resolve_escalation(app, escalate_to) -> "tuple[Optional[object], str, Optional[str]]":
+    """Resolve *escalate_to* into (provider instance, provider name, model).
+
+    *escalate_to* is either a provider name (``"glm"``) or a
+    ``(provider_name, model)`` pair. The instance is looked up in
+    ``app.providers``; when no explicit model is given, the provider's frontier
+    model is read from ``app.config``. Returns ``(None, "", None)`` when
+    *escalate_to* is falsy or names a provider that is not available -- in which
+    case escalation stays within the primary provider (within-provider frontier
+    lift), a graceful degradation rather than an abort.
+    """
+    if not escalate_to:
+        return None, "", None
+    if isinstance(escalate_to, (tuple, list)):
+        name = escalate_to[0]
+        model = escalate_to[1] if len(escalate_to) > 1 else None
+    else:
+        name, model = escalate_to, None
+    provider = app.providers.get(name)
+    if provider is None:
+        return None, "", None
+    if not model:
+        model = app.config.get_model_for(name, fast=False)
+    return provider, name, model
 
 
 def run_solve(
@@ -621,6 +665,7 @@ def run_solve(
     max_rounds: int = 15,
     escalate: bool = True,
     escalate_after: int = 1,
+    escalate_to: "Optional[str | tuple[str, str]]" = None,
     timeout: int = 300,
     on_progress: ProgressCallback = None,
     on_tokens: TokensCallback = None,
@@ -633,8 +678,13 @@ def run_solve(
     its diff can be inspected; the caller's working tree is untouched.
 
     When ``escalate`` is set, the first ``escalate_after`` iteration(s) run on the
-    provider's fast (bulk) model and later iterations escalate to its full
-    (frontier) model -- bulk-first, frontier-on-failure, all in one worktree.
+    provider's fast (bulk) model and later iterations escalate -- bulk-first,
+    stronger-on-failure, all in one worktree. By default escalation lifts the
+    model within the same provider (fast -> frontier); pass ``escalate_to`` (a
+    provider name like ``"glm"`` or a ``(provider_name, model)`` pair) to instead
+    hand stalled iterations to a stronger *provider* entirely. The returned
+    ``SolveResult`` records ``providers_used`` alongside ``models_used`` so the
+    handoff is visible.
     """
     provider_name = provider_name or app.config.get_default_provider()
     provider = app.providers.get(provider_name)
@@ -654,6 +704,9 @@ def run_solve(
     bulk_model = (
         app.config.get_model_for(provider_name, fast=True) if escalate else frontier_model
     )
+    escalation_provider, escalation_name, escalation_model = _resolve_escalation(
+        app, escalate_to
+    )
     manager = WorktreeManager()
     token_totals = [0, 0]
 
@@ -667,7 +720,7 @@ def run_solve(
         path = manager.prepare(provider_name).path
         if on_progress:
             on_progress("workspace", path)
-        result, models_used = run_verified_task(
+        result, models_used, providers_used = run_verified_task(
             provider,
             path,
             task,
@@ -678,6 +731,10 @@ def run_solve(
             max_rounds=max_rounds,
             escalate=escalate,
             escalate_after=escalate_after,
+            escalation_provider=escalation_provider,
+            escalation_model=escalation_model,
+            provider_label=provider_name,
+            escalation_label=escalation_name,
             timeout=timeout,
             on_progress=on_progress,
             on_tokens=_accumulate_tokens,
@@ -694,6 +751,7 @@ def run_solve(
             diff_excerpt=snapshot.diff_excerpt,
             changed_files=snapshot.changed_files,
             models_used=tuple(models_used),
+            providers_used=tuple(providers_used),
             input_tokens=token_totals[0],
             output_tokens=token_totals[1],
             guardrail_fired=result.guardrail_fired,
