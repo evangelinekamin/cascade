@@ -17,10 +17,10 @@ _ENV_VARS = {
     "openai": ["OPENAI_API_KEY"],
 }
 
-# Default models per provider
+# Default models per provider (kept in step with ConfigManager's own defaults).
 _DEFAULT_MODELS = {
-    "gemini": "gemini-2.5-flash",
-    "claude": "claude-sonnet-4-6",
+    "gemini": "gemini-3.1-pro-preview",
+    "claude": "claude-opus-4-8",
     "openrouter": "qwen/qwen3.5-9b",
     "openai": "gpt-5.3-codex",
 }
@@ -96,8 +96,9 @@ class SetupWizard:
 
         enabled_providers = []
 
-        # Walk through each known provider
-        for name in sorted(self.registry.keys()):
+        # Walk the key-based providers only; keyless self-hosted providers
+        # (local/glm) are configured directly in config.yaml, not via login.
+        for name in sorted(n for n in self.registry.keys() if n in _ENV_VARS):
             enabled = self._configure_provider(name, detected.get(name, ""))
             if enabled:
                 enabled_providers.append(name)
@@ -187,7 +188,8 @@ class SetupWizard:
         if fast_model:
             providers[name]["fast_model"] = fast_model
         providers[name].setdefault("temperature", 0.7)
-        providers[name].setdefault("max_tokens", 2048)
+        # No max_tokens: the agentic /solve loop needs unbounded completions, and
+        # a small cap silently truncates code edits mid-build.
         return True
 
     def _select_model(self, name: str, default_model: str) -> str:

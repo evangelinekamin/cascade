@@ -188,6 +188,7 @@ def _tiered_app(bulk="bulk-x", frontier="frontier-x"):
     app.config.get_model_for = MagicMock(
         side_effect=lambda name, mode_name=None, fast=False: bulk if fast else frontier
     )
+    app.config.get_bulk_model = MagicMock(side_effect=lambda name, mode_name=None: bulk)
     app.config.data = {"workflows": {"verify": {"test": "pytest"}}}
     return app, prov
 
@@ -222,6 +223,20 @@ def test_escalates_to_frontier_after_first_failure(monkeypatch):
     assert prov.config.model == "frontier-x"
 
 
+def test_solve_bulk_tier_resolves_via_get_bulk_model(monkeypatch):
+    """The bulk iteration comes from get_bulk_model, decoupled from fast_model."""
+    app, prov = _tiered_app()
+    app.config.get_bulk_model = MagicMock(
+        side_effect=lambda name, mode_name=None: "dedicated-bulk"
+    )
+    observed: list[str] = []
+    _patch_solve(monkeypatch, observed, iter([("fail", 1), ("ok", 0)]))
+
+    run_solve(app, "x", escalate=True, escalate_after=1, max_iterations=3)
+
+    assert observed[0] == "dedicated-bulk"
+
+
 def test_run_solve_accumulates_and_reports_token_usage(monkeypatch):
     app = MagicMock()
     prov = MagicMock()
@@ -232,6 +247,7 @@ def test_run_solve_accumulates_and_reports_token_usage(monkeypatch):
     app.config.get_model_for = MagicMock(
         side_effect=lambda name, mode_name=None, fast=False: "bulk" if fast else "frontier"
     )
+    app.config.get_bulk_model = MagicMock(side_effect=lambda name, mode_name=None: "bulk")
     app.config.data = {"workflows": {"verify": {"test": "pytest"}}}
 
     fm = MagicMock()
@@ -946,6 +962,7 @@ def _dual_app(bulk="bulk-x", frontier="frontier-x", glm_model="glm-4.6"):
         return bulk if fast else frontier
 
     app.config.get_model_for = MagicMock(side_effect=_model_for)
+    app.config.get_bulk_model = MagicMock(side_effect=lambda name, mode_name=None: bulk)
     app.config.data = {"workflows": {"verify": {"test": "pytest"}}}
     return app, primary, glm
 

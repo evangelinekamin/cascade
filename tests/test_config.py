@@ -296,6 +296,30 @@ def test_provider_config_defaults_provider_preferences_to_none():
         assert config.provider_preferences is None
 
 
+def test_get_bulk_model_defaults_to_frontier_model_not_fast_model():
+    """/solve's bulk tier uses the provider model, never the /ultrafast fast_model.
+
+    A fresh openrouter config ships fast_model=inception/mercury-2 for /ultrafast;
+    that flaky speed model must not silently become /solve's builder.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        assert manager.data["providers"]["openrouter"]["fast_model"] == "inception/mercury-2"
+        assert manager.get_bulk_model("openrouter") == "qwen/qwen3.5-9b"
+
+
+def test_get_bulk_model_prefers_explicit_bulk_model():
+    """An explicit bulk_model wins, giving /solve a cheap first tier below model."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        manager.data["providers"]["openrouter"]["bulk_model"] = "deepseek/deepseek-v4-flash"
+        assert manager.get_bulk_model("openrouter") == "deepseek/deepseek-v4-flash"
+
+
 def test_memory_config_defaults():
     """Memory config should expose safe defaults."""
     with tempfile.TemporaryDirectory() as tmpdir:
