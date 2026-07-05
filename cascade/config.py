@@ -136,6 +136,9 @@ class ConfigManager:
             "tools": {
                 "reflection": True,
                 "file_ops": True,
+                # Opt-in shell tool for direct-API chat models (test/build).
+                # Off by default -- it runs real commands in the launch dir.
+                "exec": False,
             },
             "workflows": {
                 "verify": {
@@ -355,6 +358,7 @@ class ConfigManager:
         defaults = {
             "reflection": True,
             "file_ops": True,
+            "exec": False,
         }
         config = self.data.get("tools", {})
         return {**defaults, **config} if config else defaults
