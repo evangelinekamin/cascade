@@ -1593,6 +1593,7 @@ class CommandHandler:
                     cli_app,
                     objective,
                     provider_name=provider,
+                    escalate_to=cli_app.config.get_escalation_target(provider),
                     on_progress=_on_progress,
                     on_tokens=_on_tokens,
                 )

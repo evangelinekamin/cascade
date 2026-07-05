@@ -280,6 +280,18 @@ class ConfigManager:
             return bulk_model
         return self.get_model_for(provider_name, mode_name, fast=False)
 
+    def get_escalation_target(self, provider_name: str) -> Optional[str]:
+        """Return the provider to hand off to when *provider_name* stalls in /solve.
+
+        Reads ``providers.<name>.escalate_to`` -- a provider name (e.g. "claude")
+        that a stalled cheap-bulk /solve escalates to, so a stronger provider
+        finishes the hard part. None means stay within the same provider (bulk
+        model -> frontier model), the prior behavior.
+        """
+        provider_data = self.data.get("providers", {}).get(provider_name, {})
+        target = str(provider_data.get("escalate_to", "") or "").strip()
+        return target or None
+
     def get_default_mode_for_provider(self, provider_name: str) -> str:
         """Return the first configured mode that maps to the given provider."""
         for mode_name in MODE_CYCLE:
