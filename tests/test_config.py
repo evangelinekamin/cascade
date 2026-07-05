@@ -320,6 +320,19 @@ def test_get_bulk_model_prefers_explicit_bulk_model():
         assert manager.get_bulk_model("openrouter") == "deepseek/deepseek-v4-flash"
 
 
+def test_get_escalation_target_reads_provider_escalate_to():
+    """/solve's cross-provider escalation target comes from providers.<name>.escalate_to."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "config.yaml"
+        manager = ConfigManager(str(config_path))
+
+        # unset by default -> None (escalate within the same provider)
+        assert manager.get_escalation_target("openrouter") is None
+        # a provider name -> the cross-provider handoff target
+        manager.data["providers"]["openrouter"]["escalate_to"] = "claude"
+        assert manager.get_escalation_target("openrouter") == "claude"
+
+
 def test_memory_config_defaults():
     """Memory config should expose safe defaults."""
     with tempfile.TemporaryDirectory() as tmpdir:
