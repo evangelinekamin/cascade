@@ -41,6 +41,10 @@ class MainScreen(Screen):
 
     _STREAM_BATCH_INTERVAL_SECONDS = 0.03
     _STREAM_BATCH_MAX_CHARS = 1024
+    # Tool-using chat is a light agent: more than the 5-round default so a model
+    # can read a few files before answering, but well under /solve's 15 -- chat is
+    # not a verified build, and big edit-test-commit tasks belong in /solve.
+    _CHAT_TOOL_MAX_ROUNDS = 10
 
     BINDINGS = [
         ("shift+tab", "cycle_mode", "Cycle Mode"),
@@ -524,6 +528,7 @@ class MainScreen(Screen):
                 messages,
                 tools,
                 system=final_system,
+                max_rounds=self._CHAT_TOOL_MAX_ROUNDS,
                 on_tool_event=on_tool_event,
             )
 
