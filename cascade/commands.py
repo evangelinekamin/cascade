@@ -1652,16 +1652,14 @@ class CommandHandler:
                             "this repo (or set workflows.verify.test globally) to a "
                             "command that runs here, e.g. 'uv run pytest'."
                         )
-                if result.changed_files:
-                    lines.append("Files: " + ", ".join(result.changed_files[:8]))
                 if result.diff_stat:
-                    lines.append(result.diff_stat)
+                    # The per-file stat is the compact "what changed" -- keep it;
+                    # the full diff stays in the worktree rather than flooding chat.
+                    lines.append(result.diff_stat.strip())
+                elif result.changed_files:
+                    lines.append("Files: " + ", ".join(result.changed_files[:8]))
                 if result.worktree_path:
-                    lines.append(f"Worktree: {result.worktree_path}")
-                if result.diff_excerpt:
-                    lines.append("")
-                    lines.append("--- Verified diff ---")
-                    lines.append(result.diff_excerpt)
+                    lines.append(f"Review + apply:  git -C {result.worktree_path} diff")
 
                 final = "\n".join(lines)
                 _call_ui(self._clear_progress_indicator, progress)
@@ -1730,16 +1728,14 @@ class CommandHandler:
                     lines.append(
                         f"  [{step.id}] {mark} ({step.iterations} iter): {step.description}"
                     )
-                if result.changed_files:
-                    lines.append("Files: " + ", ".join(result.changed_files[:8]))
                 if result.diff_stat:
-                    lines.append(result.diff_stat)
+                    # The per-file stat is the compact "what changed" -- keep it;
+                    # the full diff stays in the worktree rather than flooding chat.
+                    lines.append(result.diff_stat.strip())
+                elif result.changed_files:
+                    lines.append("Files: " + ", ".join(result.changed_files[:8]))
                 if result.worktree_path:
-                    lines.append(f"Worktree: {result.worktree_path}")
-                if result.diff_excerpt:
-                    lines.append("")
-                    lines.append("--- Verified diff ---")
-                    lines.append(result.diff_excerpt)
+                    lines.append(f"Review + apply:  git -C {result.worktree_path} diff")
 
                 final = "\n".join(lines)
                 _call_ui(self._clear_progress_indicator, progress)
