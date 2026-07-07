@@ -9,7 +9,7 @@ from cascade.swarm.workspace import WorkspaceTools, run_agent_in_worktree
 def test_workspace_tools_read_write_within_root():
     with tempfile.TemporaryDirectory() as root:
         tools = WorkspaceTools(root)
-        assert tools.write_file("sub/a.txt", "hello") is True
+        assert "Wrote" in tools.write_file("sub/a.txt", "hello")
         assert tools.read_file("sub/a.txt") == "hello"
         assert any("a.txt" in entry for entry in tools.list_files("sub"))
 
@@ -20,7 +20,29 @@ def test_workspace_tools_rejects_escape():
         # read returns an error string rather than touching anything outside root
         assert "Error" in tools.read_file("../../../../etc/passwd")
         # write outside the root is refused
-        assert tools.write_file("../escape.txt", "x") is False
+        assert "Error" in tools.write_file("../escape.txt", "x")
+
+
+def test_write_file_flags_broken_python_syntax():
+    with tempfile.TemporaryDirectory() as root:
+        tools = WorkspaceTools(root)
+        result = tools.write_file("mod.py", "def broken(:\n    pass\n")
+        assert "syntax check failed" in result
+        assert "line" in result.lower()
+
+
+def test_write_file_passes_valid_python():
+    with tempfile.TemporaryDirectory() as root:
+        tools = WorkspaceTools(root)
+        assert tools.write_file("mod.py", "def ok():\n    return 1\n") == "Wrote mod.py"
+
+
+def test_write_file_skips_syntax_check_for_non_python():
+    with tempfile.TemporaryDirectory() as root:
+        tools = WorkspaceTools(root)
+        # invalid "python" but a .txt -> written, not syntax-checked
+        result = tools.write_file("notes.txt", "def broken(:")
+        assert "Wrote" in result and "syntax" not in result.lower()
 
 
 def test_workspace_tools_build_exposes_five_tools():
@@ -51,7 +73,7 @@ def test_run_command_returns_stdout():
 def test_run_command_runs_in_worktree_cwd():
     with tempfile.TemporaryDirectory() as root:
         tools = WorkspaceTools(root)
-        assert tools.write_file("marker.txt", "payload") is True
+        assert "Wrote" in tools.write_file("marker.txt", "payload")
         # cwd is the worktree, so a relative path written above is visible here.
         out = tools.run_command("cat marker.txt")
         assert "payload" in out

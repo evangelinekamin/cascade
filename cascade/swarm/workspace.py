@@ -30,6 +30,29 @@ def _truncate_tail(text: str, cap: int = _OUTPUT_CAP) -> str:
     return f"{_TRUNCATION_MARKER}\n{text[-cap:]}"
 
 
+def _post_edit_check(path: Path) -> str:
+    """Fast, dependency-free validity check for a just-written file.
+
+    Returns "" when the file looks valid, else a one-line finding. Today this is a
+    Python syntax parse only (milliseconds, in-process, no subprocess) -- the cheap
+    first tier of "verify before moving on" that catches a broken edit immediately
+    instead of letting it surface at the far more expensive full-suite gate. Other
+    languages pass through silently.
+    """
+    if path.suffix != ".py":
+        return ""
+    try:
+        import ast
+
+        ast.parse(path.read_text(), filename=str(path))
+        return ""
+    except SyntaxError as exc:
+        where = f" (line {exc.lineno})" if exc.lineno else ""
+        return f"{exc.msg}{where}"
+    except Exception:
+        return ""
+
+
 class WorkspaceTools:
     """Restricted file tools rooted at a single worktree path."""
 
@@ -70,26 +93,37 @@ class WorkspaceTools:
         except Exception as exc:
             return f"Error reading file: {exc}"
 
-    def write_file(self, path: str, content: str) -> bool:
-        """Write file contents inside the worktree."""
+    def write_file(self, path: str, content: str) -> str:
+        """Write file contents inside the worktree, then fast-check the result.
+
+        Returns a short status. If the file is Python and now has a syntax error,
+        the message names it so the model fixes the edit on its next turn -- rather
+        than the break only surfacing at the (expensive) full-suite gate.
+        """
         try:
             target = self._resolve(path)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
-            return True
-        except Exception:
-            return False
+        except Exception as exc:
+            return f"Error writing {path}: {exc}"
+        issue = _post_edit_check(target)
+        if issue:
+            return f"Wrote {path}, but a syntax check failed: {issue}. Fix it."
+        return f"Wrote {path}"
 
-    def append_file(self, path: str, content: str) -> bool:
-        """Append file contents inside the worktree."""
+    def append_file(self, path: str, content: str) -> str:
+        """Append file contents inside the worktree, then fast-check the result."""
         try:
             target = self._resolve(path)
             target.parent.mkdir(parents=True, exist_ok=True)
             with target.open("a") as handle:
                 handle.write(content)
-            return True
-        except Exception:
-            return False
+        except Exception as exc:
+            return f"Error appending {path}: {exc}"
+        issue = _post_edit_check(target)
+        if issue:
+            return f"Appended {path}, but a syntax check failed: {issue}. Fix it."
+        return f"Appended {path}"
 
     def list_files(self, path: str = ".") -> list[str]:
         """List immediate children under a worktree path."""
