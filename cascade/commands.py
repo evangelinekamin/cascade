@@ -60,6 +60,7 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("swarm", "/swarm <task>", "Multi-model swarm dispatch"),
     CommandDef("solve", "/solve <task>", "Code a task in an isolated worktree, verified by tests"),
     CommandDef("pipeline", "/pipeline <objective>", "Decompose a build into ordered steps, each verified by tests"),
+    CommandDef("log", "/log", "Scroll the last /solve's full activity + verified diff"),
     CommandDef(
         "compete",
         "/compete [--providers a,b] [--judge x] <task>",
@@ -99,6 +100,9 @@ class CommandHandler:
         self.app = app
         self._shannon = None
         self._upload_server = None
+        # Full activity + diff of the most recent /solve, shown by /log.
+        self._last_solve_log: list[str] = []
+        self._last_solve_title = ""
 
     def is_command(self, text: str) -> bool:
         return text.startswith("/")
@@ -143,6 +147,7 @@ class CommandHandler:
             "swarm": self._cmd_swarm,
             "solve": self._cmd_solve,
             "pipeline": self._cmd_pipeline,
+            "log": self._cmd_log,
             "compete": self._cmd_compete,
             "compete-code": self._cmd_compete_code,
             "episodes": self._cmd_episodes,
@@ -1537,6 +1542,22 @@ class CommandHandler:
         screen = self.app.screen
         screen.run_worker(_worker, thread=True, exclusive=False)
 
+    def _cmd_log(self, args: list[str]) -> None:
+        """Open a scrollable view of the last /solve's activity + verified diff."""
+        if not self._last_solve_log:
+            self._post_system("No /solve log yet -- run /solve first.")
+            return
+        try:
+            from .screens.log_viewer import LogViewerScreen
+
+            self.app.push_screen(
+                LogViewerScreen(
+                    self._last_solve_title or "/solve log", self._last_solve_log
+                )
+            )
+        except Exception as e:
+            self._post_system(f"Could not open log viewer: {e}")
+
     def _cmd_solve(self, args: list[str]) -> None:
         """Code a task in an isolated worktree, verified by tests (iterate to green)."""
         if not args:
@@ -1554,6 +1575,7 @@ class CommandHandler:
         self._post_system(f"Solving: {objective}")
         self._record_command_line(f"/solve {objective}", title=f"[Solve] {objective}")
         progress = self._mount_progress_indicator(f"solving: {objective[:60]}")
+        solve_activity: list[str] = []  # full feed captured for /log
 
         def _call_ui(fn, *call_args) -> None:
             caller = getattr(self.app, "call_from_thread", None)
@@ -1563,6 +1585,7 @@ class CommandHandler:
                 fn(*call_args)
 
         def _on_progress(stage: str, detail: str) -> None:
+            solve_activity.append(f"[{stage}] {detail}")
             label = f"{stage}: {detail}"
             label = label[:100] if len(label) > 100 else label
             if progress is None:
@@ -1597,6 +1620,7 @@ class CommandHandler:
             if isinstance(tool_input, dict):
                 detail = str(tool_input.get("path") or tool_input.get("command") or "")
             label = f"{name} {detail}".strip()[:100]
+            solve_activity.append(f"  - {label}")
             _call_ui(self._set_progress_indicator_label, progress, label)
 
         def _worker() -> None:
@@ -1666,6 +1690,15 @@ class CommandHandler:
                 _call_ui(self._post_system, final)
                 _call_ui(self._record_history_message, "system", final)
                 _call_ui(self.app.state.add_message, "system", f"[Solve] {objective}")
+                # Stash the full run for /log: activity feed, result card, full diff.
+                solve_log = [f"/solve {objective}", ""] + solve_activity
+                solve_log += ["", "-" * 48, ""] + lines
+                if result.diff_excerpt:
+                    solve_log += ["", "== verified diff =="] + result.diff_excerpt.splitlines()
+                self._last_solve_log = solve_log
+                self._last_solve_title = (
+                    f"/solve  {'PASSED' if result.passed else 'FAILED'}  -  {objective[:60]}"
+                )
             except Exception as e:
                 _call_ui(self._clear_progress_indicator, progress)
                 _call_ui(self._post_system, f"Solve error: {e}")
