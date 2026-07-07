@@ -35,6 +35,16 @@ _CHARS_PER_TOKEN = 4
 _DOOM_INTERVENE = 2
 _DOOM_ABORT = 3
 
+# Edit-run cycle guard: a model that alternates editing one file and running a
+# command makes no net progress yet never issues two identical calls in a row, so
+# the consecutive-identical doom guard above never trips. Count file edits per
+# path and command runs per normalized prefix across the whole loop; bail once a
+# single file and a single command have both churned this many times.
+_EDIT_RUN_THRESHOLD = 6
+
+# File-mutating tools whose repeated "path" edits count toward the cycle guard.
+_EDIT_TOOLS = ("write_file", "append_file", "replace_in_file")
+
 
 def _estimate_tokens(messages: list[dict]) -> int:
     """Rough token count for OpenAI api_message dicts (~1 token / 4 chars).
@@ -141,6 +151,34 @@ def _read_dedup_key(tool_name: str, tool_args: dict) -> Optional[tuple[str, str]
     return None
 
 
+def _edit_run_target(tool_name: str, tool_args: dict) -> Optional[tuple[str, str]]:
+    """Classify a call for the edit-run cycle guard.
+
+    Returns ``("edit", path)`` for a file-mutating tool that names a ``path``, or
+    ``("run", prefix)`` for ``run_command`` keyed by its first whitespace token (so
+    ``pytest -x`` and ``pytest -v`` share one bucket), else ``None``.
+    """
+    if tool_name in _EDIT_TOOLS:
+        path = tool_args.get("path")
+        if isinstance(path, str) and path:
+            return ("edit", path)
+    elif tool_name == "run_command":
+        command = tool_args.get("command")
+        if isinstance(command, str):
+            tokens = command.split()
+            if tokens:
+                return ("run", tokens[0])
+    return None
+
+
+def _hottest_over(counts: dict[str, int], threshold: int) -> Optional[str]:
+    """Return the most-repeated key once it reaches *threshold*, else ``None``."""
+    if not counts:
+        return None
+    key = max(counts, key=counts.get)
+    return key if counts[key] >= threshold else None
+
+
 def openai_ask_with_tools(
     client: httpx.Client,
     url: str,
@@ -212,6 +250,8 @@ def openai_ask_with_tools(
     seen_reads: set[tuple[str, str]] = set()
     doom_streak = 0
     doom_sig = None
+    edit_counts: dict[str, int] = {}
+    run_counts: dict[str, int] = {}
 
     def _capture_usage(data: dict) -> None:
         nonlocal total_input_tokens, total_output_tokens
@@ -298,6 +338,25 @@ def openai_ask_with_tools(
                     f"{doom_streak + 1}x with no progress -- handing off.]"
                 )
                 return (content if content.strip() else note), tool_log
+
+            # Edit-run cycle guard: the doom guard above only catches back-to-back
+            # identical calls, so a model thrashing edit -> run -> edit slips past
+            # it. Tally edits per file and runs per command prefix across the whole
+            # loop; once one file and one command have both churned past the
+            # threshold, bail so the verified loop can escalate instead of spinning.
+            target = _edit_run_target(tool_name, tool_args)
+            if target is not None:
+                kind, key = target
+                counts = edit_counts if kind == "edit" else run_counts
+                counts[key] = counts.get(key, 0) + 1
+                stuck_file = _hottest_over(edit_counts, _EDIT_RUN_THRESHOLD)
+                if stuck_file and _hottest_over(run_counts, _EDIT_RUN_THRESHOLD):
+                    _finalize_usage()
+                    note = (
+                        f"[stalled: edit-run cycle on {stuck_file} without "
+                        f"progress -- handing off.]"
+                    )
+                    return (content if content.strip() else note), tool_log
 
             if on_tool_event:
                 on_tool_event(ToolEvent(

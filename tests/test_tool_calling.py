@@ -4,6 +4,8 @@ These tests mock the HTTP layer to verify that providers correctly format
 tool definitions and handle tool_use/tool_result round trips.
 """
 
+import itertools
+import json
 from unittest.mock import patch, MagicMock
 
 import httpx
@@ -35,6 +37,55 @@ def _make_config():
 def _msgs(prompt: str) -> list[Message]:
     """Build a single-message list from a prompt string."""
     return [{"role": "user", "content": prompt}]
+
+
+def _make_edit_run_tools():
+    """Registry with a file-writing tool and a shell-running tool."""
+    def write_file(path: str, content: str) -> str:
+        """Write content to a file."""
+        return f"wrote {path}"
+
+    def run_command(command: str) -> str:
+        """Run a shell command."""
+        return f"ran {command}"
+
+    return {
+        "write_file": callable_to_tool_def("write_file", write_file, "Write a file"),
+        "run_command": callable_to_tool_def("run_command", run_command, "Run a command"),
+    }
+
+
+def _tool_call_response(tool_name: str, arguments: dict, call_id: str) -> MagicMock:
+    """Mock chat-completions response carrying a single tool call."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        "choices": [{
+            "message": {"content": "", "tool_calls": [{
+                "id": call_id,
+                "function": {"name": tool_name, "arguments": json.dumps(arguments)},
+            }]},
+            "finish_reason": "tool_calls",
+        }],
+    }
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+def _text_response(text: str) -> MagicMock:
+    """Mock final (no tool call) chat-completions response."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        "choices": [{
+            "message": {"content": text, "tool_calls": []},
+            "finish_reason": "stop",
+        }],
+    }
+    resp.raise_for_status = MagicMock()
+    return resp
 
 
 class TestBaseProviderToolCalling:
@@ -323,6 +374,74 @@ class TestDoomLoopGuard:
         # The 3rd identical call is intercepted with a corrective nudge, not run again.
         outputs = [entry["output"] for entry in log]
         assert any("different approach" in out for out in outputs)
+
+
+class TestEditRunCycleGuard:
+    """Alternating edits and command runs make no progress -- bail before the budget."""
+
+    def test_edit_run_cycle_bails_before_max_rounds(self):
+        """write_file(same path) alternating with run_command past the threshold
+        trips the edit-run guard (which the consecutive-identical doom guard misses,
+        since the alternation resets its streak)."""
+        from cascade.providers.openai_provider import OpenAIProvider
+
+        prov = OpenAIProvider(_make_config())
+        edit = _tool_call_response("write_file", {"path": "app.py", "content": "x"}, "e1")
+        run_x = _tool_call_response("run_command", {"command": "pytest -x"}, "r1")
+        run_v = _tool_call_response("run_command", {"command": "pytest -v"}, "r2")
+        # The two pytest invocations differ only in flags, proving they share one
+        # normalized-prefix bucket ("pytest") rather than counting separately.
+        cycle = itertools.cycle([edit, run_x, edit, run_v])
+
+        with patch.object(prov.client, "post", side_effect=cycle) as post:
+            result, _log = prov.ask_with_tools(
+                _msgs("fix the failing test"), _make_edit_run_tools(), max_rounds=30
+            )
+
+        assert "edit-run cycle" in result.lower()
+        assert "app.py" in result
+        # Bailed once one file (6 edits) and one command (6 runs) both crossed the
+        # threshold -- at the 12th call, not the full 30-round budget.
+        assert post.call_count == 12
+
+    def test_short_edit_run_burst_then_finish_does_not_bail(self):
+        """A handful of edit/run cycles (below the threshold) that then finish must
+        return the model's answer, not a stall note."""
+        from cascade.providers.openai_provider import OpenAIProvider
+
+        prov = OpenAIProvider(_make_config())
+        edit = _tool_call_response("write_file", {"path": "app.py", "content": "x"}, "e1")
+        run = _tool_call_response("run_command", {"command": "pytest"}, "r1")
+        done = _text_response("All tests pass.")
+        responses = [edit, run, edit, run, edit, run, done]  # 3 cycles, then finish
+
+        with patch.object(prov.client, "post", side_effect=responses) as post:
+            result, log = prov.ask_with_tools(
+                _msgs("fix the failing test"), _make_edit_run_tools(), max_rounds=30
+            )
+
+        assert result == "All tests pass."
+        assert "edit-run cycle" not in result.lower()
+        assert post.call_count == 7
+        assert len(log) == 6
+
+    def test_identical_edit_repeats_still_trip_the_doom_guard(self):
+        """The consecutive-identical doom guard must still fire for edit tools:
+        repeating write_file with identical args bails on the doom path (4th call),
+        well before the edit-run threshold -- edit-run counting must not suppress it."""
+        from cascade.providers.openai_provider import OpenAIProvider
+
+        prov = OpenAIProvider(_make_config())
+        edit = _tool_call_response("write_file", {"path": "app.py", "content": "x"}, "e1")
+
+        with patch.object(prov.client, "post", return_value=edit) as post:
+            result, _log = prov.ask_with_tools(
+                _msgs("write the file"), _make_edit_run_tools(), max_rounds=30
+            )
+
+        assert "identical arguments" in result
+        assert "edit-run cycle" not in result.lower()
+        assert post.call_count <= 5  # doom bailed near the 4th identical call
 
 
 class TestOpenRouterToolCalling:
