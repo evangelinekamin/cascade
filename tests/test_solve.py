@@ -12,6 +12,7 @@ from cascade.swarm.solve import (
     _test_command,
     run_solve,
     run_verified_task,
+    worker_guidance_for,
 )
 
 
@@ -1050,3 +1051,176 @@ def test_run_solve_without_escalate_to_is_unchanged(monkeypatch):
 
     assert seen == [(primary, "bulk-x"), (primary, "frontier-x")]
     assert result.providers_used == ("deepseek", "deepseek")
+
+
+# --- Per-model behavioral guidance: steer each cheap model past its failure modes --
+
+
+def test_worker_guidance_for_deepseek_includes_dogfooded_steers():
+    guidance = worker_guidance_for("deepseek/deepseek-v4-flash")
+    # targeted-edit steer: prefer replace_in_file over whole-file write_file rewrites
+    assert "replace_in_file" in guidance
+    assert "write_file" in guidance
+    # blast-radius steer: leave shared helpers alone unless the task needs them
+    assert "shared" in guidance
+    # ngspice convergence steer: model a regulator as a behavioral CURRENT source
+    assert "CURRENT source" in guidance
+
+
+def test_worker_guidance_for_unknown_model_is_empty():
+    # a model with no registered failure modes gets no appended steering
+    assert worker_guidance_for("claude-opus-4-8") == ""
+
+
+def test_worker_guidance_for_matches_case_insensitively():
+    assert worker_guidance_for("DeepSeek-V4") == worker_guidance_for("deepseek-v4")
+    assert worker_guidance_for("DeepSeek-V4") != ""
+
+
+def _capture_worker_systems(monkeypatch):
+    """Patch the solve internals and return a list capturing each worker system."""
+    systems: list[str] = []
+
+    def fake_agent(provider, prompt, path, system=None, max_rounds=None, on_tool_event=None):
+        systems.append(system)
+        return "edited"
+
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", fake_agent)
+    monkeypatch.setattr(solve_mod, "_preflight_gate", lambda *a, **k: None)
+    monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: ("ok", 0))
+    return systems
+
+
+def test_run_verified_task_appends_deepseek_guidance_to_the_worker_system(monkeypatch):
+    systems = _capture_worker_systems(monkeypatch)
+
+    run_verified_task(
+        _prov(),
+        "/tmp/wt",
+        "task",
+        "pytest",
+        bulk_model="deepseek/deepseek-v4-flash",
+        frontier_model="f",
+    )
+
+    assert len(systems) == 1
+    # the base worker prompt is preserved, with the DeepSeek steering appended
+    assert solve_mod._WORKER_SYSTEM in systems[0]
+    assert "replace_in_file" in systems[0]
+    assert "CURRENT source" in systems[0]
+
+
+def test_run_verified_task_omits_guidance_for_a_non_deepseek_model(monkeypatch):
+    systems = _capture_worker_systems(monkeypatch)
+
+    run_verified_task(
+        _prov(),
+        "/tmp/wt",
+        "task",
+        "pytest",
+        bulk_model="claude-opus-4-8",
+        frontier_model="f",
+    )
+
+    # no matching failure modes -> the worker system is exactly the base prompt
+    assert systems == [solve_mod._WORKER_SYSTEM]
+
+
+# --- Anti-proxy verification classifier: annotate what the gate exercised --------
+#
+# A cheap model can green the gate without real work by pointing it at a grep, a
+# `test -f`, or a bare `true`. classify_verification labels what the resolved
+# verify command actually exercises so run_solve can warn on a passing proxy or
+# sentinel check -- an advisory note that never changes result.passed.
+
+
+def test_classify_verification_detects_a_real_test_runner():
+    assert solve_mod.classify_verification("uv run pytest tests/ -q") == "test"
+    assert solve_mod.classify_verification("python -m pytest -x") == "test"
+    assert solve_mod.classify_verification("python -m unittest discover") == "test"
+    assert solve_mod.classify_verification("go test ./...") == "test"
+    assert solve_mod.classify_verification("npx jest") == "test"
+    assert solve_mod.classify_verification("vitest run") == "test"
+    assert solve_mod.classify_verification("cargo test --all") == "test"
+
+
+def test_classify_verification_detects_syntactic_only_checks():
+    assert solve_mod.classify_verification("ruff check .") == "syntactic"
+    assert solve_mod.classify_verification("flake8 src/") == "syntactic"
+    assert solve_mod.classify_verification("mypy cascade") == "syntactic"
+    assert solve_mod.classify_verification("tsc --noEmit") == "syntactic"
+    assert solve_mod.classify_verification("python -m py_compile foo.py") == "syntactic"
+    assert solve_mod.classify_verification("eslint .") == "syntactic"
+
+
+def test_classify_verification_detects_proxy_checks():
+    # existence/grep checks prove the check ran, nothing about behavior
+    assert solve_mod.classify_verification("test -f out.txt") in {"proxy", "sentinel"}
+    assert solve_mod.classify_verification("grep -q def foo.py") == "proxy"
+    assert solve_mod.classify_verification("rg TODO cascade/") == "proxy"
+    assert solve_mod.classify_verification("ls dist/") == "proxy"
+    assert solve_mod.classify_verification("cat result.json") == "proxy"
+    assert solve_mod.classify_verification("[ -f out.txt ]") == "proxy"
+
+
+def test_classify_verification_detects_sentinels():
+    assert solve_mod.classify_verification("touch done") == "sentinel"
+    assert solve_mod.classify_verification("true") == "sentinel"
+    assert solve_mod.classify_verification(":") == "sentinel"
+
+
+def test_classify_verification_prefers_a_test_runner_anywhere():
+    # a real runner outranks a lint or a proxy sharing the same command line
+    assert solve_mod.classify_verification("ruff check . && pytest -q") == "test"
+    assert solve_mod.classify_verification("grep -q foo bar.py && pytest") == "test"
+    assert solve_mod.classify_verification("touch done && cargo test") == "test"
+
+
+def test_classify_verification_is_unknown_for_unrecognized_commands():
+    assert solve_mod.classify_verification("make build") == "unknown"
+    assert solve_mod.classify_verification("./run_ci.sh") == "unknown"
+    assert solve_mod.classify_verification("") == "unknown"
+
+
+def _solve_env(monkeypatch, rc=0):
+    """Wire a minimal passing run_solve: fake worktree + agent + test result."""
+    fm = MagicMock()
+    fm.prepare.return_value = SimpleNamespace(path="/tmp/wt")
+    fm.capture_snapshot.return_value = SimpleNamespace(
+        diff_stat="", diff_excerpt="", changed_files=()
+    )
+    monkeypatch.setattr(solve_mod, "WorktreeManager", lambda *a, **k: fm)
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", lambda *a, **k: "edited")
+    monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: ("ok", rc))
+
+
+def test_run_solve_records_verification_kind_on_a_passing_run(monkeypatch):
+    app = _fake_app("pytest")
+    _solve_env(monkeypatch)
+
+    result = run_solve(app, "add foo")
+
+    assert result.passed is True
+    assert result.verification_kind == "test"
+
+
+def test_run_solve_warns_when_a_passing_check_is_a_proxy(monkeypatch):
+    app = _fake_app("grep -q def cascade/foo.py")
+    _solve_env(monkeypatch)
+
+    result = run_solve(app, "add foo")
+
+    assert result.passed is True  # the warning is advisory, not a gate
+    assert result.verification_kind == "proxy"
+    assert "proxy" in result.error
+    assert "may not exercise real behavior" in result.error
+
+
+def test_run_solve_does_not_warn_for_a_real_test_runner(monkeypatch):
+    app = _fake_app("pytest")
+    _solve_env(monkeypatch)
+
+    result = run_solve(app, "add foo")
+
+    assert result.verification_kind == "test"
+    assert "may not exercise real behavior" not in result.error

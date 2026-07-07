@@ -34,6 +34,44 @@ focused, do not ask for confirmation, and stay inside the workspace.
 """
 
 
+# --- Per-model behavioral guidance for the verified-build worker ------------------
+#
+# Cheap "bulk" models each have their own empirically-observed failure modes. Rather
+# than bloat the shared worker prompt with caveats only one model needs, a model's
+# guidance is appended only on the iterations that model actually runs. Each registry
+# entry pairs a lowercase substring matched against the running model id with steering
+# that counters that model's dogfooded failures; ``worker_guidance_for`` concatenates
+# every matching entry, so a model id can accumulate steering from more than one.
+
+_DEEPSEEK_GUIDANCE = """\
+Guidance tuned to this model's known failure modes:
+- Prefer the `replace_in_file` tool for targeted edits; do NOT rewrite whole files
+  with `write_file` unless necessary -- whole-file rewrites drop code and waste tokens.
+- Do NOT modify shared helper functions or modules unless the task explicitly requires
+  it -- incidental edits to shared code cause collateral test failures elsewhere.
+- When writing ngspice/SPICE decks for analog circuits, model an active regulator as a
+  behavioral CURRENT source (a transconductance, e.g. "Bout 0 vout I=..."), never a
+  self-referential voltage source, or the DC operating point will not converge.
+- Act using the tools; do not merely narrate what you would do.\
+"""
+
+# Substring -> guidance. Order is the concatenation order for a multi-match model id.
+_WORKER_GUIDANCE: tuple[tuple[str, str], ...] = (("deepseek", _DEEPSEEK_GUIDANCE),)
+
+
+def worker_guidance_for(model: str) -> str:
+    """Return per-model steering to append to the worker prompt, or "" if none applies.
+
+    Each registry entry pairs a case-insensitive substring of the running model id
+    with guidance countering that model's empirically-known failure modes. The
+    guidance of every matching entry is concatenated in registry order (blank-line
+    separated), so a model id can accumulate steering from more than one entry.
+    """
+    model_id = (model or "").lower()
+    matches = [text for needle, text in _WORKER_GUIDANCE if needle in model_id]
+    return "\n\n".join(matches)
+
+
 @dataclass(frozen=True)
 class SolveResult:
     """Outcome of a verified solve run."""
@@ -52,6 +90,7 @@ class SolveResult:
     input_tokens: int = 0
     output_tokens: int = 0
     guardrail_fired: bool = False
+    verification_kind: str = ""
     error: str = ""
 
 
@@ -107,6 +146,69 @@ def _test_command(app) -> str:
         return verify.get("test") or DEFAULT_TEST_CMD
     except Exception:
         return DEFAULT_TEST_CMD
+
+
+# --- Anti-proxy verification classifier -----------------------------------------
+#
+# A cheap model can turn the verify gate green without doing real work -- by
+# pointing it at a grep, a ``test -f``, or a bare ``true``. classify_verification
+# labels what the resolved verify command actually exercises so a passing run can
+# be annotated when its "check" proves little. It only informs a warning; it never
+# changes the pass/fail decision. Patterns use word boundaries so short tokens
+# (``rg``, ``ls``, ``cat``) do not match inside unrelated words (``large``,
+# ``tools``, ``concatenate``). ``bare test`` is deliberately absent from the test
+# tier: ``go test``/``cargo test`` are runners, but ``test -f`` is a file check.
+_TEST_RUNNER_RE = re.compile(
+    r"\bpytest\b|\bunittest\b|\bjest\b|\bvitest\b|\bgo\s+test\b|\bcargo\s+test\b"
+)
+_SYNTACTIC_RE = re.compile(r"\bruff\b|\bflake8\b|\bmypy\b|\btsc\b|\bpy_compile\b|\beslint\b")
+_PROXY_RE = re.compile(r"\bgrep\b|\brg\b|\bls\b|\bcat\b|\btest\s+-f\b|\[\s*-f\b")
+_SENTINEL_RE = re.compile(r"\btouch\b|\btrue\b|(?:^|\s):(?:\s|$)")
+
+
+def classify_verification(test_cmd: str) -> str:
+    """Classify what the resolved verify command actually exercises.
+
+    Returns one of:
+
+      * ``"test"``      -- a real test runner (pytest, unittest, jest, vitest,
+                           ``go test``, ``cargo test``): exercises behavior.
+      * ``"syntactic"`` -- compile/lint only (ruff, flake8, mypy, tsc,
+                           ``py_compile``, eslint): proves it parses, not that it
+                           works.
+      * ``"proxy"``     -- existence/grep checks (grep, rg, ls, cat, ``test -f``,
+                           ``[ -f``): proves the check ran, nothing more.
+      * ``"sentinel"``  -- a no-op that always passes (touch, true, ``:``).
+      * ``"unknown"``   -- none of the above.
+
+    A real test runner anywhere in the command wins, so ``ruff && pytest`` is
+    ``"test"``. Otherwise the strongest signal present is reported.
+    """
+    haystack = (test_cmd or "").lower()
+    if _TEST_RUNNER_RE.search(haystack):
+        return "test"
+    if _SYNTACTIC_RE.search(haystack):
+        return "syntactic"
+    if _PROXY_RE.search(haystack):
+        return "proxy"
+    if _SENTINEL_RE.search(haystack):
+        return "sentinel"
+    return "unknown"
+
+
+def _annotate_verification(error: str, passed: bool, kind: str) -> str:
+    """Append an anti-proxy warning when a PASSED run's check proves little.
+
+    A passing run whose verify command was only a proxy (grep/existence) or a
+    sentinel (a no-op that always succeeds) may be green without exercising real
+    behavior. The note is advisory -- it is appended to the existing error surface
+    and never changes ``passed``. Any other kind (including a genuine test runner)
+    is returned untouched.
+    """
+    if not (passed and kind in ("proxy", "sentinel")):
+        return error
+    note = f"warning: the passing check ({kind}) may not exercise real behavior"
+    return f"{error}\n{note}" if error else note
 
 
 def _worktree_change_summary(path: str, cap: int = 1500) -> str:
@@ -557,9 +659,11 @@ def run_verified_task(
             on_progress("editing", model)
         original_model = agent.config.model
         agent.config.model = model
+        guidance = worker_guidance_for(model)
+        worker_system = f"{_WORKER_SYSTEM}\n{guidance}" if guidance else _WORKER_SYSTEM
         try:
             response = run_agent_in_worktree(
-                agent, prompt, path, system=_WORKER_SYSTEM, max_rounds=max_rounds,
+                agent, prompt, path, system=worker_system, max_rounds=max_rounds,
                 on_tool_event=on_tool_event,
             )
             if on_tokens is not None:
@@ -703,6 +807,7 @@ def run_solve(
         )
 
     test_cmd = _test_command(app)
+    verification_kind = classify_verification(test_cmd)
     frontier_model = app.config.get_model_for(provider_name, fast=False)
     bulk_model = app.config.get_bulk_model(provider_name) if escalate else frontier_model
     escalation_provider, escalation_name, escalation_model = _resolve_escalation(
@@ -757,7 +862,8 @@ def run_solve(
             input_tokens=token_totals[0],
             output_tokens=token_totals[1],
             guardrail_fired=result.guardrail_fired,
-            error=result.error,
+            verification_kind=verification_kind,
+            error=_annotate_verification(result.error, result.passed, verification_kind),
         )
     except Exception as exc:
         return SolveResult(
@@ -767,5 +873,6 @@ def run_solve(
             iterations=0,
             attempts=(),
             worktree_path="",
+            verification_kind=verification_kind,
             error=str(exc),
         )
