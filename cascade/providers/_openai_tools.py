@@ -28,6 +28,13 @@ _KEEP_RECENT_MESSAGES = 6
 # chars-per-token heuristic, mirroring cascade.conversation.estimate_tokens.
 _CHARS_PER_TOKEN = 4
 
+# Doom-loop guard: a model repeating the exact same tool call is stalled. Nudge it
+# toward a new approach on the 3rd identical call; bail on the 4th so the verified
+# loop can escalate instead of spinning to the round budget. The streak counts
+# repeats after the first call, so streak 2 == the 3rd identical call.
+_DOOM_INTERVENE = 2
+_DOOM_ABORT = 3
+
 
 def _estimate_tokens(messages: list[dict]) -> int:
     """Rough token count for OpenAI api_message dicts (~1 token / 4 chars).
@@ -203,6 +210,8 @@ def openai_ask_with_tools(
     total_output_tokens = 0
     budget = int(context_window * _CONTEXT_BUDGET_FRACTION)
     seen_reads: set[tuple[str, str]] = set()
+    doom_streak = 0
+    doom_sig = None
 
     def _capture_usage(data: dict) -> None:
         nonlocal total_input_tokens, total_output_tokens
@@ -275,6 +284,21 @@ def openai_ask_with_tools(
             except json.JSONDecodeError:
                 tool_args = {}
 
+            # Doom-loop guard: the same tool + same args over and over is a stall.
+            # A different call in between resets it (so read -> edit -> read is fine).
+            sig = (tool_name, json.dumps(tool_args, sort_keys=True, default=str))
+            if sig == doom_sig:
+                doom_streak += 1
+            else:
+                doom_streak, doom_sig = 0, sig
+            if doom_streak >= _DOOM_ABORT:
+                _finalize_usage()
+                note = (
+                    f"[stalled: called {tool_name} with identical arguments "
+                    f"{doom_streak + 1}x with no progress -- handing off.]"
+                )
+                return (content if content.strip() else note), tool_log
+
             if on_tool_event:
                 on_tool_event(ToolEvent(
                     kind="tool_start",
@@ -284,15 +308,23 @@ def openai_ask_with_tools(
                     tool_input=tool_args,
                 ))
 
-            # Read de-duplication: serve a repeat read of an already-read path
-            # from a short stub instead of re-appending the full file content.
-            dedup_key = _read_dedup_key(tool_name, tool_args)
-            if dedup_key is not None and dedup_key in seen_reads:
-                result = f"[already read above: {dedup_key[1]}]"
+            if doom_streak == _DOOM_INTERVENE:
+                # 3rd identical call: don't run it again -- nudge to change tack.
+                result = (
+                    f"You have called {tool_name} with identical arguments "
+                    f"{doom_streak + 1} times with the same result. Stop repeating "
+                    f"it and try a different approach."
+                )
             else:
-                result = executor.execute(tool_name, tool_args)
-                if dedup_key is not None:
-                    seen_reads.add(dedup_key)
+                # Read de-duplication: serve a repeat read of an already-read path
+                # from a short stub instead of re-appending the full file content.
+                dedup_key = _read_dedup_key(tool_name, tool_args)
+                if dedup_key is not None and dedup_key in seen_reads:
+                    result = f"[already read above: {dedup_key[1]}]"
+                else:
+                    result = executor.execute(tool_name, tool_args)
+                    if dedup_key is not None:
+                        seen_reads.add(dedup_key)
             tool_log.append({
                 "tool": tool_name,
                 "input": tool_args,

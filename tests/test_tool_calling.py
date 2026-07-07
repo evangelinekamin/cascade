@@ -282,6 +282,49 @@ class TestToolLoopExhaustion:
         assert len(log) == 2       # ran the tool each round until the budget was spent
 
 
+class TestDoomLoopGuard:
+    """A model spinning on the same tool call is stalled -- nudge, then bail."""
+
+    @staticmethod
+    def _repeating_response():
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "choices": [{
+                "message": {"content": "", "tool_calls": [{
+                    "id": "c1",
+                    "function": {"name": "echo", "arguments": '{"message": "same"}'},
+                }]},
+                "finish_reason": "tool_calls",
+            }],
+        }
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    def test_doom_loop_bails_before_burning_the_round_budget(self):
+        from cascade.providers.openai_provider import OpenAIProvider
+
+        prov = OpenAIProvider(_make_config())
+        with patch.object(prov.client, "post", return_value=self._repeating_response()) as post:
+            result, _log = prov.ask_with_tools(_msgs("go"), _make_tools(), max_rounds=20)
+
+        # Bailed near the 4th identical call, not the full 20-round budget.
+        assert post.call_count <= 5
+        assert "stall" in result.lower() or "handing off" in result.lower()
+
+    def test_doom_loop_nudges_on_the_third_call_before_bailing(self):
+        from cascade.providers.openai_provider import OpenAIProvider
+
+        prov = OpenAIProvider(_make_config())
+        with patch.object(prov.client, "post", return_value=self._repeating_response()):
+            _result, log = prov.ask_with_tools(_msgs("go"), _make_tools(), max_rounds=20)
+
+        # The 3rd identical call is intercepted with a corrective nudge, not run again.
+        outputs = [entry["output"] for entry in log]
+        assert any("different approach" in out for out in outputs)
+
+
 class TestOpenRouterToolCalling:
     """Test OpenRouter provider uses same format as OpenAI."""
 
