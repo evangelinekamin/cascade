@@ -45,11 +45,50 @@ def test_write_file_skips_syntax_check_for_non_python():
         assert "Wrote" in result and "syntax" not in result.lower()
 
 
-def test_workspace_tools_build_exposes_five_tools():
+def test_replace_in_file_exact_match():
+    with tempfile.TemporaryDirectory() as root:
+        tools = WorkspaceTools(root)
+        tools.write_file("m.py", "x = 1\ny = 2\n")
+        result = tools.replace_in_file("m.py", "y = 2", "y = 3")
+        assert "replaced" in result
+        assert tools.read_file("m.py") == "x = 1\ny = 3\n"
+
+
+def test_replace_in_file_tolerates_indentation_difference():
+    with tempfile.TemporaryDirectory() as root:
+        tools = WorkspaceTools(root)
+        tools.write_file("m.py", "def f():\n        return 1\n")  # 8-space body
+        # the model supplies 4-space indent: exact match fails, line-trim succeeds
+        result = tools.replace_in_file(
+            "m.py", "def f():\n    return 1", "def f():\n    return 2"
+        )
+        assert "replaced" in result
+        assert "return 2" in tools.read_file("m.py")
+
+
+def test_replace_in_file_reports_not_found():
+    with tempfile.TemporaryDirectory() as root:
+        tools = WorkspaceTools(root)
+        tools.write_file("m.py", "a = 1\n")
+        assert "not found" in tools.replace_in_file("m.py", "nonexistent", "x")
+
+
+def test_replace_in_file_refuses_ambiguous_match():
+    with tempfile.TemporaryDirectory() as root:
+        tools = WorkspaceTools(root)
+        tools.write_file("m.py", "x = 1\nx = 1\n")
+        result = tools.replace_in_file("m.py", "x = 1", "x = 2")
+        assert "2 places" in result
+        # nothing changed when the target is ambiguous
+        assert tools.read_file("m.py") == "x = 1\nx = 1\n"
+
+
+def test_workspace_tools_build_exposes_the_edit_tool_set():
     with tempfile.TemporaryDirectory() as root:
         tools = WorkspaceTools(root).build()
         assert set(tools) == {
-            "read_file", "write_file", "append_file", "list_files", "run_command",
+            "read_file", "write_file", "append_file", "replace_in_file",
+            "list_files", "run_command",
         }
 
 
@@ -61,6 +100,7 @@ def test_workspace_read_tools_are_concurrency_safe():
         assert tools["list_files"].concurrency_safe is True
         assert tools["write_file"].concurrency_safe is False
         assert tools["append_file"].concurrency_safe is False
+        assert tools["replace_in_file"].concurrency_safe is False
         assert tools["run_command"].concurrency_safe is False
 
 
@@ -118,7 +158,8 @@ def test_run_agent_api_provider_uses_workspace_tools():
     _args, kwargs = provider.ask_with_tools.call_args
     tools_arg = _args[1] if len(_args) > 1 else kwargs.get("tools")
     assert set(tools_arg) == {
-        "read_file", "write_file", "append_file", "list_files", "run_command",
+        "read_file", "write_file", "append_file", "replace_in_file",
+        "list_files", "run_command",
     }
 
 

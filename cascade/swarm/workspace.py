@@ -53,6 +53,42 @@ def _post_edit_check(path: Path) -> str:
         return ""
 
 
+def _replace_in_text(content: str, old: str, new: str) -> "tuple[Optional[str], str]":
+    """Replace *old* with *new* in *content* via a ladder of match strategies.
+
+    Returns ``(new_content, note)``; ``new_content`` is None when *old* cannot be
+    located uniquely. Cheap models rarely reproduce whitespace/indentation exactly,
+    so an exact-match-only edit tool wastes /solve iterations -- this first tries an
+    exact unique match, then falls back to a per-line whitespace-tolerant match.
+    """
+    if not old:
+        return None, "old_string is empty"
+
+    exact = content.count(old)
+    if exact == 1:
+        return content.replace(old, new, 1), "replaced (exact match)"
+    if exact > 1:
+        return None, f"old_string matches {exact} places -- add surrounding context to disambiguate"
+
+    # Whitespace-tolerant: compare lines with leading/trailing whitespace stripped,
+    # so the model need not reproduce indentation exactly.
+    target = [ln.strip() for ln in old.split("\n")]
+    lines = content.split("\n")
+    stripped = [ln.strip() for ln in lines]
+    span = len(target)
+    hits = [
+        i for i in range(len(stripped) - span + 1)
+        if stripped[i:i + span] == target
+    ]
+    if len(hits) == 1:
+        i = hits[0]
+        merged = lines[:i] + new.split("\n") + lines[i + span:]
+        return "\n".join(merged), "replaced (whitespace-tolerant match)"
+    if len(hits) > 1:
+        return None, f"old_string matches {len(hits)} places (whitespace-tolerant) -- add more context"
+    return None, "old_string not found in the file"
+
+
 class WorkspaceTools:
     """Restricted file tools rooted at a single worktree path."""
 
@@ -68,6 +104,10 @@ class WorkspaceTools:
             ),
             "write_file": callable_to_tool_def("write_file", self.write_file, description=description),
             "append_file": callable_to_tool_def("append_file", self.append_file, description=description),
+            "replace_in_file": callable_to_tool_def(
+                "replace_in_file", self.replace_in_file,
+                description="Replace a snippet in a file (whitespace-tolerant) -- a surgical edit that avoids rewriting the whole file",
+            ),
             "list_files": callable_to_tool_def(
                 "list_files", self.list_files, description=description, read_only=True,
             ),
@@ -124,6 +164,30 @@ class WorkspaceTools:
         if issue:
             return f"Appended {path}, but a syntax check failed: {issue}. Fix it."
         return f"Appended {path}"
+
+    def replace_in_file(self, path: str, old_string: str, new_string: str) -> str:
+        """Replace old_string with new_string in a file -- a surgical edit that
+        avoids rewriting the whole file. Whitespace-tolerant per line, so exact
+        indentation need not be reproduced; old_string must match exactly one place
+        (add surrounding context to disambiguate). Cheaper and less error-prone than
+        rewriting a large file with write_file.
+        """
+        try:
+            target = self._resolve(path)
+            content = target.read_text()
+        except Exception as exc:
+            return f"Error reading {path}: {exc}"
+        updated, note = _replace_in_text(content, old_string, new_string)
+        if updated is None:
+            return f"No change to {path}: {note}"
+        try:
+            target.write_text(updated)
+        except Exception as exc:
+            return f"Error writing {path}: {exc}"
+        issue = _post_edit_check(target)
+        if issue:
+            return f"{note} in {path}, but a syntax check failed: {issue}. Fix it."
+        return f"{note} in {path}"
 
     def list_files(self, path: str = ".") -> list[str]:
         """List immediate children under a worktree path."""
