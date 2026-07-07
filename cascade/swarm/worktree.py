@@ -86,6 +86,36 @@ class WorktreeManager:
             diff_excerpt=self._clip_text(diff_text.strip()),
         )
 
+    def diff_patch(self, worktree_path: str) -> str:
+        """Full (unclipped) binary diff of a worktree vs its baseline.
+
+        Unlike ``capture_snapshot``'s clipped excerpt, this is a re-appliable patch
+        -- the fan-out integrator collects one per subtask worktree and replays the
+        passing ones onto a fresh integration worktree.
+        """
+        baseline_ref = self._baseline_refs.get(worktree_path, "HEAD")
+        self._git(["add", "-N", "."], cwd=worktree_path, check=False)
+        return self._git(["diff", "--binary", baseline_ref], cwd=worktree_path, check=False)
+
+    def apply_patch(self, worktree_path: str, patch: str) -> bool:
+        """Apply *patch* into a worktree. Returns True on success, False on conflict.
+
+        Used to merge one subtask's verified diff into the integration worktree;
+        a clean False (rather than a raise) lets the integrator skip a conflicting
+        subtask and report it instead of aborting the whole fan-out.
+        """
+        if not patch.strip():
+            return True
+        try:
+            self._git(
+                ["apply", "--whitespace=nowarn", "-"],
+                cwd=worktree_path,
+                input_text=patch,
+            )
+            return True
+        except Exception:
+            return False
+
     def cleanup(self, keep_provider: str = "") -> None:
         """Remove temporary worktrees, optionally keeping the winner's workspace."""
         for provider, prepared in list(self._prepared.items()):

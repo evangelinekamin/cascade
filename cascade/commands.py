@@ -60,6 +60,7 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("swarm", "/swarm <task>", "Multi-model swarm dispatch"),
     CommandDef("solve", "/solve <task>", "Code a task in an isolated worktree, verified by tests"),
     CommandDef("pipeline", "/pipeline <objective>", "Decompose a build into ordered steps, each verified by tests"),
+    CommandDef("fanout", "/fanout <objective>", "Split into independent subtasks, build each verified in its own worktree, then merge"),
     CommandDef("log", "/log", "Scroll the last /solve's full activity + verified diff"),
     CommandDef(
         "compete",
@@ -147,6 +148,7 @@ class CommandHandler:
             "swarm": self._cmd_swarm,
             "solve": self._cmd_solve,
             "pipeline": self._cmd_pipeline,
+            "fanout": self._cmd_fanout,
             "log": self._cmd_log,
             "compete": self._cmd_compete,
             "compete-code": self._cmd_compete_code,
@@ -1779,6 +1781,77 @@ class CommandHandler:
                 _call_ui(self._clear_progress_indicator, progress)
                 _call_ui(self._post_system, f"Pipeline error: {e}")
                 _call_ui(self._record_history_message, "system", f"Pipeline error: {e}")
+
+        screen = self.app.screen
+        screen.run_worker(_worker, thread=True, exclusive=False)
+
+    def _cmd_fanout(self, args: list[str]) -> None:
+        """Decompose into independent subtasks, build each verified, merge the result."""
+        if not args:
+            self._post_system("Usage: /fanout <objective>")
+            return
+
+        objective = " ".join(args)
+        cli_app = getattr(self.app, "cli_app", None)
+        if cli_app is None:
+            self._post_system("Fanout requires CLI app.")
+            return
+
+        provider = getattr(getattr(self.app, "state", None), "active_provider", None)
+
+        self._post_system(f"Fanout: {objective}")
+        self._record_command_line(f"/fanout {objective}", title=f"[Fanout] {objective}")
+        progress = self._mount_progress_indicator(f"fanout: {objective[:60]}")
+
+        def _call_ui(fn, *call_args) -> None:
+            caller = getattr(self.app, "call_from_thread", None)
+            if callable(caller):
+                caller(fn, *call_args)
+            else:
+                fn(*call_args)
+
+        def _on_progress(stage: str, detail: str) -> None:
+            label = f"{stage}: {detail}"[:100]
+            if progress is None:
+                _call_ui(self._post_system, f"[{stage}] {detail}")
+            else:
+                _call_ui(self._set_progress_indicator_label, progress, label)
+
+        def _worker() -> None:
+            try:
+                from .swarm.fanout import run_fanout
+
+                result = run_fanout(
+                    cli_app, objective, provider_name=provider, on_progress=_on_progress
+                )
+
+                merged = sum(1 for s in result.subs if s.integrated)
+                outcome = "PASSED" if result.passed else "FAILED"
+                lines = [
+                    f"Fanout {outcome}: {merged}/{len(result.subs)} "
+                    f"subtasks merged + verified on {result.provider}"
+                ]
+                if result.error:
+                    lines.append(f"Error: {result.error}")
+                for sub in result.subs:
+                    mark = "MERGED" if sub.integrated else ("CONFLICT" if sub.passed else "FAIL")
+                    lines.append(f"  [{sub.id}] {mark}: {sub.description}")
+                if result.diff_stat:
+                    lines.append(result.diff_stat.strip())
+                elif result.changed_files:
+                    lines.append("Files: " + ", ".join(result.changed_files[:8]))
+                if result.worktree_path:
+                    lines.append(f"Review + apply:  git -C {result.worktree_path} diff")
+
+                final = "\n".join(lines)
+                _call_ui(self._clear_progress_indicator, progress)
+                _call_ui(self._post_system, final)
+                _call_ui(self._record_history_message, "system", final)
+                _call_ui(self.app.state.add_message, "system", f"[Fanout] {objective}")
+            except Exception as e:
+                _call_ui(self._clear_progress_indicator, progress)
+                _call_ui(self._post_system, f"Fanout error: {e}")
+                _call_ui(self._record_history_message, "system", f"Fanout error: {e}")
 
         screen = self.app.screen
         screen.run_worker(_worker, thread=True, exclusive=False)
