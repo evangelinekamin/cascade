@@ -73,10 +73,15 @@ class StreamMessage(Widget):
             self._body_column = None
 
     def feed(self, chunk: str) -> None:
-        """Feed a streaming chunk. Handles arbitrary chunk boundaries."""
+        """Feed a streaming chunk. Handles arbitrary chunk boundaries.
+
+        Rendering refreshes once per fed batch, not once per completed line: the
+        caller coalesces chunks on a ~30ms cadence, so a single refresh here keeps
+        the stream smooth instead of forcing a full re-layout on every newline.
+        """
         for ch in chunk:
             self._process_char(ch)
-        if self._state == _StreamState.PROSE and self._line_buf:
+        if self._state == _StreamState.PROSE:
             self._refresh_prose(include_partial=True)
 
     def finish(self) -> None:
@@ -106,8 +111,9 @@ class StreamMessage(Widget):
                     self._state = _StreamState.CODE_BLOCK
                     self._code_buf = ""
                 else:
+                    # Accumulate the completed line; the refresh is coalesced to
+                    # once per fed batch in feed() to avoid per-line layout churn.
                     self._prose_lines.append(line)
-                    self._refresh_prose()
                 self._line_buf = ""
         else:
             # CODE_BLOCK state
