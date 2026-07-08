@@ -108,3 +108,83 @@ def test_run_fanout_missing_provider_errors():
     result = run_fanout(app, "x", provider_name="ghost")
     assert result.passed is False
     assert "not available" in result.error
+
+
+def test_run_fanout_aborts_on_a_red_base(monkeypatch):
+    app = _fanout_app()
+    monkeypatch.setattr(
+        fanout_mod, "plan_subtasks", lambda *a, **k: [FanoutTask("sub_1", "x", "p1", ())]
+    )
+    _patch_manager(monkeypatch)
+    ran: list[int] = []
+    monkeypatch.setattr(
+        fanout_mod, "run_verified_task",
+        lambda *a, **k: (ran.append(1), (SimpleNamespace(passed=True), ["b"], ["p"]))[1],
+    )
+    # the base test suite fails -> the fan-out must bail before running any subtask
+    monkeypatch.setattr(fanout_mod, "_run_tests_in", lambda c, w, t: ("2 failed", 1))
+
+    result = run_fanout(app, "x")
+
+    assert result.passed is False
+    assert "not green" in result.error
+    assert ran == []
+
+
+# --- WorktreeManager merge primitives ------------------------------------------
+
+
+def test_patched_paths_extracts_diff_targets():
+    from cascade.swarm.worktree import WorktreeManager
+
+    patch = (
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1,2 @@\n a\n+b\n"
+        "diff --git a/y.py b/y.py\n--- a/y.py\n+++ b/y.py\n@@ -1 +1,2 @@\n c\n+d\n"
+    )
+    assert WorktreeManager._patched_paths(patch) == ("x.py", "y.py")
+
+
+def test_has_conflict_markers_detects_only_marked_files(tmp_path):
+    from cascade.swarm.worktree import WorktreeManager
+
+    (tmp_path / "clean.py").write_text("x = 1\n")
+    (tmp_path / "bad.py").write_text("<<<<<<< ours\nx\n=======\ny\n>>>>>>> theirs\n")
+    assert WorktreeManager._has_conflict_markers(tmp_path, ("clean.py",)) is False
+    assert WorktreeManager._has_conflict_markers(tmp_path, ("bad.py",)) is True
+
+
+def test_apply_patch_3way_lands_nonoverlapping_shared_edits(tmp_path, monkeypatch):
+    import subprocess
+    from pathlib import Path
+    from cascade.swarm.worktree import WorktreeManager
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*a):
+        subprocess.run(["git", *a], cwd=repo, check=True, capture_output=True, text=True)
+
+    git("init")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (repo / "mod.py").write_text("A\nB\nC\n")
+    git("add", "-A")
+    git("commit", "-m", "base")
+
+    monkeypatch.setenv("CASCADE_WORKTREE_ROOT", str(tmp_path / "wts"))
+    mgr = WorktreeManager(cwd=str(repo))
+    try:
+        # two subtasks edit the same file in non-overlapping regions
+        w1 = mgr.prepare("sub_1").path
+        (Path(w1) / "mod.py").write_text("A\nA2\nB\nC\n")  # insert near the top
+        w2 = mgr.prepare("sub_2").path
+        (Path(w2) / "mod.py").write_text("A\nB\nC\nC2\n")  # append at the bottom
+
+        integ = mgr.prepare("_integration").path
+        assert mgr.apply_patch(integ, mgr.diff_patch(w1)) is True   # plain apply
+        assert mgr.apply_patch(integ, mgr.diff_patch(w2)) is True   # 3-way merges
+
+        merged = (Path(integ) / "mod.py").read_text()
+        assert "A2" in merged and "C2" in merged  # both edits landed
+    finally:
+        mgr.cleanup()

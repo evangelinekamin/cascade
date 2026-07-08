@@ -100,21 +100,86 @@ class WorktreeManager:
     def apply_patch(self, worktree_path: str, patch: str) -> bool:
         """Apply *patch* into a worktree. Returns True on success, False on conflict.
 
-        Used to merge one subtask's verified diff into the integration worktree;
-        a clean False (rather than a raise) lets the integrator skip a conflicting
-        subtask and report it instead of aborting the whole fan-out.
+        Tries a plain apply first (clean, no side effects on conflict), then falls
+        back to a 3-way merge -- which lands non-overlapping edits to an already-
+        touched file (e.g. two subtasks each appending a different export to the
+        same __init__.py, which a plain apply rejects because the context shifted).
+        On a genuine overlapping conflict the touched files are restored to their
+        pre-apply state so no conflict markers leak into the integration, and the
+        subtask is reported as a conflict rather than aborting the whole fan-out.
         """
         if not patch.strip():
             return True
+
+        # Plain apply first -- clean and atomic; on any conflict it changes nothing.
+        # Stage the result so the index tracks accumulated merges: git apply --3way
+        # refuses ("does not match index") if the working tree has drifted from the
+        # index, which happens after a prior working-tree-only apply.
         try:
             self._git(
                 ["apply", "--whitespace=nowarn", "-"],
                 cwd=worktree_path,
                 input_text=patch,
             )
+            self._git(["add", "-A"], cwd=worktree_path, check=False)
             return True
         except Exception:
-            return False
+            pass
+
+        # 3-way merge -- lands non-overlapping edits to an already-touched file
+        # (two subtasks each appending a different export to the same __init__.py).
+        # Snapshot the touched files so a genuine overlapping conflict rolls back
+        # cleanly instead of leaving markers in the integration.
+        root = Path(worktree_path)
+        affected = self._patched_paths(patch)
+        saved = {rel: self._read_if_exists(root / rel) for rel in affected}
+        try:
+            self._git(
+                ["apply", "--3way", "--whitespace=nowarn", "-"],
+                cwd=worktree_path,
+                input_text=patch,
+            )
+            if not self._has_conflict_markers(root, affected):
+                self._git(["add", "-A"], cwd=worktree_path, check=False)
+                return True
+        except Exception:
+            pass
+
+        # Overlapping conflict (or hard failure): undo just the files this patch
+        # touched and resync the index, leaving prior merges intact.
+        for rel, content in saved.items():
+            target = root / rel
+            if content is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.write_text(content)
+        self._git(["add", "-A"], cwd=worktree_path, check=False)
+        return False
+
+    @staticmethod
+    def _patched_paths(patch: str) -> tuple[str, ...]:
+        """Repo-relative paths a unified diff writes to (its ``+++ b/`` targets)."""
+        paths = [
+            line[len("+++ b/"):].strip()
+            for line in patch.splitlines()
+            if line.startswith("+++ b/")
+        ]
+        return tuple(dict.fromkeys(paths))
+
+    @staticmethod
+    def _read_if_exists(path: Path) -> "str | None":
+        try:
+            return path.read_text()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _has_conflict_markers(root: Path, paths: tuple[str, ...]) -> bool:
+        for rel in paths:
+            content = WorktreeManager._read_if_exists(root / rel)
+            if content and "<<<<<<<" in content:
+                return True
+        return False
 
     def cleanup(self, keep_provider: str = "") -> None:
         """Remove temporary worktrees, optionally keeping the winner's workspace."""

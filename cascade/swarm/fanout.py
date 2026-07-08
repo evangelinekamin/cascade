@@ -181,6 +181,28 @@ def run_fanout(
     manager = WorktreeManager()
 
     try:
+        # Preflight: a fan-out only makes sense on a green base. A red base forces
+        # every subtask to also fix the same pre-existing failures, and those fixes
+        # then collide on merge -- so check once up front and bail with a clear
+        # message rather than producing a confusing pile of conflicts.
+        base = manager.prepare("_base")
+        if on_progress:
+            on_progress("preflight", f"checking the base is green: {test_cmd}")
+        _base_output, base_rc = _run_tests_in(test_cmd, base.path, timeout)
+        if base_rc != 0:
+            return FanoutResult(
+                objective=objective,
+                provider=provider_name,
+                worktree_path="",
+                subs=(),
+                passed=False,
+                error=(
+                    "base test suite is not green -- fix it before fanning out "
+                    "(a red base makes every subtask fix the same failures and "
+                    "collide on merge)"
+                ),
+            )
+
         # 1. Build each independent subtask verified, in its own worktree.
         ran = []
         for task in tasks:
