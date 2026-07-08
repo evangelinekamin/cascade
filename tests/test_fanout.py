@@ -110,6 +110,73 @@ def test_run_fanout_missing_provider_errors():
     assert "not available" in result.error
 
 
+def test_run_fanout_decomposes_on_the_escalation_frontier(monkeypatch):
+    """Frontier directs bulk: the director is the escalation model (Opus), not the
+    cheap primary."""
+    app = _fanout_app()
+    claude = MagicMock()
+    claude.config = SimpleNamespace(model="claude-opus-4-8")
+    app.providers = {
+        "openrouter": MagicMock(config=SimpleNamespace(model="deepseek")),
+        "claude": claude,
+    }
+    app.config.get_escalation_target.return_value = "claude"
+    app.config.get_model_for.side_effect = lambda name, mode=None, fast=False: (
+        "claude-opus-4-8" if name == "claude" else "deepseek"
+    )
+
+    captured = {}
+
+    def fake_plan(app_, objective, director, director_model, on_progress=None):
+        captured["director"] = director
+        captured["model"] = director_model
+        return [FanoutTask("sub_1", "x", "p1", ())]
+
+    monkeypatch.setattr(fanout_mod, "plan_subtasks", fake_plan)
+    _patch_manager(monkeypatch)
+    monkeypatch.setattr(
+        fanout_mod, "run_verified_task",
+        lambda *a, **k: (SimpleNamespace(passed=True), ["b"], ["p"]),
+    )
+    monkeypatch.setattr(fanout_mod, "_run_tests_in", lambda c, w, t: ("ok", 0))
+
+    run_fanout(app, "x", provider_name="openrouter")
+
+    assert captured["director"] is claude
+    assert captured["model"] == "claude-opus-4-8"
+
+
+def test_clone_provider_gives_an_independent_config():
+    from dataclasses import dataclass
+    from cascade.swarm.fanout import _clone_provider
+
+    @dataclass
+    class _Cfg:
+        model: str
+
+    class _Prov:
+        def __init__(self, config):
+            self.config = config
+
+    original = _Prov(_Cfg(model="m"))
+    clone = _clone_provider(original)
+    assert clone is not original and clone.config is not original.config
+    clone.config.model = "changed"
+    assert original.config.model == "m"  # mutating the clone never touches the original
+
+
+def test_clone_provider_falls_back_for_non_dataclass_config():
+    from cascade.swarm.fanout import _clone_provider
+
+    class _Prov:
+        def __init__(self, config):
+            self.config = config
+
+    original = _Prov(SimpleNamespace(model="m"))  # not a dataclass -> can't replace()
+    assert _clone_provider(original) is original
+    assert _clone_provider(None) is None
+
+
 def test_run_fanout_aborts_on_a_red_base(monkeypatch):
     app = _fanout_app()
     monkeypatch.setattr(

@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Callable, List, Optional
 
 from .solve import _resolve_escalation, _run_tests_in, _test_command, run_verified_task
@@ -30,6 +32,8 @@ from .worktree import WorktreeManager
 ProgressCallback = Optional[Callable[[str, str], None]]
 
 _MAX_SUBTASKS = 6
+# Concurrent subtask builds. Each is a heavy verified /solve loop, so cap it.
+_MAX_PARALLEL = 4
 
 _DIRECTOR_SYSTEM = """\
 You are a software director planning a PARALLEL build. Decompose the objective
@@ -120,29 +124,44 @@ def _parse_subtasks(objective: str, response: str) -> List[FanoutTask]:
 def plan_subtasks(
     app,
     objective: str,
-    provider_name: str,
+    director,
+    director_model: str,
     on_progress: ProgressCallback = None,
 ) -> List[FanoutTask]:
-    """Ask the director (on its frontier model) to split the objective into subtasks."""
-    provider = app.providers.get(provider_name)
-    if provider is None:
+    """Ask the *director* (a frontier model) to split the objective into subtasks."""
+    if director is None:
         return [FanoutTask(id="sub_1", description=objective, prompt=objective)]
     if on_progress:
-        on_progress("planning", f"{provider_name} decomposing into parallel subtasks")
+        on_progress("planning", f"director ({director_model}) decomposing into subtasks")
 
-    original_model = provider.config.model
-    provider.config.model = app.config.get_model_for(provider_name, fast=False)
+    original_model = director.config.model
+    director.config.model = director_model
     try:
-        response = provider.ask_single(
+        response = director.ask_single(
             f"Decompose this objective into independent parallel subtasks:\n\n{objective}",
             system=_DIRECTOR_SYSTEM,
         )
     except Exception:
         return [FanoutTask(id="sub_1", description=objective, prompt=objective)]
     finally:
-        provider.config.model = original_model
+        director.config.model = original_model
 
     return _parse_subtasks(objective, response)
+
+
+def _clone_provider(provider):
+    """A fresh provider instance with a COPIED config, safe to mutate in one thread.
+
+    Subtasks build in parallel and run_verified_task swaps ``config.model`` in place,
+    so they must not share a provider -- or even a config object. Best-effort: if the
+    config is not a dataclass (e.g. a test double), fall back to the original.
+    """
+    if provider is None:
+        return None
+    try:
+        return type(provider)(replace(provider.config))
+    except Exception:
+        return provider
 
 
 def run_fanout(
@@ -171,12 +190,20 @@ def run_fanout(
             error=f"Provider '{provider_name}' not available",
         )
 
-    tasks = plan_subtasks(app, objective, provider_name, on_progress=on_progress)
     frontier_model = app.config.get_model_for(provider_name, fast=False)
     bulk_model = app.config.get_bulk_model(provider_name) if escalate else frontier_model
     escalation_provider, escalation_name, escalation_model = _resolve_escalation(
         app, app.config.get_escalation_target(provider_name)
     )
+    # Frontier directs bulk: decompose on the stronger escalation model (e.g. Opus)
+    # when one is configured, else the primary provider's own frontier model.
+    if escalation_provider is not None:
+        director = escalation_provider
+        director_model = escalation_model or escalation_provider.config.model
+    else:
+        director = provider
+        director_model = frontier_model
+    tasks = plan_subtasks(app, objective, director, director_model, on_progress=on_progress)
     test_cmd = _test_command(app)
     manager = WorktreeManager()
 
@@ -203,30 +230,41 @@ def run_fanout(
                 ),
             )
 
-        # 1. Build each independent subtask verified, in its own worktree.
-        ran = []
-        for task in tasks:
+        # 1. Build each independent subtask verified, IN PARALLEL -- each in its own
+        #    pre-prepared worktree on its own provider clone (run_verified_task swaps
+        #    config.model in place, so subtasks must not share a provider or config).
+        #    Worktrees are prepared sequentially up front (the manager is not
+        #    thread-safe); only the heavy build loop runs concurrently.
+        prepared = {task.id: manager.prepare(task.id) for task in tasks}
+
+        def _build(task):
             if on_progress:
                 on_progress("subtask", f"{task.id}: {task.description}")
-            prepared = manager.prepare(task.id)
-            result, models_used, _providers = run_verified_task(
-                provider,
-                prepared.path,
-                task.prompt,
-                test_cmd,
-                bulk_model=bulk_model,
-                frontier_model=frontier_model,
-                max_iterations=max_iterations,
-                escalate=escalate,
-                escalate_after=escalate_after,
-                escalation_provider=escalation_provider,
-                escalation_model=escalation_model,
-                provider_label=provider_name,
-                escalation_label=escalation_name,
-                timeout=timeout,
-                on_progress=on_progress,
-            )
-            ran.append((task, prepared.path, result, tuple(models_used)))
+            try:
+                result, models_used, _providers = run_verified_task(
+                    _clone_provider(provider),
+                    prepared[task.id].path,
+                    task.prompt,
+                    test_cmd,
+                    bulk_model=bulk_model,
+                    frontier_model=frontier_model,
+                    max_iterations=max_iterations,
+                    escalate=escalate,
+                    escalate_after=escalate_after,
+                    escalation_provider=_clone_provider(escalation_provider),
+                    escalation_model=escalation_model,
+                    provider_label=provider_name,
+                    escalation_label=escalation_name,
+                    timeout=timeout,
+                    on_progress=on_progress,
+                )
+                return task, prepared[task.id].path, result, tuple(models_used)
+            except Exception:
+                return task, prepared[task.id].path, SimpleNamespace(passed=False), ()
+
+        # pool.map preserves task order, so the integration below stays deterministic.
+        with ThreadPoolExecutor(max_workers=min(len(tasks), _MAX_PARALLEL)) as pool:
+            ran = list(pool.map(_build, tasks))
 
         # 2. Merge the passing subtasks' diffs onto one integration worktree.
         integration = manager.prepare("_integration")
