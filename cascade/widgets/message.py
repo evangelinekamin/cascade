@@ -223,7 +223,11 @@ class ChatHistory(VerticalScroll):
 
 
 class GutterSeparator(Static):
-    """Thin vertical hairline between gutter and message body."""
+    """Provider-accent left stroke marking each message (a colored ``\u258d``).
+
+    Color-codes every message by whose it is -- the single biggest "why it looks
+    better" move (kimchi) -- replacing the flat dim hairline.
+    """
 
     DEFAULT_CSS = """
     GutterSeparator {
@@ -233,8 +237,14 @@ class GutterSeparator(Static):
     }
     """
 
+    def __init__(self, role: str = "", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._role = role
+
     def render(self) -> Text:
-        return Text("\u2502", style=f"dim {PALETTE.border_subtle}")
+        if self._role in ("you", "system", ""):
+            return Text("\u258d", style=f"dim {PALETTE.border_subtle}")
+        return Text("\u258d", style=get_accent(self._role))
 
 
 class MessageWidget(Widget):
@@ -262,7 +272,7 @@ class MessageWidget(Widget):
 
     def compose(self) -> ComposeResult:
         yield GutterLabel(self._role)
-        yield GutterSeparator()
+        yield GutterSeparator(self._role)
         yield MessageBody(self._content)
 
 

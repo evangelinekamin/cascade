@@ -61,7 +61,7 @@ class StreamMessage(Widget):
 
     def compose(self) -> ComposeResult:
         yield GutterLabel(self._provider)
-        yield GutterSeparator()
+        yield GutterSeparator(self._provider)
         with Vertical(classes="stream-body"):
             self._prose_widget = _ProseBody("")
             yield self._prose_widget
