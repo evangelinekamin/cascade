@@ -11,6 +11,7 @@ from textual.binding import Binding
 
 from .history import BranchingSession, HistoryDB
 from .state import CascadeState, ProviderChanged, ThinkingChanged
+from .swarm.lifecycle import RunLedger
 from .theme import MODES, get_provider_theme
 
 _TITLE_SPINNER_FRAMES = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
@@ -32,6 +33,8 @@ class CascadeTUI(App):
         self.cli_app = cli_app
         self.state = CascadeState()
         self.db = HistoryDB()
+        self.run_ledger = RunLedger(self.db.path)
+        self.recovered_run_count = self.run_ledger.mark_interrupted()
         self._db_session: dict | None = None
         self._branching_session: BranchingSession | None = None
         self._title_timer = None
@@ -104,6 +107,14 @@ class CascadeTUI(App):
             self._title_timer.stop()
             self._title_timer = None
         self._sync_window_title()
+        try:
+            self.run_ledger.close()
+        except Exception:
+            pass
+        try:
+            self.db.close()
+        except Exception:
+            pass
 
     def on_provider_changed(self, event: ProviderChanged) -> None:
         del event

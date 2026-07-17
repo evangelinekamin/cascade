@@ -17,13 +17,25 @@ class OpenRouterProvider(BaseProvider):
 
     _APP_URL = "https://github.com/Evangeline-Development-Company/cascade"
     _APP_TITLE = "Cascade"
-    _RETRYABLE_FALLBACK_STATUS_CODES = frozenset((502, 503))
+    _RETRYABLE_FALLBACK_STATUS_CODES = frozenset((429, 502, 503))
     _DEFAULT_FALLBACK_MODEL = "minimax/minimax-m2.5"
 
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
         self.base_url = config.base_url or "https://openrouter.ai/api/v1"
         self.client = httpx.Client(timeout=60.0)
+        self._last_generation_id: Optional[str] = None
+        self._last_cost: Optional[float] = None
+
+    @property
+    def last_generation_id(self) -> Optional[str]:
+        """OpenRouter generation id for correlation and provider debugging."""
+        return self._last_generation_id
+
+    @property
+    def last_cost(self) -> Optional[float]:
+        """Reported request cost when OpenRouter includes it in usage."""
+        return self._last_cost
 
     def _headers(self) -> dict:
         return {
@@ -73,9 +85,17 @@ class OpenRouterProvider(BaseProvider):
         if self.config.provider_preferences:
             payload["provider"] = self.config.provider_preferences
 
-        with self.client.stream("POST", url, json=payload, headers=self._headers()) as response:
+        with self.client.stream(
+            "POST", url, json=payload, headers=self._headers()
+        ) as response, self.cancellation_callback(
+            getattr(response, "close", lambda: None)
+        ):
             response.raise_for_status()
+            self._last_generation_id = getattr(response, "headers", {}).get(
+                "X-Generation-Id"
+            )
             for line in response.iter_lines():
+                self.raise_if_cancelled()
                 if not line.startswith("data: "):
                     continue
                 data_str = line[6:]
@@ -86,12 +106,30 @@ class OpenRouterProvider(BaseProvider):
                 except json.JSONDecodeError:
                     continue
 
+                error = data.get("error")
+                if error:
+                    metadata = error.get("metadata", {}) if isinstance(error, dict) else {}
+                    error_type = metadata.get("error_type") if isinstance(metadata, dict) else None
+                    message = (
+                        error.get("message", "OpenRouter stream failed")
+                        if isinstance(error, dict)
+                        else str(error)
+                    )
+                    suffix = f" ({error_type})" if error_type else ""
+                    # A mid-stream failure cannot be retried safely: partial output
+                    # may already have been shown. Raise so it is never recorded as
+                    # a successful, merely-short completion.
+                    raise RuntimeError(f"OpenRouter stream error{suffix}: {message}")
+
                 usage = data.get("usage")
                 if usage:
                     self._last_usage = (
                         usage.get("prompt_tokens", 0),
                         usage.get("completion_tokens", 0),
                     )
+                    cost = usage.get("cost")
+                    if isinstance(cost, (int, float)):
+                        self._last_cost = float(cost)
                 choices = data.get("choices", [])
                 if choices:
                     delta = choices[0].get("delta", {})
@@ -110,6 +148,8 @@ class OpenRouterProvider(BaseProvider):
     def stream(self, messages: list[Message], system: Optional[str] = None) -> Iterator[str]:
         """Stream tokens from OpenRouter."""
         self._last_usage = None
+        self._last_generation_id = None
+        self._last_cost = None
         try:
             yield from self._stream_with_model(self.config.model, messages, system)
         except httpx.HTTPStatusError as exc:
@@ -126,6 +166,86 @@ class OpenRouterProvider(BaseProvider):
         except httpx.RequestError as exc:
             raise RuntimeError(str(exc)) from exc
 
+    def ask_structured(
+        self,
+        prompt: str,
+        schema: dict,
+        *,
+        system: Optional[str] = None,
+        schema_name: str = "cascade_response",
+    ) -> dict:
+        """Return a strict JSON-schema response using OpenRouter's native field.
+
+        This is intentionally non-streaming: it is used for small control-plane
+        decisions where a single validated object is more useful than incremental
+        text. Provider preferences (including ``require_parameters``) are preserved.
+        """
+        url = f"{self.base_url}/chat/completions"
+        payload = {
+            "model": self.config.model,
+            "messages": self._build_api_messages(
+                [{"role": "user", "content": prompt}], system
+            ),
+            "stream": False,
+            "temperature": self.config.temperature,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": schema,
+                },
+            },
+        }
+        if self.config.max_tokens:
+            payload["max_tokens"] = self.config.max_tokens
+        if self.config.provider_preferences:
+            payload["provider"] = self.config.provider_preferences
+
+        self._last_usage = None
+        self._last_generation_id = None
+        self._last_cost = None
+        try:
+            response = self.client.post(url, json=payload, headers=self._headers())
+            response.raise_for_status()
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            raise RuntimeError(str(exc)) from exc
+
+        self._last_generation_id = getattr(response, "headers", {}).get(
+            "X-Generation-Id"
+        )
+        data = response.json()
+        if data.get("error"):
+            raise RuntimeError(f"OpenRouter structured response failed: {data['error']}")
+        usage = data.get("usage") or {}
+        if usage:
+            self._last_usage = (
+                usage.get("prompt_tokens", 0),
+                usage.get("completion_tokens", 0),
+            )
+            cost = usage.get("cost")
+            if isinstance(cost, (int, float)):
+                self._last_cost = float(cost)
+
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError("OpenRouter structured response contained no choices")
+        choice = choices[0]
+        if choice.get("finish_reason") == "error" or choice.get("error"):
+            raise RuntimeError(f"OpenRouter structured response failed: {choice.get('error')}")
+        content = (choice.get("message") or {}).get("content")
+        if isinstance(content, dict):
+            return content
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError("OpenRouter structured response contained no JSON content")
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("OpenRouter returned invalid structured JSON") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError("OpenRouter structured response was not an object")
+        return parsed
+
     def ask_with_tools(
         self,
         messages: list[Message],
@@ -136,6 +256,7 @@ class OpenRouterProvider(BaseProvider):
     ) -> tuple[str, list[dict]]:
         """OpenAI-compatible tool calling via OpenRouter."""
         self._last_usage = None
+        self._last_cost = None
         try:
             return openai_ask_with_tools(
                 client=self.client,
@@ -150,8 +271,10 @@ class OpenRouterProvider(BaseProvider):
                 max_rounds=max_rounds,
                 on_tool_event=on_tool_event,
                 on_usage=lambda usage: setattr(self, "_last_usage", usage),
+                on_cost=lambda cost: setattr(self, "_last_cost", cost),
                 context_window=self.config.context_window,
                 provider_preferences=self.config.provider_preferences,
+                check_cancelled=self.raise_if_cancelled,
             )
         except RuntimeError as exc:
             fallback_model = self.get_fallback_model()
@@ -174,8 +297,10 @@ class OpenRouterProvider(BaseProvider):
                     max_rounds=max_rounds,
                     on_tool_event=on_tool_event,
                     on_usage=lambda usage: setattr(self, "_last_usage", usage),
+                    on_cost=lambda cost: setattr(self, "_last_cost", cost),
                     context_window=self.config.context_window,
                     provider_preferences=self.config.provider_preferences,
+                    check_cancelled=self.raise_if_cancelled,
                 )
             raise
 

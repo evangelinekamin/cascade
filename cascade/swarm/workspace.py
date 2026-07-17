@@ -9,12 +9,14 @@ file tools rooted at the worktree.
 
 from __future__ import annotations
 
-import subprocess
 from contextlib import nullcontext
+from fnmatch import fnmatch
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Optional
 
 from ..tools.schema import ToolDef, callable_to_tool_def
+from .lifecycle import CancellationToken, RunCancelled, run_cancellable_shell
 
 
 # Command output is capped to its tail: errors and test summaries live at the
@@ -92,9 +94,19 @@ def _replace_in_text(content: str, old: str, new: str) -> "tuple[Optional[str], 
 class WorkspaceTools:
     """Restricted file tools rooted at a single worktree path."""
 
-    def __init__(self, root: str, command_timeout: float = 120.0):
+    def __init__(
+        self,
+        root: str,
+        command_timeout: float = 120.0,
+        cancel_token: Optional[CancellationToken] = None,
+    ):
         self._root = Path(root).resolve()
         self._command_timeout = command_timeout
+        self._cancel_token = cancel_token
+
+    def _checkpoint(self) -> None:
+        if self._cancel_token is not None:
+            self._cancel_token.checkpoint()
 
     def build(self) -> dict[str, ToolDef]:
         description = "Read, write, append, and list files inside the isolated coding worktree"
@@ -117,6 +129,37 @@ class WorkspaceTools:
             ),
         }
 
+    def build_read_only(self) -> dict[str, ToolDef]:
+        """Return repository-inspection tools with no mutation or shell access.
+
+        This is the capability set used by the cheap reconnaissance lane.  Keeping
+        it separate from :meth:`build` makes the coordinator's promise of
+        "read-only" executable rather than a prompt instruction a model can ignore.
+        """
+        return {
+            "read_file": callable_to_tool_def(
+                "read_file",
+                self.read_file,
+                description="Read a UTF-8 text file inside the repository",
+                read_only=True,
+            ),
+            "list_files": callable_to_tool_def(
+                "list_files",
+                self.list_files,
+                description="List immediate children inside the repository",
+                read_only=True,
+            ),
+            "search_files": callable_to_tool_def(
+                "search_files",
+                self.search_files,
+                description=(
+                    "Search repository text files for a literal string; returns "
+                    "path:line matches without invoking a shell"
+                ),
+                read_only=True,
+            ),
+        }
+
     def _resolve(self, path: str) -> Path:
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():
@@ -128,10 +171,13 @@ class WorkspaceTools:
 
     def read_file(self, path: str) -> str:
         """Read file contents from the worktree."""
+        self._checkpoint()
         try:
-            return self._resolve(path).read_text()
+            content = self._resolve(path).read_text()
         except Exception as exc:
             return f"Error reading file: {exc}"
+        self._checkpoint()
+        return content
 
     def write_file(self, path: str, content: str) -> str:
         """Write file contents inside the worktree, then fast-check the result.
@@ -140,12 +186,14 @@ class WorkspaceTools:
         the message names it so the model fixes the edit on its next turn -- rather
         than the break only surfacing at the (expensive) full-suite gate.
         """
+        self._checkpoint()
         try:
             target = self._resolve(path)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content)
         except Exception as exc:
             return f"Error writing {path}: {exc}"
+        self._checkpoint()
         issue = _post_edit_check(target)
         if issue:
             return f"Wrote {path}, but a syntax check failed: {issue}. Fix it."
@@ -153,6 +201,7 @@ class WorkspaceTools:
 
     def append_file(self, path: str, content: str) -> str:
         """Append file contents inside the worktree, then fast-check the result."""
+        self._checkpoint()
         try:
             target = self._resolve(path)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -160,6 +209,7 @@ class WorkspaceTools:
                 handle.write(content)
         except Exception as exc:
             return f"Error appending {path}: {exc}"
+        self._checkpoint()
         issue = _post_edit_check(target)
         if issue:
             return f"Appended {path}, but a syntax check failed: {issue}. Fix it."
@@ -172,6 +222,7 @@ class WorkspaceTools:
         (add surrounding context to disambiguate). Cheaper and less error-prone than
         rewriting a large file with write_file.
         """
+        self._checkpoint()
         try:
             target = self._resolve(path)
             content = target.read_text()
@@ -184,6 +235,7 @@ class WorkspaceTools:
             target.write_text(updated)
         except Exception as exc:
             return f"Error writing {path}: {exc}"
+        self._checkpoint()
         issue = _post_edit_check(target)
         if issue:
             return f"{note} in {path}, but a syntax check failed: {issue}. Fix it."
@@ -191,11 +243,83 @@ class WorkspaceTools:
 
     def list_files(self, path: str = ".") -> list[str]:
         """List immediate children under a worktree path."""
+        self._checkpoint()
         try:
             target = self._resolve(path)
-            return sorted(str(item) for item in target.iterdir())
+            result = sorted(str(item) for item in target.iterdir())
         except Exception as exc:
             return [f"Error: {exc}"]
+        self._checkpoint()
+        return result
+
+    def search_files(
+        self,
+        query: str,
+        path: str = ".",
+        file_glob: str = "*",
+        max_results: int = 100,
+    ) -> list[str]:
+        """Search text files under *path* for a case-insensitive literal string.
+
+        The implementation deliberately avoids a shell and regular expressions:
+        inputs come from a model, and reconnaissance should have no command
+        execution side door. Results and file sizes are bounded to protect the
+        model context from generated/vendor trees and accidental huge files.
+        """
+        self._checkpoint()
+        if not query:
+            return ["Error: query is empty"]
+        glob_path = PurePosixPath(file_glob.replace("\\", "/"))
+        if glob_path.is_absolute() or ".." in glob_path.parts:
+            return [f"Error: unsafe file_glob: {file_glob}"]
+        try:
+            target = self._resolve(path)
+            limit = max(1, min(int(max_results), 200))
+        except Exception as exc:
+            return [f"Error: {exc}"]
+
+        needle = query.casefold()
+        matches: list[str] = []
+        try:
+            candidates = target.rglob("*")
+            for candidate in candidates:
+                self._checkpoint()
+                if len(matches) >= limit:
+                    break
+                if not candidate.is_file():
+                    continue
+                try:
+                    resolved = candidate.resolve()
+                    if resolved != self._root and self._root not in resolved.parents:
+                        continue
+                    relative = resolved.relative_to(self._root)
+                    relative_text = relative.as_posix()
+                    if ".git" in relative.parts:
+                        continue
+                    if not (
+                        fnmatch(relative_text, file_glob)
+                        or fnmatch(relative.name, file_glob)
+                    ):
+                        continue
+                    if resolved.stat().st_size > 1_000_000:
+                        continue
+                    lines = resolved.read_text(errors="replace").splitlines()
+                except (OSError, UnicodeError, ValueError):
+                    continue
+                for line_number, line in enumerate(lines, start=1):
+                    if needle in line.casefold():
+                        excerpt = line.strip()
+                        if len(excerpt) > 240:
+                            excerpt = excerpt[:237] + "..."
+                        matches.append(f"{relative_text}:{line_number}: {excerpt}")
+                        if len(matches) >= limit:
+                            break
+        except RunCancelled:
+            raise
+        except Exception as exc:
+            return [f"Error: {exc}"]
+        self._checkpoint()
+        return matches or ["No matches"]
 
     def run_command(self, command: str) -> str:
         """Run a shell command in the workspace root and return its output.
@@ -214,22 +338,19 @@ class WorkspaceTools:
         # -- the same trust model as the CLI-proxy providers, which already drive
         # full bash. v1 deliberately does no further sandboxing.
         try:
-            completed = subprocess.run(
+            combined, returncode, timed_out = run_cancellable_shell(
                 command,
-                shell=True,
-                cwd=self._root,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=self._command_timeout,
+                str(self._root),
+                self._command_timeout,
+                self._cancel_token,
             )
-        except subprocess.TimeoutExpired:
-            return f"Command timed out after {self._command_timeout:g}s"
+        except RunCancelled:
+            raise
         except Exception as exc:
             return f"Error running command: {exc}"
-
-        combined = (completed.stdout or "") + (completed.stderr or "")
-        return f"Exit code: {completed.returncode}\n{_truncate_tail(combined)}"
+        if timed_out:
+            return f"Command timed out after {self._command_timeout:g}s"
+        return f"Exit code: {returncode}\n{_truncate_tail(combined)}"
 
 
 def run_agent_in_worktree(
@@ -239,6 +360,7 @@ def run_agent_in_worktree(
     system: Optional[str] = None,
     max_rounds: int = 15,
     on_tool_event=None,
+    cancel_token: Optional[CancellationToken] = None,
 ) -> str:
     """Run *provider* as a tool-using agent rooted at *worktree_path*.
 
@@ -250,14 +372,27 @@ def run_agent_in_worktree(
     """
     workdir = getattr(provider, "working_directory", None)
     ctx = provider.working_directory(worktree_path) if callable(workdir) else nullcontext()
-    with ctx:
+    cancellation_scope = getattr(provider, "cancellation_scope", None)
+    cancel_ctx = (
+        cancellation_scope(cancel_token)
+        if callable(cancellation_scope) and cancel_token is not None
+        else nullcontext()
+    )
+    with ctx, cancel_ctx:
+        if cancel_token is not None:
+            cancel_token.checkpoint()
         if getattr(provider, "_use_cli_proxy", False):
-            return provider.ask_single(prompt, system=system)
+            response = provider.ask_single(prompt, system=system)
+            if cancel_token is not None:
+                cancel_token.checkpoint()
+            return response
         response, _tool_log = provider.ask_with_tools(
             [{"role": "user", "content": prompt}],
-            WorkspaceTools(worktree_path).build(),
+            WorkspaceTools(worktree_path, cancel_token=cancel_token).build(),
             system=system,
             max_rounds=max_rounds,
             on_tool_event=on_tool_event,
         )
+        if cancel_token is not None:
+            cancel_token.checkpoint()
         return response

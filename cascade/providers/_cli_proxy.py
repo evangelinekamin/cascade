@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
@@ -344,11 +345,25 @@ def _terminate_with_timeout(
     grace_seconds: float = 5.0,
 ) -> None:
     """Send SIGTERM, wait *grace_seconds*, then SIGKILL if still alive."""
-    proc.terminate()
+    if proc.returncode is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        else:
+            proc.terminate()
+    except (ProcessLookupError, AttributeError):
+        return
     try:
         proc.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        if os.name == "posix":
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                return
+        else:
+            proc.kill()
         proc.wait()
 
 
@@ -417,6 +432,7 @@ def stream_cli_proxy(
     config: CLIProxyConfig,
     handler: CLIEventHandler,
     emit_activity: bool = True,
+    cancel_token=None,
 ) -> Iterator[str]:
     """Spawn a CLI subprocess and stream parsed output.
 
@@ -440,6 +456,7 @@ def stream_cli_proxy(
             bufsize=1,
             env=env,
             cwd=cwd,
+            start_new_session=(os.name == "posix"),
         )
     except Exception as exc:
         raise RuntimeError(str(exc)) from exc
@@ -447,28 +464,45 @@ def stream_cli_proxy(
     if emit_activity:
         yield f"{ACTIVITY_PREFIX}starting {config.cli_name} cli in {cwd}"
 
-    assert proc.stdout is not None
-    for raw_line in proc.stdout:
-        line = raw_line.strip()
-        if not line:
-            continue
+    remove_cancel_callback = None
+    if cancel_token is not None:
+        remove_cancel_callback = cancel_token.add_cancel_callback(
+            lambda: _terminate_with_timeout(proc, grace_seconds=1.0)
+        )
 
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            activity = handler.on_non_json_line(line)
-            if activity is not None and emit_activity:
-                yield f"{ACTIVITY_PREFIX}{activity}"
-            continue
+    try:
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            if cancel_token is not None:
+                cancel_token.checkpoint()
+            line = raw_line.strip()
+            if not line:
+                continue
 
-        for kind, value in handler.on_json_event(event):
-            if kind == "text":
-                handler.saw_text = True
-                yield value
-            elif kind == "activity" and emit_activity:
-                yield f"{ACTIVITY_PREFIX}{value}"
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                activity = handler.on_non_json_line(line)
+                if activity is not None and emit_activity:
+                    yield f"{ACTIVITY_PREFIX}{activity}"
+                continue
 
-    proc.wait()
+            for kind, value in handler.on_json_event(event):
+                if kind == "text":
+                    handler.saw_text = True
+                    yield value
+                elif kind == "activity" and emit_activity:
+                    yield f"{ACTIVITY_PREFIX}{value}"
+
+        proc.wait()
+        if cancel_token is not None:
+            cancel_token.checkpoint()
+    finally:
+        if remove_cancel_callback is not None:
+            remove_cancel_callback()
+        # Closing a provider generator early must not orphan its native CLI.
+        if proc.returncode is None:
+            _terminate_with_timeout(proc, grace_seconds=1.0)
 
     if proc.returncode != 0 and not handler.saw_text:
         msg = _select_error_message(

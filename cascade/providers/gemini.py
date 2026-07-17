@@ -97,7 +97,13 @@ class GeminiProvider(BaseProvider):
             cmd_args=cmd,
             cwd=workdir,
         )
-        yield from stream_cli_proxy(cfg, handler, self._emit_activity)
+        cancel_token = self.cancellation_token()
+        if cancel_token is None:
+            yield from stream_cli_proxy(cfg, handler, self._emit_activity)
+        else:
+            yield from stream_cli_proxy(
+                cfg, handler, self._emit_activity, cancel_token,
+            )
         if handler.last_usage:
             self._last_usage = handler.last_usage
 
@@ -133,9 +139,14 @@ class GeminiProvider(BaseProvider):
                 ],
             }
 
-            with self.client.stream("POST", url, json=payload, params=params, headers=headers) as response:
+            with self.client.stream(
+                "POST", url, json=payload, params=params, headers=headers
+            ) as response, self.cancellation_callback(
+                getattr(response, "close", lambda: None)
+            ):
                 response.raise_for_status()
                 for line in response.iter_lines():
+                    self.raise_if_cancelled()
                     if line.strip():
                         try:
                             data = json.loads(line)
@@ -188,6 +199,7 @@ class GeminiProvider(BaseProvider):
 
         text_parts = []
         for round_num in range(max_rounds):
+            self.raise_if_cancelled()
             url = f"{self.base_url}/{self.config.model}:generateContent"
             payload = {
                 "contents": contents,
@@ -204,6 +216,7 @@ class GeminiProvider(BaseProvider):
                 data = response.json()
             except Exception as e:
                 return f"Error: {e}", tool_log
+            self.raise_if_cancelled()
 
             # Parse response parts
             candidates = data.get("candidates", [])
@@ -229,6 +242,7 @@ class GeminiProvider(BaseProvider):
             # Execute each function call
             response_parts = []
             for fc in function_calls:
+                self.raise_if_cancelled()
                 tool_name = fc["name"]
                 tool_args = fc.get("args", {})
 
@@ -242,6 +256,7 @@ class GeminiProvider(BaseProvider):
                     ))
 
                 result = executor.execute(tool_name, tool_args)
+                self.raise_if_cancelled()
                 tool_log.append({
                     "tool": tool_name,
                     "input": tool_args,

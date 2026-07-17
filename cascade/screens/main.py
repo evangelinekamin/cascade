@@ -6,6 +6,7 @@ Bridges to synchronous provider.stream() via run_worker(thread=True).
 
 import datetime
 import time
+from contextlib import nullcontext
 from typing import Iterator
 
 from rich.text import Text
@@ -26,6 +27,8 @@ from ..theme import PALETTE, MODE_CYCLE, MODES, get_provider_theme
 from ..commands import CommandHandler
 from ..hooks import HookContext, HookEvent
 from ..keybindings import ChordManager, ChordState
+from ..swarm.lifecycle import RunCancelled, RunContext
+from ..swarm.outcome import RunOutcome
 
 
 def summarize_user_prompt(prompt: str) -> str:
@@ -85,6 +88,7 @@ class MainScreen(Screen):
         self._activity_timer = None
         self._activity_provider = None
         self._last_seen_activity = None
+        self._active_run: RunContext | None = None
         self._chords = self._build_chord_manager()
 
     @staticmethod
@@ -121,12 +125,82 @@ class MainScreen(Screen):
             self.app.notify(text)
 
     def action_kill_workers(self) -> None:
-        """Cancel running background workers (ctrl+x ctrl+k)."""
+        """Cancel the active run and reject all of its later callbacks."""
+        run = self._active_run
+        if run is not None:
+            reason = "cancelled by user"
+            run.cancel(reason)
+            run.finish(RunOutcome.CANCELLED, error=reason)
+            # Clearing this identity is what makes callbacks already queued by the
+            # old worker stale. A subsequent prompt gets a new run id immediately.
+            self._active_run = None
         try:
             self.workers.cancel_all()
         except Exception:
             pass
-        self._post_system_message("Cancelled running background workers.")
+        self._reset_cancelled_ui()
+        if run is None:
+            self._post_system_message("No active run to cancel.")
+        else:
+            self._post_system_message(
+                f"Cancelled run {run.id[:8]}. Provider work will stop at its next checkpoint."
+            )
+
+    def _reset_cancelled_ui(self) -> None:
+        """Return the input/UI to idle without recording an assistant response."""
+        self._stop_activity_poll()
+        if self._thinking:
+            self._thinking.remove()
+            self._thinking = None
+        self.app.state.set_thinking(self._active_provider, False)
+        self._set_input_locked(False)
+        stream = getattr(self, "_stream_msg", None)
+        if stream is not None:
+            try:
+                stream.remove()
+            except Exception:
+                pass
+            self._stream_msg = None
+
+    def _call_for_run(
+        self,
+        run: RunContext,
+        callback,
+        *args,
+        terminal: bool = False,
+    ) -> None:
+        """Schedule a UI callback that is accepted only for the active run id."""
+        self.app.call_from_thread(
+            self._dispatch_for_run,
+            run.id,
+            terminal,
+            callback,
+            args,
+        )
+
+    def _emit_for_run(
+        self,
+        run: RunContext | None,
+        callback,
+        *args,
+        terminal: bool = False,
+    ) -> None:
+        """Use identity-gated dispatch, with a direct path for focused unit calls."""
+        if run is None:
+            self.app.call_from_thread(callback, *args)
+        else:
+            self._call_for_run(run, callback, *args, terminal=terminal)
+
+    def _dispatch_for_run(self, run_id: str, terminal: bool, callback, args: tuple) -> None:
+        """Drop callbacks from cancelled, superseded, or otherwise stale workers."""
+        active = self._active_run
+        if active is None or active.id != run_id or active.cancelled:
+            return
+        try:
+            callback(*args)
+        finally:
+            if terminal and self._active_run is active:
+                self._active_run = None
 
     def action_export_session(self) -> None:
         """Export the current session via the existing /export path (ctrl+x ctrl+e)."""
@@ -174,6 +248,14 @@ class MainScreen(Screen):
             self._summary_turn_interval = int(cfg.get("summary_turn_interval", 6))
             self._summary_provider_pref = str(cfg.get("summary_provider", "auto"))
             self._summary_max_chars = int(cfg.get("summary_max_chars", 1800))
+        recovered = int(getattr(self.app, "recovered_run_count", 0) or 0)
+        if recovered:
+            noun = "run" if recovered == 1 else "runs"
+            self._post_system_message(
+                f"Recovered {recovered} interrupted {noun} from the previous process. "
+                "Any recorded review worktrees were preserved."
+            )
+            self.app.recovered_run_count = 0
 
     # ------------------------------------------------------------------
     # Input handling
@@ -271,9 +353,22 @@ class MainScreen(Screen):
         self._scroll_chat_end(chat, force=True)
 
         provider_name = self._active_provider
+        session = self.app.ensure_session()
+        provider = getattr(self.app, "cli_app", None)
+        provider_obj = provider.providers.get(provider_name) if provider is not None else None
+        model = getattr(getattr(provider_obj, "config", None), "model", "")
+        run = RunContext(
+            objective=prompt,
+            workflow="routing",
+            provider=provider_name,
+            model=str(model or ""),
+            session_id=session["id"],
+            ledger=getattr(self.app, "run_ledger", None),
+        )
+        self._active_run = run
         self._start_activity_poll(self._providers.get(provider_name))
         def _worker() -> None:
-            self._provider_worker(prompt, provider_name)
+            self._provider_worker(prompt, provider_name, run)
 
         self.run_worker(
             _worker,
@@ -312,19 +407,40 @@ class MainScreen(Screen):
             )
         return pipeline.build() or None
 
-    def _provider_worker(self, prompt: str, provider_name: str):
+    def _provider_worker(
+        self,
+        prompt: str,
+        provider_name: str,
+        run: RunContext | None = None,
+    ):
         """Run in a worker thread -- calls synchronous provider.stream() or ask_with_tools()."""
+        managed_run = run is not None
+        run = run or RunContext(objective=prompt, provider=provider_name)
+
+        def _call(callback, *args, terminal: bool = False) -> None:
+            if managed_run:
+                self._call_for_run(run, callback, *args, terminal=terminal)
+            else:
+                self.app.call_from_thread(callback, *args)
+
+        try:
+            run.checkpoint()
+        except RunCancelled:
+            return
         cli_app = self.app.cli_app
         if cli_app is None:
-            self.app.call_from_thread(self._on_stream_error, "No CLI app available")
+            run.finish(RunOutcome.FAILED, error="No CLI app available")
+            _call(self._on_stream_error, "No CLI app available", terminal=True)
             return
 
         prov = cli_app.providers.get(provider_name)
         if prov is None:
-            self.app.call_from_thread(
-                self._on_stream_error, f"Provider '{provider_name}' not available",
-            )
+            error = f"Provider '{provider_name}' not available"
+            run.finish(RunOutcome.BLOCKED, error=error)
+            _call(self._on_stream_error, error, terminal=True)
             return
+
+        run.start(workflow="routing", provider=provider_name, model=prov.config.model)
 
         # Build system prompt (no longer includes conversation history)
         final_system = self._build_system_prompt(cli_app, prompt, provider_name)
@@ -372,7 +488,7 @@ class MainScreen(Screen):
                     chat_messages, keep_recent=6,
                 )
                 compacted_count = max(len(active_messages) - len(remaining), 0)
-                self.app.call_from_thread(
+                _call(
                     self.app.state.apply_episode_compaction,
                     compacted_count,
                     new_episodes,
@@ -412,10 +528,41 @@ class MainScreen(Screen):
             ),
         )
         if req_hook and req_hook.block:
-            self.app.call_from_thread(
-                self._on_stream_error, f"Request blocked by hook: {req_hook.reason}",
-            )
+            error = f"Request blocked by hook: {req_hook.reason}"
+            run.finish(RunOutcome.BLOCKED, error=error)
+            _call(self._on_stream_error, error, terminal=True)
             return
+
+        # Normal prompts in configured modes can be routed to a
+        # capability-constrained workflow. This is intentionally after request
+        # hooks/compaction, but before ordinary chat dispatch. Slash commands are
+        # retained as explicit overrides and debugging controls.
+        from ..swarm.auto import WorkflowKind, select_workflow, should_auto_orchestrate
+
+        if should_auto_orchestrate(cli_app, self._mode):
+            _call(self._on_stream_activity, "selecting workflow...")
+            run.checkpoint()
+            if managed_run:
+                decision = select_workflow(
+                    cli_app, prompt, self._mode, cancel_token=run.token,
+                )
+            else:
+                decision = select_workflow(cli_app, prompt, self._mode)
+            run.checkpoint()
+            run.add_tokens(decision.input_tokens, decision.output_tokens)
+            run.add_cost(decision.cost)
+            if decision.workflow != WorkflowKind.CHAT:
+                if managed_run:
+                    self._auto_orchestration_worker(
+                        cli_app, prompt, provider_name, decision, run,
+                    )
+                else:
+                    self._auto_orchestration_worker(
+                        cli_app, prompt, provider_name, decision,
+                    )
+                return
+
+        run.start(workflow="chat")
 
         # Decide: tool-calling path or streaming path
         tool_registry = getattr(cli_app, "tool_registry", None)
@@ -428,26 +575,146 @@ class MainScreen(Screen):
         if use_tools:
             self._tool_worker(
                 cli_app, prov, messages, provider_name, final_system, tool_registry,
+                run if managed_run else None,
             )
         else:
-            self._stream_worker(cli_app, prov, messages, provider_name, final_system)
+            self._stream_worker(
+                cli_app, prov, messages, provider_name, final_system,
+                run if managed_run else None,
+            )
 
-    def _stream_worker(self, cli_app, prov, messages, provider_name, final_system):
+    def _auto_orchestration_worker(
+        self,
+        cli_app,
+        prompt: str,
+        provider_name: str,
+        decision,
+        run: RunContext | None = None,
+    ) -> None:
+        """Execute and record a model-selected non-chat workflow."""
+        from ..swarm.auto import execute_auto
+
+        live_run = run or RunContext(
+            objective=prompt,
+            workflow=decision.workflow.value,
+            provider=provider_name,
+        )
+        live_run.start(workflow=decision.workflow.value)
+
+        def _progress(stage: str, detail: str) -> None:
+            live_run.checkpoint()
+            self._emit_for_run(
+                run,
+                self._on_stream_activity,
+                f"{stage}: {detail}",
+            )
+
+        def _tool_event(event: ToolEvent) -> None:
+            live_run.checkpoint()
+            self._emit_for_run(run, self._on_tool_event, event)
+
+        try:
+            result = execute_auto(
+                cli_app,
+                prompt,
+                provider_name,
+                decision,
+                on_progress=_progress,
+                on_tool_event=_tool_event,
+                cancel_token=live_run.token,
+                run_context=live_run,
+            )
+            live_run.checkpoint()
+            response_text = result.text
+            self._emit_for_run(run, self._on_stream_chunk, response_text)
+
+            if hasattr(cli_app, "record_turn"):
+                cli_app.record_turn(provider_name, prompt, response_text)
+
+            total_tokens = result.input_tokens + result.output_tokens
+            episode = generate_episode(
+                user_content=prompt,
+                assistant_content=response_text,
+                provider=provider_name,
+                tokens=total_tokens,
+            )
+            self._emit_for_run(run, self.app.state.add_episode, episode)
+            cli_app.hook_runner.emit(
+                HookEvent.EPISODE_GENERATED,
+                HookContext(
+                    event=HookEvent.EPISODE_GENERATED.value,
+                    provider=provider_name,
+                    episode_id=episode.id,
+                ),
+            )
+            live_run.finish(
+                result.outcome,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                cost=result.cost,
+            )
+            self._emit_for_run(
+                run,
+                self._on_stream_done,
+                provider_name,
+                response_text,
+                result.input_tokens,
+                result.output_tokens,
+                terminal=True,
+            )
+            cli_app.hook_runner.run_hooks(
+                HookEvent.AFTER_RESPONSE,
+                context={
+                    "response_length": str(len(response_text)),
+                    "provider": provider_name,
+                    "tool_calls": "orchestrated",
+                    "workflow": decision.workflow.value,
+                    "outcome": result.outcome.value,
+                },
+            )
+        except RunCancelled as exc:
+            live_run.finish(RunOutcome.CANCELLED, error=str(exc))
+        except Exception as exc:
+            live_run.finish(RunOutcome.FAILED, error=str(exc))
+            self._emit_for_run(
+                run, self._on_stream_error, str(exc), terminal=True,
+            )
+
+    def _stream_worker(
+        self,
+        cli_app,
+        prov,
+        messages,
+        provider_name,
+        final_system,
+        run: RunContext | None = None,
+    ):
         """Streaming path -- token-by-token output."""
         full_response = []
         # Extract the user prompt for record_turn (last user message)
         prompt = messages[-1]["content"] if messages else ""
+        live_run = run or RunContext(
+            objective=prompt, workflow="chat", provider=provider_name,
+        )
+        live_run.start(workflow="chat", model=prov.config.model)
         try:
-            for chunk in self._coalesce_stream_chunks(prov.stream(messages, final_system)):
-                full_response.append(chunk)
-                self.app.call_from_thread(self._on_stream_chunk, chunk)
+            cancellation_scope = getattr(prov, "cancellation_scope", None)
+            scope = cancellation_scope(live_run.token) if callable(cancellation_scope) else nullcontext()
+            with scope:
+                for chunk in self._coalesce_stream_chunks(prov.stream(messages, final_system)):
+                    live_run.checkpoint()
+                    full_response.append(chunk)
+                    self._emit_for_run(run, self._on_stream_chunk, chunk)
 
+            live_run.checkpoint()
             response_text = "".join(full_response)
             if hasattr(cli_app, "record_turn"):
                 cli_app.record_turn(provider_name, prompt, response_text)
 
             # Generate episode for this interaction
             usage = prov.last_usage or (0, 0)
+            live_run.add_tokens(usage[0], usage[1])
+            live_run.add_cost(float(getattr(prov, "last_cost", None) or 0.0))
             total_tokens = usage[0] + usage[1]
             episode = generate_episode(
                 user_content=prompt,
@@ -455,7 +722,7 @@ class MainScreen(Screen):
                 provider=provider_name,
                 tokens=total_tokens,
             )
-            self.app.call_from_thread(self.app.state.add_episode, episode)
+            self._emit_for_run(run, self.app.state.add_episode, episode)
             cli_app.hook_runner.emit(
                 HookEvent.EPISODE_GENERATED,
                 HookContext(
@@ -465,8 +732,15 @@ class MainScreen(Screen):
                 ),
             )
 
-            self.app.call_from_thread(
-                self._on_stream_done, provider_name, response_text, usage[0], usage[1],
+            live_run.finish(RunOutcome.SUCCEEDED)
+            self._emit_for_run(
+                run,
+                self._on_stream_done,
+                provider_name,
+                response_text,
+                usage[0],
+                usage[1],
+                terminal=True,
             )
 
             cli_app.hook_runner.run_hooks(HookEvent.AFTER_RESPONSE, context={
@@ -475,8 +749,17 @@ class MainScreen(Screen):
                 "tool_calls": "0",
             })
 
+        except RunCancelled as exc:
+            usage = prov.last_usage or (0, 0)
+            live_run.add_tokens(usage[0], usage[1])
+            live_run.add_cost(float(getattr(prov, "last_cost", None) or 0.0))
+            live_run.finish(RunOutcome.CANCELLED, error=str(exc))
         except Exception as e:
-            self.app.call_from_thread(self._on_stream_error, str(e))
+            usage = prov.last_usage or (0, 0)
+            live_run.add_tokens(usage[0], usage[1])
+            live_run.add_cost(float(getattr(prov, "last_cost", None) or 0.0))
+            live_run.finish(RunOutcome.FAILED, error=str(e))
+            self._emit_for_run(run, self._on_stream_error, str(e), terminal=True)
 
     @classmethod
     def _coalesce_stream_chunks(cls, chunks: Iterator[str]) -> Iterator[str]:
@@ -515,28 +798,48 @@ class MainScreen(Screen):
         if pending:
             yield "".join(pending)
 
-    def _tool_worker(self, cli_app, prov, messages, provider_name, final_system, tools):
+    def _tool_worker(
+        self,
+        cli_app,
+        prov,
+        messages,
+        provider_name,
+        final_system,
+        tools,
+        run: RunContext | None = None,
+    ):
         """Tool-calling path -- non-streaming with tool progress events."""
         # Extract the user prompt for record_turn (last user message)
         prompt = messages[-1]["content"] if messages else ""
+        live_run = run or RunContext(
+            objective=prompt, workflow="chat", provider=provider_name,
+        )
+        live_run.start(workflow="chat", model=prov.config.model)
 
         def on_tool_event(event: ToolEvent) -> None:
-            self.app.call_from_thread(self._on_tool_event, event)
+            live_run.checkpoint()
+            self._emit_for_run(run, self._on_tool_event, event)
 
         try:
-            response_text, tool_log = prov.ask_with_tools(
-                messages,
-                tools,
-                system=final_system,
-                max_rounds=self._CHAT_TOOL_MAX_ROUNDS,
-                on_tool_event=on_tool_event,
-            )
+            cancellation_scope = getattr(prov, "cancellation_scope", None)
+            scope = cancellation_scope(live_run.token) if callable(cancellation_scope) else nullcontext()
+            with scope:
+                response_text, tool_log = prov.ask_with_tools(
+                    messages,
+                    tools,
+                    system=final_system,
+                    max_rounds=self._CHAT_TOOL_MAX_ROUNDS,
+                    on_tool_event=on_tool_event,
+                )
+            live_run.checkpoint()
 
             if hasattr(cli_app, "record_turn"):
                 cli_app.record_turn(provider_name, prompt, response_text)
 
             # Generate episode with tool call data
             usage = prov.last_usage or (0, 0)
+            live_run.add_tokens(usage[0], usage[1])
+            live_run.add_cost(float(getattr(prov, "last_cost", None) or 0.0))
             total_tokens = usage[0] + usage[1]
             episode = generate_episode(
                 user_content=prompt,
@@ -545,7 +848,7 @@ class MainScreen(Screen):
                 tokens=total_tokens,
                 tool_log=tool_log,
             )
-            self.app.call_from_thread(self.app.state.add_episode, episode)
+            self._emit_for_run(run, self.app.state.add_episode, episode)
             cli_app.hook_runner.emit(
                 HookEvent.EPISODE_GENERATED,
                 HookContext(
@@ -555,9 +858,12 @@ class MainScreen(Screen):
                 ),
             )
 
-            self.app.call_from_thread(
+            live_run.finish(RunOutcome.SUCCEEDED)
+            self._emit_for_run(
+                run,
                 self._on_tool_done,
                 provider_name, response_text, usage[0], usage[1], tool_log,
+                terminal=True,
             )
 
             cli_app.hook_runner.run_hooks(HookEvent.AFTER_RESPONSE, context={
@@ -566,8 +872,17 @@ class MainScreen(Screen):
                 "tool_calls": str(len(tool_log)),
             })
 
+        except RunCancelled as exc:
+            usage = prov.last_usage or (0, 0)
+            live_run.add_tokens(usage[0], usage[1])
+            live_run.add_cost(float(getattr(prov, "last_cost", None) or 0.0))
+            live_run.finish(RunOutcome.CANCELLED, error=str(exc))
         except Exception as e:
-            self.app.call_from_thread(self._on_stream_error, str(e))
+            usage = prov.last_usage or (0, 0)
+            live_run.add_tokens(usage[0], usage[1])
+            live_run.add_cost(float(getattr(prov, "last_cost", None) or 0.0))
+            live_run.finish(RunOutcome.FAILED, error=str(e))
+            self._emit_for_run(run, self._on_stream_error, str(e), terminal=True)
 
     def _format_history_blocks(
         self,
@@ -1021,6 +1336,17 @@ class MainScreen(Screen):
 
     def action_exit_app(self) -> None:
         from .exit import ExitScreen
+
+        active_run = self._active_run
+        if active_run is not None:
+            reason = "cancelled because Cascade is exiting"
+            active_run.cancel(reason)
+            active_run.finish(RunOutcome.CANCELLED, error=reason)
+            self._active_run = None
+            try:
+                self.workers.cancel_all()
+            except Exception:
+                pass
 
         if not self._exit_hook_fired:
             cli_app = getattr(self.app, "cli_app", None)

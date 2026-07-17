@@ -24,6 +24,7 @@ class HistoryDB:
     def __init__(self, db_path: Optional[str] = None):
         path = Path(db_path or _DEFAULT_DB_PATH).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = str(path)
         self._conn = sqlite3.connect(str(path))
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")

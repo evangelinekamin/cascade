@@ -88,7 +88,13 @@ class ClaudeProvider(BaseProvider):
             cmd_args=cmd,
             cwd=workdir,
         )
-        yield from stream_cli_proxy(cfg, handler, self._emit_activity)
+        cancel_token = self.cancellation_token()
+        if cancel_token is None:
+            yield from stream_cli_proxy(cfg, handler, self._emit_activity)
+        else:
+            yield from stream_cli_proxy(
+                cfg, handler, self._emit_activity, cancel_token,
+            )
         if handler.last_usage:
             self._last_usage = handler.last_usage
 
@@ -124,9 +130,14 @@ class ClaudeProvider(BaseProvider):
             if system:
                 payload["system"] = system
 
-            with self.client.stream("POST", url, json=payload, headers=self._headers()) as response:
+            with self.client.stream(
+                "POST", url, json=payload, headers=self._headers()
+            ) as response, self.cancellation_callback(
+                getattr(response, "close", lambda: None)
+            ):
                 response.raise_for_status()
                 for line in response.iter_lines():
+                    self.raise_if_cancelled()
                     if line.startswith("data: "):
                         try:
                             data = json.loads(line[6:])
@@ -180,6 +191,7 @@ class ClaudeProvider(BaseProvider):
 
         text_parts = []
         for round_num in range(max_rounds):
+            self.raise_if_cancelled()
             payload = {
                 "model": self.config.model,
                 "max_tokens": self.config.max_tokens or 2048,
@@ -198,6 +210,7 @@ class ClaudeProvider(BaseProvider):
                 data = response.json()
             except Exception as e:
                 return f"Error: {e}", tool_log
+            self.raise_if_cancelled()
 
             # Capture token usage
             usage = data.get("usage", {})
@@ -228,6 +241,7 @@ class ClaudeProvider(BaseProvider):
             # Execute each tool call and build tool_result messages
             tool_results = []
             for tool_use in tool_uses:
+                self.raise_if_cancelled()
                 tool_name = tool_use["name"]
                 tool_input = tool_use.get("input", {})
                 tool_id = tool_use["id"]
@@ -242,6 +256,7 @@ class ClaudeProvider(BaseProvider):
                     ))
 
                 result = executor.execute(tool_name, tool_input)
+                self.raise_if_cancelled()
                 tool_log.append({
                     "tool": tool_name,
                     "input": tool_input,

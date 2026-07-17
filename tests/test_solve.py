@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import cascade.swarm.solve as solve_mod
+from cascade.providers.base import ProviderConfig
 from cascade.swarm.solve import (
     DEFAULT_TEST_CMD,
     SolveResult,
@@ -165,7 +166,7 @@ def test_run_solve_retries_until_tests_pass(monkeypatch):
     fake_manager = MagicMock()
     fake_manager.prepare.return_value = fake_prepared
     fake_manager.capture_snapshot.return_value = MagicMock(
-        diff_stat="", diff_excerpt="", changed_files=()
+        diff_stat="1 file", diff_excerpt="+x", changed_files=("x.py",)
     )
     monkeypatch.setattr(solve_mod, "WorktreeManager", lambda *a, **k: fake_manager)
     monkeypatch.setattr(solve_mod, "run_agent_in_worktree", lambda *a, **k: "edited")
@@ -202,7 +203,7 @@ def _patch_solve(monkeypatch, observed, test_results):
     fm = MagicMock()
     fm.prepare.return_value = SimpleNamespace(path="/tmp/wt")
     fm.capture_snapshot.return_value = SimpleNamespace(
-        diff_stat="", diff_excerpt="", changed_files=()
+        diff_stat="1 file changed", diff_excerpt="+x", changed_files=("x.py",)
     )
     monkeypatch.setattr(solve_mod, "run_agent_in_worktree", fake_agent)
     monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: next(test_results))
@@ -236,6 +237,58 @@ def test_solve_bulk_tier_resolves_via_get_bulk_model(monkeypatch):
     run_solve(app, "x", escalate=True, escalate_after=1, max_iterations=3)
 
     assert observed[0] == "dedicated-bulk"
+
+
+def test_solve_accepts_verified_fast_lane_model_override(monkeypatch):
+    app, _prov = _tiered_app()
+    observed: list[str] = []
+    _patch_solve(monkeypatch, observed, iter([("ok", 0)]))
+
+    result = run_solve(
+        app,
+        "tiny fix",
+        bulk_model_override="inception/mercury-2",
+        escalate=True,
+    )
+
+    assert result.passed is True
+    assert observed == ["inception/mercury-2"]
+
+
+def test_solve_isolates_fast_lane_provider_preferences(monkeypatch):
+    class _Provider:
+        def __init__(self, config):
+            self.config = config
+            self.last_usage = None
+
+    original = _Provider(ProviderConfig(api_key="k", model="frontier"))
+    app = MagicMock()
+    app.providers = {"openrouter": original}
+    app.config.get_default_provider.return_value = "openrouter"
+    app.config.get_model_for.return_value = "frontier"
+    app.config.get_bulk_model.return_value = "bulk"
+    app.config.data = {"workflows": {"verify": {"test": "pytest"}}}
+    observed_preferences = []
+    _patch_solve(monkeypatch, [], iter([("ok", 0)]))
+
+    def fake_agent(provider, *args, **kwargs):
+        observed_preferences.append(provider.config.provider_preferences)
+        return "edited"
+
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", fake_agent)
+    prefs = {"allow_fallbacks": True, "require_parameters": True}
+
+    result = run_solve(
+        app,
+        "tiny fix",
+        provider_name="openrouter",
+        bulk_model_override="inception/mercury-2",
+        provider_preferences_override=prefs,
+    )
+
+    assert result.passed is True
+    assert observed_preferences == [prefs]
+    assert original.config.provider_preferences is None
 
 
 def test_run_agent_in_worktree_forwards_tool_events(tmp_path):
@@ -1126,12 +1179,12 @@ def test_run_verified_task_omits_guidance_for_a_non_deepseek_model(monkeypatch):
     assert systems == [solve_mod._WORKER_SYSTEM]
 
 
-# --- Anti-proxy verification classifier: annotate what the gate exercised --------
+# --- Anti-proxy verification classifier: enforce what the gate exercised ----------
 #
 # A cheap model can green the gate without real work by pointing it at a grep, a
 # `test -f`, or a bare `true`. classify_verification labels what the resolved
-# verify command actually exercises so run_solve can warn on a passing proxy or
-# sentinel check -- an advisory note that never changes result.passed.
+# verify command actually exercises so run_solve can reject a passing proxy or
+# sentinel check unless the caller explicitly opts into that weaker contract.
 
 
 def test_classify_verification_detects_a_real_test_runner():
@@ -1187,7 +1240,7 @@ def _solve_env(monkeypatch, rc=0):
     fm = MagicMock()
     fm.prepare.return_value = SimpleNamespace(path="/tmp/wt")
     fm.capture_snapshot.return_value = SimpleNamespace(
-        diff_stat="", diff_excerpt="", changed_files=()
+        diff_stat="1 file", diff_excerpt="+x", changed_files=("foo.py",)
     )
     monkeypatch.setattr(solve_mod, "WorktreeManager", lambda *a, **k: fm)
     monkeypatch.setattr(solve_mod, "run_agent_in_worktree", lambda *a, **k: "edited")
@@ -1204,15 +1257,27 @@ def test_run_solve_records_verification_kind_on_a_passing_run(monkeypatch):
     assert result.verification_kind == "test"
 
 
-def test_run_solve_warns_when_a_passing_check_is_a_proxy(monkeypatch):
+def test_run_solve_rejects_a_passing_proxy_check_by_default(monkeypatch):
     app = _fake_app("grep -q def cascade/foo.py")
     _solve_env(monkeypatch)
 
     result = run_solve(app, "add foo")
 
-    assert result.passed is True  # the warning is advisory, not a gate
+    assert result.passed is False
+    assert result.outcome == "failed"
     assert result.verification_kind == "proxy"
     assert "proxy" in result.error
+    assert "does not prove behavior" in result.error
+
+
+def test_run_solve_can_explicitly_allow_a_weak_gate(monkeypatch):
+    app = _fake_app("grep -q def cascade/foo.py")
+    _solve_env(monkeypatch)
+
+    result = run_solve(app, "add foo", allow_weak_verification=True)
+
+    assert result.passed is True
+    assert result.outcome == "succeeded"
     assert "may not exercise real behavior" in result.error
 
 
@@ -1224,3 +1289,38 @@ def test_run_solve_does_not_warn_for_a_real_test_runner(monkeypatch):
 
     assert result.verification_kind == "test"
     assert "may not exercise real behavior" not in result.error
+
+
+def test_run_solve_rejects_a_green_noop(monkeypatch):
+    app = _fake_app("pytest")
+    fm = MagicMock()
+    fm.prepare.return_value = SimpleNamespace(path="/tmp/wt")
+    fm.capture_snapshot.return_value = SimpleNamespace(
+        diff_stat="", diff_excerpt="", changed_files=()
+    )
+    monkeypatch.setattr(solve_mod, "WorktreeManager", lambda *a, **k: fm)
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", lambda *a, **k: "done")
+    monkeypatch.setattr(solve_mod, "_run_tests_in", lambda *a: ("ok", 0))
+
+    result = run_solve(app, "add foo")
+
+    assert result.passed is False
+    assert result.outcome == "failed"
+    assert "no repository changes" in result.error
+
+
+def test_run_solve_allows_an_intentional_noop(monkeypatch):
+    app = _fake_app("pytest")
+    fm = MagicMock()
+    fm.prepare.return_value = SimpleNamespace(path="/tmp/wt")
+    fm.capture_snapshot.return_value = SimpleNamespace(
+        diff_stat="", diff_excerpt="", changed_files=()
+    )
+    monkeypatch.setattr(solve_mod, "WorktreeManager", lambda *a, **k: fm)
+    monkeypatch.setattr(solve_mod, "run_agent_in_worktree", lambda *a, **k: "done")
+    monkeypatch.setattr(solve_mod, "_run_tests_in", lambda *a: ("ok", 0))
+
+    result = run_solve(app, "confirm no change needed", allow_noop=True)
+
+    assert result.passed is True
+    assert result.outcome == "succeeded"

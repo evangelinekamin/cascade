@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 import os
+import threading
 from typing import Optional, Iterator, Callable, TypedDict, TYPE_CHECKING
 from dataclasses import dataclass, field
 
@@ -65,6 +66,7 @@ class BaseProvider(ABC):
         self._last_activity_key: Optional[str] = None
         self._emit_activity: bool = False
         self._workdir_override: Optional[str] = None
+        self._cancellation = threading.local()
 
     @property
     def last_usage(self) -> Optional[tuple[int, int]]:
@@ -100,6 +102,41 @@ class BaseProvider(ABC):
             yield
         finally:
             self._workdir_override = previous
+
+    @contextmanager
+    def cancellation_scope(self, token):
+        """Attach a cooperative token to provider work in the current thread."""
+        previous = getattr(self._cancellation, "token", None)
+        self._cancellation.token = token
+        try:
+            yield
+        finally:
+            self._cancellation.token = previous
+
+    def raise_if_cancelled(self) -> None:
+        """Raise the attached token's cancellation exception, if any."""
+        token = getattr(self._cancellation, "token", None)
+        if token is not None:
+            token.checkpoint()
+
+    def is_cancelled(self) -> bool:
+        token = getattr(self._cancellation, "token", None)
+        return bool(token is not None and token.cancelled)
+
+    def cancellation_token(self):
+        """Return the token attached to this thread, if any."""
+        return getattr(self._cancellation, "token", None)
+
+    @contextmanager
+    def cancellation_callback(self, callback):
+        """Register resource cleanup for the current token for one context."""
+        token = self.cancellation_token()
+        remove = token.add_cancel_callback(callback) if token is not None else None
+        try:
+            yield
+        finally:
+            if remove is not None:
+                remove()
 
     def _filter_activity(self, chunks: Iterator[str]) -> Iterator[str]:
         """Strip activity prefix messages from stream, storing them for TUI access."""
@@ -218,7 +255,10 @@ class BaseProvider(ABC):
         Returns:
             Tuple of (final_text_response, tool_calls_log).
         """
-        return self.ask(messages, system), []
+        self.raise_if_cancelled()
+        response = self.ask(messages, system)
+        self.raise_if_cancelled()
+        return response, []
 
     def get_fallback_model(self) -> Optional[str]:
         """Return a cheaper/faster model to fall back to on rate limits.

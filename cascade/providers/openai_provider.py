@@ -530,7 +530,13 @@ class OpenAIProvider(BaseProvider):
                     cwd=workdir,
                 )
                 try:
-                    yield from stream_cli_proxy(cfg, handler, self._emit_activity)
+                    cancel_token = self.cancellation_token()
+                    if cancel_token is None:
+                        yield from stream_cli_proxy(cfg, handler, self._emit_activity)
+                    else:
+                        yield from stream_cli_proxy(
+                            cfg, handler, self._emit_activity, cancel_token,
+                        )
                 except RuntimeError:
                     if session_id and attempt == 0 and not handler.saw_text:
                         self._codex_sessions.pop(session_key, None)
@@ -587,9 +593,14 @@ class OpenAIProvider(BaseProvider):
             if self.config.max_tokens:
                 payload["max_tokens"] = self.config.max_tokens
 
-            with self.client.stream("POST", url, json=payload, headers=self._headers()) as response:
+            with self.client.stream(
+                "POST", url, json=payload, headers=self._headers()
+            ) as response, self.cancellation_callback(
+                getattr(response, "close", lambda: None)
+            ):
                 response.raise_for_status()
                 for line in response.iter_lines():
+                    self.raise_if_cancelled()
                     if not line.startswith("data: "):
                         continue
                     data_str = line[6:]
@@ -641,6 +652,7 @@ class OpenAIProvider(BaseProvider):
             on_tool_event=on_tool_event,
             on_usage=lambda usage: setattr(self, "_last_usage", usage),
             context_window=self.config.context_window,
+            check_cancelled=self.raise_if_cancelled,
         )
 
     def compare(self, prompt: str, system: Optional[str] = None) -> dict:

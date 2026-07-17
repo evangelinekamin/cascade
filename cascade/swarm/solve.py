@@ -16,12 +16,21 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Callable, Optional
 
+from .lifecycle import (
+    CancellationToken,
+    RunCancelled,
+    RunContext,
+    TaskStatus,
+    run_cancellable_shell,
+)
+from .outcome import RunOutcome
 from .verify_loop import VerifiedWorker, VerifyAttempt, WorkerResult
 from .workspace import run_agent_in_worktree
 from .worktree import WorktreeManager
 
 ProgressCallback = Optional[Callable[[str, str], None]]
 TokensCallback = Optional[Callable[[int, int], None]]
+CostCallback = Optional[Callable[[float], None]]
 
 DEFAULT_TEST_CMD = "python -m pytest -x -q"
 
@@ -82,6 +91,7 @@ class SolveResult:
     iterations: int
     attempts: tuple[VerifyAttempt, ...]
     worktree_path: str
+    outcome: RunOutcome = RunOutcome.FAILED
     diff_stat: str = ""
     diff_excerpt: str = ""
     changed_files: tuple[str, ...] = ()
@@ -89,6 +99,7 @@ class SolveResult:
     providers_used: tuple[str, ...] = ()
     input_tokens: int = 0
     output_tokens: int = 0
+    cost: float = 0.0
     guardrail_fired: bool = False
     verification_kind: str = ""
     error: str = ""
@@ -196,19 +207,30 @@ def classify_verification(test_cmd: str) -> str:
     return "unknown"
 
 
-def _annotate_verification(error: str, passed: bool, kind: str) -> str:
-    """Append an anti-proxy warning when a PASSED run's check proves little.
+def _annotate_verification(
+    error: str,
+    passed: bool,
+    kind: str,
+    *,
+    allow_weak: bool = False,
+) -> "tuple[bool, str]":
+    """Reject a green proxy/sentinel gate unless explicitly permitted.
 
     A passing run whose verify command was only a proxy (grep/existence) or a
     sentinel (a no-op that always succeeds) may be green without exercising real
-    behavior. The note is advisory -- it is appended to the existing error surface
-    and never changes ``passed``. Any other kind (including a genuine test runner)
-    is returned untouched.
+    behavior. Verified orchestration fails closed here; callers with an intentionally
+    weak project gate can explicitly opt in.
     """
     if not (passed and kind in ("proxy", "sentinel")):
-        return error
-    note = f"warning: the passing check ({kind}) may not exercise real behavior"
-    return f"{error}\n{note}" if error else note
+        return passed, error
+    if allow_weak:
+        note = f"warning: the passing check ({kind}) may not exercise real behavior"
+        return passed, f"{error}\n{note}" if error else note
+    note = (
+        f"verification rejected: the configured {kind} check does not prove "
+        "behavior; configure a real test command or explicitly allow a weak gate"
+    )
+    return False, f"{error}\n{note}" if error else note
 
 
 def _worktree_change_summary(path: str, cap: int = 1500) -> str:
@@ -237,23 +259,22 @@ def _worktree_change_summary(path: str, cap: int = 1500) -> str:
     return out
 
 
-def _run_tests_in(cmd: str, cwd: str, timeout: int) -> "tuple[str, int]":
+def _run_tests_in(
+    cmd: str,
+    cwd: str,
+    timeout: int,
+    cancel_token: Optional[CancellationToken] = None,
+) -> "tuple[str, int]":
     """Run *cmd* inside *cwd*; return (combined output, returncode)."""
     try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+        output, returncode, timed_out = run_cancellable_shell(
+            cmd, cwd, timeout, cancel_token,
         )
-        output = result.stdout
-        if result.stderr:
-            output = f"{output}\n{result.stderr}" if output else result.stderr
-        return output.strip(), result.returncode
-    except subprocess.TimeoutExpired:
-        return f"[tests timed out after {timeout}s]", -1
+        if timed_out:
+            return f"[tests timed out after {timeout}s]", -1
+        return output.strip(), returncode
+    except RunCancelled:
+        raise
 
 
 # Signatures that mean the verify command never actually ran -- an environment
@@ -279,14 +300,22 @@ def _is_infra_failure(output: str, returncode: int) -> bool:
     return any(signature in low for signature in _INFRA_FAILURE_SIGNATURES)
 
 
-def _preflight_gate(test_cmd: str, cwd: str, timeout: int) -> Optional[str]:
+def _preflight_gate(
+    test_cmd: str,
+    cwd: str,
+    timeout: int,
+    cancel_token: Optional[CancellationToken] = None,
+) -> Optional[str]:
     """Confirm the verify command can execute before spending agent iterations.
 
     Returns a human-readable error when the command does not run at all (an
     environment/config problem the agent cannot fix); returns None when the gate
     is healthy -- whether or not its tests currently pass.
     """
-    output, returncode = _run_tests_in(test_cmd, cwd, timeout)
+    if cancel_token is None:
+        output, returncode = _run_tests_in(test_cmd, cwd, timeout)
+    else:
+        output, returncode = _run_tests_in(test_cmd, cwd, timeout, cancel_token)
     if _is_infra_failure(output, returncode):
         stripped = output.strip()
         detail = stripped.splitlines()[-1] if stripped else f"exit code {returncode}"
@@ -548,7 +577,11 @@ def _establish_guardrail_baseline(worktree: str) -> Optional[str]:
 
 
 def _minimize_blast_radius(
-    worktree: str, baseline_ref: str, test_cmd: str, timeout: int
+    worktree: str,
+    baseline_ref: str,
+    test_cmd: str,
+    timeout: int,
+    cancel_token: Optional[CancellationToken] = None,
 ) -> bool:
     """Revert the worker's needless edits to shared code if that greens the suite.
 
@@ -596,7 +629,12 @@ def _minimize_blast_radius(
     if reverted.returncode != 0:
         return False  # git apply is atomic -- the worker's changes are untouched
 
-    _output, returncode = _run_tests_in(test_cmd, worktree, timeout)
+    if cancel_token is None:
+        _output, returncode = _run_tests_in(test_cmd, worktree, timeout)
+    else:
+        _output, returncode = _run_tests_in(
+            test_cmd, worktree, timeout, cancel_token,
+        )
     if returncode == 0:
         return True  # the needless modifications are gone and the suite is green
     _restore_files(saved)  # the revert did not help -> restore the worker verbatim
@@ -622,7 +660,9 @@ def run_verified_task(
     timeout: int = 300,
     on_progress: ProgressCallback = None,
     on_tokens: TokensCallback = None,
+    on_cost: CostCallback = None,
     on_tool_event=None,
+    cancel_token: Optional[CancellationToken] = None,
 ) -> "tuple[WorkerResult, list[str], list[str]]":
     """Run the escalating verified loop for one task against an existing worktree.
 
@@ -651,6 +691,8 @@ def run_verified_task(
         return provider, bulk_model, provider_label
 
     def run_agent(prompt: str, path: str) -> str:
+        if cancel_token is not None:
+            cancel_token.checkpoint()
         state["iteration"] += 1
         agent, model, label = _agent_for(state["iteration"])
         models_used.append(model)
@@ -662,10 +704,14 @@ def run_verified_task(
         guidance = worker_guidance_for(model)
         worker_system = f"{_WORKER_SYSTEM}\n{guidance}" if guidance else _WORKER_SYSTEM
         try:
-            response = run_agent_in_worktree(
-                agent, prompt, path, system=worker_system, max_rounds=max_rounds,
-                on_tool_event=on_tool_event,
-            )
+            agent_kwargs = {
+                "system": worker_system,
+                "max_rounds": max_rounds,
+                "on_tool_event": on_tool_event,
+            }
+            if cancel_token is not None:
+                agent_kwargs["cancel_token"] = cancel_token
+            response = run_agent_in_worktree(agent, prompt, path, **agent_kwargs)
             if on_tokens is not None:
                 usage = getattr(agent, "last_usage", None)
                 if isinstance(usage, tuple) and len(usage) == 2:
@@ -673,6 +719,9 @@ def run_verified_task(
                         on_tokens(int(usage[0]), int(usage[1]))
                     except (TypeError, ValueError):
                         pass
+            cost = getattr(agent, "last_cost", None)
+            if on_cost is not None and isinstance(cost, (int, float)) and cost:
+                on_cost(float(cost))
             return response
         finally:
             agent.config.model = original_model
@@ -684,14 +733,18 @@ def run_verified_task(
         _restore_files(test_snapshot)
         if on_progress:
             on_progress("verifying", f"running: {test_cmd}")
-        return _run_tests_in(test_cmd, path, timeout)
+        if cancel_token is None:
+            return _run_tests_in(test_cmd, path, timeout)
+        return _run_tests_in(test_cmd, path, timeout, cancel_token)
 
     def on_attempt(attempt: VerifyAttempt) -> None:
         if on_progress:
             outcome = "passed" if attempt.passed else "failed"
             on_progress("verified", f"iteration {attempt.iteration}: tests {outcome}")
 
-    gate_error = _preflight_gate(test_cmd, worktree_path, timeout)
+    gate_error = _preflight_gate(
+        test_cmd, worktree_path, timeout, cancel_token,
+    )
     if gate_error is not None:
         if on_progress:
             on_progress("aborted", gate_error)
@@ -728,7 +781,13 @@ def run_verified_task(
     # just its needless (non-additive) edits to shared code and re-verifying once.
     if not result.passed and guardrail_baseline is not None:
         _restore_files(test_snapshot)  # re-verify against the true contract
-        if _minimize_blast_radius(worktree_path, guardrail_baseline, test_cmd, timeout):
+        if _minimize_blast_radius(
+            worktree_path,
+            guardrail_baseline,
+            test_cmd,
+            timeout,
+            cancel_token,
+        ):
             if on_progress:
                 on_progress("guardrail", "reverted needless edits to shared code; suite green")
             result = replace(result, passed=True, guardrail_fired=True)
@@ -773,9 +832,15 @@ def run_solve(
     escalate_after: int = 1,
     escalate_to: "Optional[str | tuple[str, str]]" = None,
     timeout: int = 300,
+    bulk_model_override: Optional[str] = None,
+    provider_preferences_override: Optional[dict] = None,
+    allow_noop: bool = False,
+    allow_weak_verification: bool = False,
     on_progress: ProgressCallback = None,
     on_tokens: TokensCallback = None,
     on_tool_event=None,
+    cancel_token: Optional[CancellationToken] = None,
+    run_context: Optional[RunContext] = None,
 ) -> SolveResult:
     """Run *task* to a verified diff in an isolated worktree.
 
@@ -791,11 +856,26 @@ def run_solve(
     provider name like ``"glm"`` or a ``(provider_name, model)`` pair) to instead
     hand stalled iterations to a stronger *provider* entirely. The returned
     ``SolveResult`` records ``providers_used`` alongside ``models_used`` so the
-    handoff is visible.
+    handoff is visible. ``bulk_model_override`` and
+    ``provider_preferences_override`` let the automatic router start a tiny
+    verified task on its selected fast lane without mutating global config.
     """
     provider_name = provider_name or app.config.get_default_provider()
+    token = cancel_token or (run_context.token if run_context is not None else None)
+    if token is not None:
+        token.checkpoint()
+    if run_context is not None:
+        run_context.start(workflow="solve", provider=provider_name)
+        run_context.declare_task("solve", task)
     provider = app.providers.get(provider_name)
     if provider is None:
+        if run_context is not None:
+            run_context.task_status(
+                "solve",
+                task,
+                TaskStatus.BLOCKED,
+                error=f"Provider '{provider_name}' not available",
+            )
         return SolveResult(
             task=task,
             provider=provider_name,
@@ -803,27 +883,72 @@ def run_solve(
             iterations=0,
             attempts=(),
             worktree_path="",
+            outcome=RunOutcome.BLOCKED,
             error=f"Provider '{provider_name}' not available",
         )
+    if provider_preferences_override is not None:
+        try:
+            provider = type(provider)(
+                replace(
+                    provider.config,
+                    provider_preferences=dict(provider_preferences_override),
+                )
+            )
+        except Exception as exc:
+            if run_context is not None:
+                run_context.task_status(
+                    "solve", task, TaskStatus.BLOCKED, error=str(exc),
+                )
+            return SolveResult(
+                task=task,
+                provider=provider_name,
+                passed=False,
+                iterations=0,
+                attempts=(),
+                worktree_path="",
+                outcome=RunOutcome.BLOCKED,
+                error=f"Could not isolate provider routing preferences: {exc}",
+            )
 
     test_cmd = _test_command(app)
     verification_kind = classify_verification(test_cmd)
     frontier_model = app.config.get_model_for(provider_name, fast=False)
-    bulk_model = app.config.get_bulk_model(provider_name) if escalate else frontier_model
+    bulk_model = (
+        bulk_model_override
+        or (app.config.get_bulk_model(provider_name) if escalate else frontier_model)
+    )
     escalation_provider, escalation_name, escalation_model = _resolve_escalation(
         app, escalate_to
     )
     manager = WorktreeManager()
     token_totals = [0, 0]
+    cost_total = [0.0]
+    path = ""
+    models_used: list[str] = []
+    providers_used: list[str] = []
 
     def _accumulate_tokens(in_tokens: int, out_tokens: int) -> None:
         token_totals[0] += in_tokens
         token_totals[1] += out_tokens
+        if run_context is not None:
+            run_context.add_tokens(in_tokens, out_tokens)
         if on_tokens is not None:
             on_tokens(in_tokens, out_tokens)
 
+    def _accumulate_cost(cost: float) -> None:
+        cost_total[0] += cost
+        if run_context is not None:
+            run_context.add_cost(cost)
+
     try:
+        if token is not None:
+            token.checkpoint()
         path = manager.prepare(provider_name).path
+        if run_context is not None:
+            run_context.set_worktree(path)
+            run_context.task_status(
+                "solve", task, TaskStatus.RUNNING, worktree_path=path,
+            )
         if on_progress:
             on_progress("workspace", path)
         result, models_used, providers_used = run_verified_task(
@@ -844,16 +969,46 @@ def run_solve(
             timeout=timeout,
             on_progress=on_progress,
             on_tokens=_accumulate_tokens,
+            on_cost=_accumulate_cost,
             on_tool_event=on_tool_event,
+            cancel_token=token,
         )
+        if token is not None:
+            token.checkpoint()
         snapshot = manager.capture_snapshot(path)
+        passed = result.passed
+        error = result.error
+        if passed and not snapshot.changed_files and not allow_noop:
+            passed = False
+            no_change = (
+                "verification passed, but the worker produced no repository changes; "
+                "use allow_noop only for an intentionally no-op task"
+            )
+            error = f"{error}\n{no_change}" if error else no_change
+        passed, error = _annotate_verification(
+            error,
+            passed,
+            verification_kind,
+            allow_weak=allow_weak_verification,
+        )
+        if run_context is not None:
+            run_context.task_status(
+                "solve",
+                task,
+                TaskStatus.SUCCEEDED if passed else TaskStatus.FAILED,
+                model=models_used[-1] if models_used else "",
+                worktree_path=path,
+                error=error,
+                metadata={"iterations": result.iterations},
+            )
         return SolveResult(
             task=task,
             provider=provider_name,
-            passed=result.passed,
+            passed=passed,
             iterations=result.iterations,
             attempts=result.attempts,
             worktree_path=path,
+            outcome=RunOutcome.SUCCEEDED if passed else RunOutcome.FAILED,
             diff_stat=snapshot.diff_stat,
             diff_excerpt=snapshot.diff_excerpt,
             changed_files=snapshot.changed_files,
@@ -861,18 +1016,63 @@ def run_solve(
             providers_used=tuple(providers_used),
             input_tokens=token_totals[0],
             output_tokens=token_totals[1],
+            cost=cost_total[0],
             guardrail_fired=result.guardrail_fired,
             verification_kind=verification_kind,
-            error=_annotate_verification(result.error, result.passed, verification_kind),
+            error=error,
         )
-    except Exception as exc:
+    except RunCancelled as exc:
+        snapshot = None
+        if path:
+            try:
+                snapshot = manager.capture_snapshot(path)
+            except Exception:
+                pass
+        if run_context is not None:
+            run_context.task_status(
+                "solve",
+                task,
+                TaskStatus.CANCELLED,
+                model=models_used[-1] if models_used else "",
+                worktree_path=path,
+                error=str(exc),
+            )
         return SolveResult(
             task=task,
             provider=provider_name,
             passed=False,
             iterations=0,
             attempts=(),
-            worktree_path="",
+            worktree_path=path,
+            outcome=RunOutcome.CANCELLED,
+            diff_stat=snapshot.diff_stat if snapshot else "",
+            diff_excerpt=snapshot.diff_excerpt if snapshot else "",
+            changed_files=snapshot.changed_files if snapshot else (),
+            models_used=tuple(models_used),
+            providers_used=tuple(providers_used),
+            input_tokens=token_totals[0],
+            output_tokens=token_totals[1],
+            cost=cost_total[0],
+            verification_kind=verification_kind,
+            error=str(exc),
+        )
+    except Exception as exc:
+        if run_context is not None:
+            run_context.task_status(
+                "solve", task, TaskStatus.FAILED,
+                worktree_path=path, error=str(exc),
+            )
+        return SolveResult(
+            task=task,
+            provider=provider_name,
+            passed=False,
+            iterations=0,
+            attempts=(),
+            worktree_path=path,
+            outcome=RunOutcome.FAILED,
+            input_tokens=token_totals[0],
+            output_tokens=token_totals[1],
+            cost=cost_total[0],
             verification_kind=verification_kind,
             error=str(exc),
         )

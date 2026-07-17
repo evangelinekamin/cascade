@@ -218,3 +218,116 @@ def test_openrouter_ask_with_tools_forwards_provider_preferences():
         provider.ask_with_tools([{"role": "user", "content": "hi"}], tools={})
 
     assert captured["provider_preferences"] == prefs
+
+
+def test_openrouter_midstream_error_is_not_treated_as_success():
+    """HTTP 200 can still contain an in-band provider failure after partial text."""
+    config = ProviderConfig(api_key="test-key", model="test-model")
+    provider = OpenRouterProvider(config)
+
+    class _Response:
+        headers = {"X-Generation-Id": "gen-partial"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"partial"}}]}'
+            yield (
+                'data: {"error":{"code":429,"message":"overloaded",'
+                '"metadata":{"error_type":"provider_overloaded"}},'
+                '"choices":[{"delta":{"content":""},"finish_reason":"error"}]}'
+            )
+
+    class _Context:
+        def __enter__(self):
+            return _Response()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    with patch.object(provider.client, "stream", return_value=_Context()):
+        stream = provider.stream_single("hello")
+        assert next(stream) == "partial"
+        with pytest.raises(RuntimeError, match="provider_overloaded"):
+            next(stream)
+
+    assert provider.last_generation_id == "gen-partial"
+
+
+def test_openrouter_structured_response_uses_schema_and_required_provider_params():
+    prefs = {
+        "order": ["cerebras"],
+        "allow_fallbacks": True,
+        "require_parameters": True,
+    }
+    provider = OpenRouterProvider(
+        ProviderConfig(
+            api_key="test-key",
+            model="openai/gpt-oss-120b",
+            provider_preferences=prefs,
+        )
+    )
+    response = httpx.Response(
+        200,
+        headers={"X-Generation-Id": "gen-route"},
+        json={
+            "choices": [{
+                "message": {
+                    "content": '{"workflow":"recon","reason":"read only","confidence":0.9}'
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 5, "cost": 0.001},
+        },
+        request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+    )
+    schema = {
+        "type": "object",
+        "properties": {"workflow": {"type": "string"}},
+        "required": ["workflow"],
+    }
+
+    with patch.object(provider.client, "post", return_value=response) as post:
+        result = provider.ask_structured("route this", schema, schema_name="route")
+
+    payload = post.call_args.kwargs["json"]
+    assert result["workflow"] == "recon"
+    assert payload["model"] == "openai/gpt-oss-120b"
+    assert payload["provider"] == prefs
+    assert payload["response_format"]["json_schema"] == {
+        "name": "route",
+        "strict": True,
+        "schema": schema,
+    }
+    assert provider.last_usage == (12, 5)
+    assert provider.last_cost == 0.001
+    assert provider.last_generation_id == "gen-route"
+
+
+def test_openrouter_tool_loop_captures_usage_cost():
+    provider = OpenRouterProvider(
+        ProviderConfig(api_key="test-key", model="openai/gpt-oss-120b")
+    )
+    response = httpx.Response(
+        200,
+        json={
+            "choices": [{
+                "message": {"content": "done"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 4, "cost": 0.0025},
+        },
+        request=httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions"),
+    )
+
+    with patch.object(provider.client, "post", return_value=response):
+        text, log = provider.ask_with_tools(
+            [{"role": "user", "content": "inspect"}],
+            {},
+        )
+
+    assert text == "done"
+    assert log == []
+    assert provider.last_usage == (20, 4)
+    assert provider.last_cost == pytest.approx(0.0025)

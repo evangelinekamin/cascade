@@ -16,14 +16,46 @@ providers:
     temperature: 0.7
     max_tokens: 2048
 
+  openrouter:
+    enabled: true
+    api_key: ${OPENROUTER_API_KEY}
+    model: qwen/qwen3.5-9b
+    fast_model: inception/mercury-2
+    fallback_model: minimax/minimax-m2.5
+    temperature: 0.7
+
 defaults:
   provider: gemini
   theme: deep-stream
+
+# Model-selected workflow routing for ordinary prompts. Cerebras is an
+# OpenRouter upstream endpoint, not a separate Cascade provider.
+orchestration:
+  enabled: true
+  modes: [design, plan, build, test]
+  router_provider: openrouter
+  router_model: openai/gpt-oss-120b
+  recon_provider: openrouter
+  recon_model: openai/gpt-oss-120b
+  fast_provider: openrouter
+  fast_model: inception/mercury-2
+  provider_preferences:
+    order: [cerebras]
+    allow_fallbacks: true
+    require_parameters: true
+    # OpenRouter supports per-request privacy filtering. Uncomment either when
+    # endpoint availability is less important than the stronger constraint.
+    # data_collection: deny
+    # zdr: true
+  fast_provider_preferences:
+    allow_fallbacks: true
+    require_parameters: true
 
 # Before using Cascade, set your API keys:
 #
 # export GEMINI_API_KEY="your-gemini-key-here"
 # export CLAUDE_API_KEY="your-claude-key-here"
+# export OPENROUTER_API_KEY="your-openrouter-key-here"
 #
 # Then run:
 #   cascade ask "hello world"

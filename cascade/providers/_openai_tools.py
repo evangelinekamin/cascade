@@ -179,6 +179,17 @@ def _hottest_over(counts: dict[str, int], threshold: int) -> Optional[str]:
     return key if counts[key] >= threshold else None
 
 
+def _api_error_text(error: object) -> str:
+    """Return a useful normalized message for an in-band API error object."""
+    if not isinstance(error, dict):
+        return str(error or "provider request failed")
+    message = str(error.get("message") or "provider request failed")
+    metadata = error.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("error_type"):
+        message = f"{message} ({metadata['error_type']})"
+    return message
+
+
 def openai_ask_with_tools(
     client: httpx.Client,
     url: str,
@@ -192,8 +203,10 @@ def openai_ask_with_tools(
     max_rounds: int = 5,
     on_tool_event: ToolEventCallback = None,
     on_usage: Optional[Callable[[tuple[int, int]], None]] = None,
+    on_cost: Optional[Callable[[float], None]] = None,
     context_window: int = 128000,
     provider_preferences: Optional[dict] = None,
+    check_cancelled: Optional[Callable[[], None]] = None,
 ) -> tuple[str, list[dict]]:
     """OpenAI-compatible tool calling loop.
 
@@ -246,6 +259,7 @@ def openai_ask_with_tools(
     content = ""
     total_input_tokens = 0
     total_output_tokens = 0
+    total_cost = 0.0
     budget = int(context_window * _CONTEXT_BUDGET_FRACTION)
     seen_reads: set[tuple[str, str]] = set()
     doom_streak = 0
@@ -254,7 +268,7 @@ def openai_ask_with_tools(
     run_counts: dict[str, int] = {}
 
     def _capture_usage(data: dict) -> None:
-        nonlocal total_input_tokens, total_output_tokens
+        nonlocal total_input_tokens, total_output_tokens, total_cost
         usage = data.get("usage", {})
         if not isinstance(usage, dict):
             return
@@ -263,12 +277,22 @@ def openai_ask_with_tools(
         if isinstance(in_t, int) and isinstance(out_t, int):
             total_input_tokens += in_t
             total_output_tokens += out_t
+        cost = usage.get("cost")
+        if isinstance(cost, (int, float)):
+            total_cost += float(cost)
 
     def _finalize_usage() -> None:
         if on_usage is not None and (total_input_tokens or total_output_tokens):
             on_usage((total_input_tokens, total_output_tokens))
+        if on_cost is not None and total_cost:
+            on_cost(total_cost)
+
+    def _checkpoint() -> None:
+        if check_cancelled is not None:
+            check_cancelled()
 
     for round_num in range(max_rounds):
+        _checkpoint()
         # Bound the running context before every request: evict old, large tool
         # results so accumulated file reads cannot overflow the model's window.
         api_messages = _compact_messages_to_budget(
@@ -297,10 +321,25 @@ def openai_ask_with_tools(
         except Exception as exc:
             raise RuntimeError(str(exc)) from exc
 
+        _checkpoint()
+
+        # OpenRouter and some OpenAI-compatible providers can commit an HTTP 200
+        # before generation fails, then report the failure in the response body.
+        # Treating that as an empty assistant message lets truncated agent work
+        # masquerade as a normal round.
+        if data.get("error"):
+            _finalize_usage()
+            raise RuntimeError(_api_error_text(data["error"]))
+
         choices = data.get("choices", [])
         if not choices:
             _finalize_usage()
             return "", tool_log
+
+        choice_error = choices[0].get("error")
+        if choices[0].get("finish_reason") == "error" or choice_error:
+            _finalize_usage()
+            raise RuntimeError(_api_error_text(choice_error))
 
         message = choices[0].get("message", {})
         finish_reason = choices[0].get("finish_reason", "stop")
@@ -317,6 +356,7 @@ def openai_ask_with_tools(
 
         # Execute each tool call
         for tc in tool_calls:
+            _checkpoint()
             fn = tc.get("function", {})
             tool_name = fn.get("name", "")
             try:
@@ -384,6 +424,7 @@ def openai_ask_with_tools(
                     result = executor.execute(tool_name, tool_args)
                     if dedup_key is not None:
                         seen_reads.add(dedup_key)
+            _checkpoint()
             tool_log.append({
                 "tool": tool_name,
                 "input": tool_args,

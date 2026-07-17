@@ -95,9 +95,14 @@ class OpenAICompatibleProvider(BaseProvider):
             payload["max_tokens"] = self.config.max_tokens
 
         try:
-            with self.client.stream("POST", url, json=payload, headers=self._headers()) as response:
+            with self.client.stream(
+                "POST", url, json=payload, headers=self._headers()
+            ) as response, self.cancellation_callback(
+                getattr(response, "close", lambda: None)
+            ):
                 response.raise_for_status()
                 for line in response.iter_lines():
+                    self.raise_if_cancelled()
                     if not line.startswith("data: "):
                         continue
                     data_str = line[6:]
@@ -149,6 +154,7 @@ class OpenAICompatibleProvider(BaseProvider):
             on_tool_event=on_tool_event,
             on_usage=lambda usage: setattr(self, "_last_usage", usage),
             context_window=self.config.context_window,
+            check_cancelled=self.raise_if_cancelled,
         )
 
     def compare(self, prompt: str, system: Optional[str] = None) -> dict:

@@ -4,7 +4,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import cascade.swarm.fanout as fanout_mod
-from cascade.swarm.fanout import FanoutTask, _parse_subtasks, run_fanout
+from cascade.swarm.fanout import (
+    FanoutTask,
+    _parse_subtasks,
+    _validate_subtasks,
+    run_fanout,
+)
 
 
 def test_parse_subtasks_parses_json():
@@ -37,7 +42,7 @@ def _fanout_app():
     return app
 
 
-def _patch_manager(monkeypatch, apply_results=None):
+def _patch_manager(monkeypatch, apply_results=None, subtask_changes=None):
     """Fake WorktreeManager; apply_results maps subtask path suffix -> apply bool."""
     fm = MagicMock()
     fm.prepare.side_effect = lambda name: SimpleNamespace(path=f"/tmp/wt/{name}")
@@ -45,9 +50,22 @@ def _patch_manager(monkeypatch, apply_results=None):
     fm.apply_patch.side_effect = lambda integ_path, patch: (
         apply_results.get(patch, True) if apply_results else True
     )
-    fm.capture_snapshot.return_value = SimpleNamespace(
-        diff_stat="2 files changed", diff_excerpt="+A\n+B", changed_files=("a.py", "b.py")
-    )
+    changes = subtask_changes or {
+        "task_01": ("a.py",),
+        "task_02": ("b.py",),
+        "task_03": ("c.py",),
+    }
+
+    def snapshot(path):
+        key = path.rsplit("/", 1)[-1]
+        changed = changes.get(key, ("a.py", "b.py", "c.py"))
+        return SimpleNamespace(
+            diff_stat="2 files changed" if changed else "",
+            diff_excerpt="+A\n+B" if changed else "",
+            changed_files=changed,
+        )
+
+    fm.capture_snapshot.side_effect = snapshot
     monkeypatch.setattr(fanout_mod, "WorktreeManager", lambda *a, **k: fm)
     return fm
 
@@ -68,6 +86,7 @@ def test_run_fanout_merges_passing_subtasks_and_verifies(monkeypatch):
     result = run_fanout(app, "build A and B")
 
     assert result.passed is True
+    assert result.outcome == "succeeded"
     assert len(result.subs) == 2
     assert all(s.passed and s.integrated for s in result.subs)
     assert result.worktree_path == "/tmp/wt/_integration"
@@ -79,10 +98,10 @@ def test_run_fanout_skips_failing_and_conflicting_subtasks(monkeypatch):
     monkeypatch.setattr(fanout_mod, "plan_subtasks", lambda *a, **k: [
         FanoutTask("sub_1", "ok", "p1", ("a.py",)),      # passes + merges
         FanoutTask("sub_2", "fails", "p2", ("b.py",)),   # fails -> never merged
-        FanoutTask("sub_3", "conflict", "p3", ("a.py",)),  # passes but conflicts
+        FanoutTask("sub_3", "conflict", "p3", ("c.py",)),  # passes but conflicts
     ])
     # sub_3's patch conflicts on apply
-    _patch_manager(monkeypatch, apply_results={"patch::/tmp/wt/sub_3": False})
+    _patch_manager(monkeypatch, apply_results={"patch::/tmp/wt/task_03": False})
 
     passed_map = {"p1": True, "p2": False, "p3": True}
     monkeypatch.setattr(
@@ -99,7 +118,9 @@ def test_run_fanout_skips_failing_and_conflicting_subtasks(monkeypatch):
     assert by_id["sub_1"].integrated is True
     assert by_id["sub_2"].passed is False and by_id["sub_2"].integrated is False
     assert by_id["sub_3"].passed is True and by_id["sub_3"].integrated is False  # conflict
-    assert result.passed is True  # tests green and at least one subtask merged
+    assert result.passed is False
+    assert result.outcome == "partial"
+    assert "sub_2" in result.error and "sub_3" in result.error
 
 
 def test_run_fanout_missing_provider_errors():
@@ -127,7 +148,9 @@ def test_run_fanout_decomposes_on_the_escalation_frontier(monkeypatch):
 
     captured = {}
 
-    def fake_plan(app_, objective, director, director_model, on_progress=None):
+    def fake_plan(
+        app_, objective, director, director_model, on_progress=None, on_tokens=None
+    ):
         captured["director"] = director
         captured["model"] = director_model
         return [FanoutTask("sub_1", "x", "p1", ())]
@@ -165,7 +188,7 @@ def test_clone_provider_gives_an_independent_config():
     assert original.config.model == "m"  # mutating the clone never touches the original
 
 
-def test_clone_provider_falls_back_for_non_dataclass_config():
+def test_clone_provider_deep_copies_non_dataclass_config():
     from cascade.swarm.fanout import _clone_provider
 
     class _Prov:
@@ -173,8 +196,105 @@ def test_clone_provider_falls_back_for_non_dataclass_config():
             self.config = config
 
     original = _Prov(SimpleNamespace(model="m"))  # not a dataclass -> can't replace()
-    assert _clone_provider(original) is original
+    clone = _clone_provider(original)
+    assert clone is not original
+    assert clone.config is not original.config
     assert _clone_provider(None) is None
+
+
+def test_validate_subtasks_rejects_duplicate_ids():
+    _tasks, error = _validate_subtasks([
+        FanoutTask("same", "a", "a", ("a.py",)),
+        FanoutTask("same", "b", "b", ("b.py",)),
+    ])
+    assert "duplicate" in error
+
+
+def test_validate_subtasks_rejects_unsafe_ids_and_paths():
+    _tasks, error = _validate_subtasks([
+        FanoutTask("../../escape", "a", "a", ("a.py",)),
+    ])
+    assert "unsafe task id" in error
+
+    _tasks, error = _validate_subtasks([
+        FanoutTask("safe", "a", "a", ("../../outside.py",)),
+    ])
+    assert "unsafe owned path" in error
+
+
+def test_validate_subtasks_rejects_overlapping_ownership():
+    _tasks, error = _validate_subtasks([
+        FanoutTask("a", "a", "a", ("src",)),
+        FanoutTask("b", "b", "b", ("src/b.py",)),
+    ])
+    assert "overlaps" in error
+
+
+def test_run_fanout_rejects_worker_changes_outside_ownership(monkeypatch):
+    app = _fanout_app()
+    monkeypatch.setattr(
+        fanout_mod,
+        "plan_subtasks",
+        lambda *a, **k: [FanoutTask("sub_1", "a", "a", ("owned.py",))],
+    )
+    _patch_manager(monkeypatch, subtask_changes={"task_01": ("other.py",)})
+    monkeypatch.setattr(
+        fanout_mod,
+        "run_verified_task",
+        lambda *a, **k: (SimpleNamespace(passed=True, error=""), ["bulk"], ["p"]),
+    )
+    monkeypatch.setattr(fanout_mod, "_run_tests_in", lambda *a: ("ok", 0))
+
+    result = run_fanout(app, "x")
+
+    assert result.passed is False
+    assert result.subs[0].ownership_violations == ("other.py",)
+    assert "outside" in result.subs[0].error
+
+
+def test_run_fanout_rejects_noop_subtask(monkeypatch):
+    app = _fanout_app()
+    monkeypatch.setattr(
+        fanout_mod,
+        "plan_subtasks",
+        lambda *a, **k: [FanoutTask("sub_1", "a", "a", ("a.py",))],
+    )
+    _patch_manager(monkeypatch, subtask_changes={"task_01": ()})
+    monkeypatch.setattr(
+        fanout_mod,
+        "run_verified_task",
+        lambda *a, **k: (SimpleNamespace(passed=True, error=""), ["bulk"], ["p"]),
+    )
+    monkeypatch.setattr(fanout_mod, "_run_tests_in", lambda *a: ("ok", 0))
+
+    result = run_fanout(app, "x")
+
+    assert result.passed is False
+    assert result.outcome == "failed"
+    assert "no changes" in result.subs[0].error
+
+
+def test_run_fanout_rejects_green_proxy_verification(monkeypatch):
+    app = _fanout_app()
+    app.config.data = {"workflows": {"verify": {"test": "test -f a.py"}}}
+    monkeypatch.setattr(
+        fanout_mod,
+        "plan_subtasks",
+        lambda *a, **k: [FanoutTask("sub_1", "a", "a", ("a.py",))],
+    )
+    _patch_manager(monkeypatch, subtask_changes={"task_01": ("a.py",)})
+    monkeypatch.setattr(
+        fanout_mod,
+        "run_verified_task",
+        lambda *a, **k: (SimpleNamespace(passed=True, error=""), ["bulk"], ["p"]),
+    )
+    monkeypatch.setattr(fanout_mod, "_run_tests_in", lambda *a: ("ok", 0))
+
+    result = run_fanout(app, "x")
+
+    assert result.passed is False
+    assert result.verification_kind == "proxy"
+    assert "does not prove behavior" in result.subs[0].error
 
 
 def test_run_fanout_aborts_on_a_red_base(monkeypatch):
@@ -196,6 +316,31 @@ def test_run_fanout_aborts_on_a_red_base(monkeypatch):
     assert result.passed is False
     assert "not green" in result.error
     assert ran == []
+
+
+def test_fanout_counts_planner_and_parallel_worker_tokens(monkeypatch):
+    app = _fanout_app()
+
+    def fake_plan(*args, on_tokens=None, **kwargs):
+        on_tokens(9, 3)
+        return [
+            FanoutTask("sub_1", "a", "a", ("a.py",)),
+            FanoutTask("sub_2", "b", "b", ("b.py",)),
+        ]
+
+    monkeypatch.setattr(fanout_mod, "plan_subtasks", fake_plan)
+    _patch_manager(monkeypatch)
+
+    def fake_worker(*args, on_tokens=None, **kwargs):
+        on_tokens(10, 2)
+        return SimpleNamespace(passed=True, error=""), ["bulk"], ["p"]
+
+    monkeypatch.setattr(fanout_mod, "run_verified_task", fake_worker)
+    monkeypatch.setattr(fanout_mod, "_run_tests_in", lambda *a: ("ok", 0))
+
+    result = run_fanout(app, "x")
+
+    assert (result.input_tokens, result.output_tokens) == (29, 7)
 
 
 # --- WorktreeManager merge primitives ------------------------------------------

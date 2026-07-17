@@ -109,7 +109,7 @@ class WorktreeManager:
         subtask is reported as a conflict rather than aborting the whole fan-out.
         """
         if not patch.strip():
-            return True
+            return False
 
         # Plain apply first -- clean and atomic; on any conflict it changes nothing.
         # Stage the result so the index tracks accumulated merges: git apply --3way

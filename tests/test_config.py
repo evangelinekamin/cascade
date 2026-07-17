@@ -360,3 +360,44 @@ def test_memory_config_invalid_values_are_sanitized():
         assert cfg["summary_turn_interval"] == 1
         assert cfg["summary_max_chars"] == 400
         assert cfg["summary_provider"] == "auto"
+
+
+def test_orchestration_defaults_use_cerebras_through_openrouter():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = ConfigManager(str(Path(tmpdir) / "config.yaml"))
+
+        cfg = manager.get_orchestration_config()
+
+        assert cfg["enabled"] is True
+        assert cfg["modes"] == ["design", "plan", "build", "test"]
+        assert cfg["router_provider"] == "openrouter"
+        assert cfg["router_model"] == "openai/gpt-oss-120b"
+        assert cfg["recon_provider"] == "openrouter"
+        assert cfg["recon_model"] == "openai/gpt-oss-120b"
+        assert cfg["fast_provider"] == "openrouter"
+        assert cfg["fast_model"] == "inception/mercury-2"
+        assert cfg["fast_provider_preferences"] == {
+            "allow_fallbacks": True,
+            "require_parameters": True,
+        }
+        assert cfg["provider_preferences"] == {
+            "order": ["cerebras"],
+            "allow_fallbacks": True,
+            "require_parameters": True,
+        }
+
+
+def test_orchestration_config_sanitizes_modes_preferences_and_rounds():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = ConfigManager(str(Path(tmpdir) / "config.yaml"))
+        manager.data["orchestration"] = {
+            "modes": ["BUILD", "invalid"],
+            "provider_preferences": "bad",
+            "recon_max_rounds": 999,
+        }
+
+        cfg = manager.get_orchestration_config()
+
+        assert cfg["modes"] == ["build"]
+        assert cfg["provider_preferences"]["order"] == ["cerebras"]
+        assert cfg["recon_max_rounds"] == 20

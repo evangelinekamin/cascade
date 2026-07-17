@@ -148,6 +148,32 @@ class ConfigManager:
                     "audit": "",
                 },
             },
+            "orchestration": {
+                # Normal prompts in these modes are classified into chat,
+                # read-only reconnaissance, focused solve, sequential pipeline,
+                # or safe fanout. Slash commands remain useful as debug controls.
+                "enabled": True,
+                "modes": ["design", "plan", "build", "test"],
+                "router_provider": "openrouter",
+                "router_model": "openai/gpt-oss-120b",
+                "recon_provider": "openrouter",
+                "recon_model": "openai/gpt-oss-120b",
+                "fast_provider": "openrouter",
+                "fast_model": "inception/mercury-2",
+                "fast_provider_preferences": {
+                    "allow_fallbacks": True,
+                    "require_parameters": True,
+                },
+                "provider_preferences": {
+                    # Cerebras is selected through OpenRouter, not configured as
+                    # a separate Cascade provider. Other hosts may take over when
+                    # it is unavailable, but only if they support required params.
+                    "order": ["cerebras"],
+                    "allow_fallbacks": True,
+                    "require_parameters": True,
+                },
+                "recon_max_rounds": 10,
+            },
             "integrations": {
                 "shannon": {
                     "path": "",
@@ -387,6 +413,69 @@ class ConfigManager:
         }
         config = self.data.get("workflows", {})
         return {**defaults, **config} if config else defaults
+
+    def get_orchestration_config(self) -> Dict[str, Any]:
+        """Return sanitized automatic workflow-routing configuration."""
+        defaults: Dict[str, Any] = {
+            "enabled": True,
+            "modes": ["design", "plan", "build", "test"],
+            "router_provider": "openrouter",
+            "router_model": "openai/gpt-oss-120b",
+            "recon_provider": "openrouter",
+            "recon_model": "openai/gpt-oss-120b",
+            "fast_provider": "openrouter",
+            "fast_model": "inception/mercury-2",
+            "fast_provider_preferences": {
+                "allow_fallbacks": True,
+                "require_parameters": True,
+            },
+            "provider_preferences": {
+                "order": ["cerebras"],
+                "allow_fallbacks": True,
+                "require_parameters": True,
+            },
+            "recon_max_rounds": 10,
+        }
+        raw = self.data.get("orchestration", {})
+        merged = {**defaults, **(raw if isinstance(raw, dict) else {})}
+        merged["enabled"] = bool(merged.get("enabled", True))
+
+        raw_modes = merged.get("modes", defaults["modes"])
+        if not isinstance(raw_modes, (list, tuple)):
+            raw_modes = defaults["modes"]
+        modes = [
+            str(mode).strip().lower()
+            for mode in raw_modes
+            if str(mode).strip().lower() in MODE_CYCLE
+        ]
+        merged["modes"] = modes or list(defaults["modes"])
+
+        for key in (
+            "router_provider",
+            "router_model",
+            "recon_provider",
+            "recon_model",
+            "fast_provider",
+            "fast_model",
+        ):
+            value = str(merged.get(key, defaults[key]) or "").strip()
+            merged[key] = value or defaults[key]
+
+        preferences = merged.get("provider_preferences")
+        if not isinstance(preferences, dict):
+            preferences = defaults["provider_preferences"]
+        merged["provider_preferences"] = dict(preferences)
+        fast_preferences = merged.get("fast_provider_preferences")
+        if not isinstance(fast_preferences, dict):
+            fast_preferences = defaults["fast_provider_preferences"]
+        merged["fast_provider_preferences"] = dict(fast_preferences)
+
+        try:
+            rounds = int(merged.get("recon_max_rounds", 10))
+        except (TypeError, ValueError):
+            rounds = 10
+        merged["recon_max_rounds"] = max(1, min(rounds, 20))
+        return merged
 
     def get_integrations_config(self) -> Dict[str, Any]:
         """Get integrations configuration."""

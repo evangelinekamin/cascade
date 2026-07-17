@@ -104,6 +104,30 @@ def test_workspace_read_tools_are_concurrency_safe():
         assert tools["run_command"].concurrency_safe is False
 
 
+def test_read_only_workspace_tools_exclude_mutation_and_shell():
+    with tempfile.TemporaryDirectory() as root:
+        tools = WorkspaceTools(root).build_read_only()
+        assert set(tools) == {"read_file", "list_files", "search_files"}
+        assert all(tool.concurrency_safe for tool in tools.values())
+
+
+def test_search_files_returns_bounded_literal_matches():
+    with tempfile.TemporaryDirectory() as root:
+        tools = WorkspaceTools(root)
+        tools.write_file("src/a.py", "Needle = 1\nother = 2\n")
+        tools.write_file("src/b.txt", "a needle appears here\n")
+
+        matches = tools.search_files("needle", "src", "*.py")
+
+        assert matches == ["src/a.py:1: Needle = 1"]
+
+
+def test_search_files_rejects_escaping_glob():
+    with tempfile.TemporaryDirectory() as root:
+        result = WorkspaceTools(root).search_files("secret", file_glob="../*")
+        assert result == ["Error: unsafe file_glob: ../*"]
+
+
 def test_run_command_returns_stdout():
     with tempfile.TemporaryDirectory() as root:
         out = WorkspaceTools(root).run_command("echo hi")

@@ -1642,7 +1642,7 @@ class CommandHandler:
                 if result.error and result.iterations == 0 and not result.passed:
                     lines = [f"Solve could not start on {result.provider}"]
                 else:
-                    outcome = "PASSED" if result.passed else "FAILED"
+                    outcome = result.outcome.value.upper()
                     lines = [
                         f"Solve {outcome} after {result.iterations} "
                         f"iteration(s) on {result.provider}"
@@ -1670,6 +1670,9 @@ class CommandHandler:
                         f"Tokens: {result.input_tokens:,} in / "
                         f"{result.output_tokens:,} out"
                     )
+                cost = float(getattr(result, "cost", 0.0) or 0.0)
+                if cost:
+                    lines.append(f"OpenRouter cost: {cost:.6f} credits")
                 if result.error:
                     lines.append(f"Error: {result.error}")
                     if "did not run" in result.error:
@@ -1699,7 +1702,7 @@ class CommandHandler:
                     solve_log += ["", "== verified diff =="] + result.diff_excerpt.splitlines()
                 self._last_solve_log = solve_log
                 self._last_solve_title = (
-                    f"/solve  {'PASSED' if result.passed else 'FAILED'}  -  {objective[:60]}"
+                    f"/solve  {result.outcome.value.upper()}  -  {objective[:60]}"
                 )
             except Exception as e:
                 _call_ui(self._clear_progress_indicator, progress)
@@ -1707,7 +1710,7 @@ class CommandHandler:
                 _call_ui(self._record_history_message, "system", f"Solve error: {e}")
 
         screen = self.app.screen
-        screen.run_worker(_worker, thread=True, exclusive=False)
+        screen.run_worker(_worker, thread=True, exclusive=True)
 
     def _cmd_pipeline(self, args: list[str]) -> None:
         """Decompose a build into ordered steps, each run as a verified worker."""
@@ -1751,7 +1754,7 @@ class CommandHandler:
                 )
 
                 passed_steps = sum(1 for s in result.steps if s.passed)
-                outcome = "PASSED" if result.passed else "FAILED"
+                outcome = result.outcome.value.upper()
                 lines = [
                     f"Pipeline {outcome}: {passed_steps}/{len(result.steps)} "
                     f"steps verified on {result.provider}"
@@ -1763,6 +1766,16 @@ class CommandHandler:
                     lines.append(
                         f"  [{step.id}] {mark} ({step.iterations} iter): {step.description}"
                     )
+                    if step.error:
+                        lines.append(f"    {step.error}")
+                if result.input_tokens or result.output_tokens:
+                    lines.append(
+                        f"Tokens: {result.input_tokens:,} in / "
+                        f"{result.output_tokens:,} out"
+                    )
+                cost = float(getattr(result, "cost", 0.0) or 0.0)
+                if cost:
+                    lines.append(f"OpenRouter cost: {cost:.6f} credits")
                 if result.diff_stat:
                     # The per-file stat is the compact "what changed" -- keep it;
                     # the full diff stays in the worktree rather than flooding chat.
@@ -1783,7 +1796,7 @@ class CommandHandler:
                 _call_ui(self._record_history_message, "system", f"Pipeline error: {e}")
 
         screen = self.app.screen
-        screen.run_worker(_worker, thread=True, exclusive=False)
+        screen.run_worker(_worker, thread=True, exclusive=True)
 
     def _cmd_fanout(self, args: list[str]) -> None:
         """Decompose into independent subtasks, build each verified, merge the result."""
@@ -1826,7 +1839,7 @@ class CommandHandler:
                 )
 
                 merged = sum(1 for s in result.subs if s.integrated)
-                outcome = "PASSED" if result.passed else "FAILED"
+                outcome = result.outcome.value.upper()
                 lines = [
                     f"Fanout {outcome}: {merged}/{len(result.subs)} "
                     f"subtasks merged + verified on {result.provider}"
@@ -1836,6 +1849,16 @@ class CommandHandler:
                 for sub in result.subs:
                     mark = "MERGED" if sub.integrated else ("CONFLICT" if sub.passed else "FAIL")
                     lines.append(f"  [{sub.id}] {mark}: {sub.description}")
+                    if sub.error:
+                        lines.append(f"    {sub.error}")
+                if result.input_tokens or result.output_tokens:
+                    lines.append(
+                        f"Tokens: {result.input_tokens:,} in / "
+                        f"{result.output_tokens:,} out"
+                    )
+                cost = float(getattr(result, "cost", 0.0) or 0.0)
+                if cost:
+                    lines.append(f"OpenRouter cost: {cost:.6f} credits")
                 if result.diff_stat:
                     lines.append(result.diff_stat.strip())
                 elif result.changed_files:
@@ -1854,7 +1877,7 @@ class CommandHandler:
                 _call_ui(self._record_history_message, "system", f"Fanout error: {e}")
 
         screen = self.app.screen
-        screen.run_worker(_worker, thread=True, exclusive=False)
+        screen.run_worker(_worker, thread=True, exclusive=True)
 
     def _cmd_compete(self, args: list[str]) -> None:
         """Run the same task across providers and let a judge pick a winner."""

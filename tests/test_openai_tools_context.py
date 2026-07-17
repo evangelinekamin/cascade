@@ -14,6 +14,8 @@ three defences that keep the loop inside a model's window:
 import json
 from unittest.mock import patch
 
+import pytest
+
 from cascade.providers._openai_tools import (
     _compact_messages_to_budget,
     _estimate_tokens,
@@ -457,3 +459,30 @@ def test_loop_omits_provider_field_when_preferences_none():
         context_window=200000,
     )
     assert "provider" not in client.payloads[0]
+
+
+def test_loop_raises_on_top_level_in_band_provider_error():
+    client = _FakeClient([{
+        "error": {
+            "code": 429,
+            "message": "provider overloaded",
+            "metadata": {"error_type": "provider_overloaded"},
+        },
+        "choices": [],
+    }])
+
+    with pytest.raises(RuntimeError, match="provider_overloaded"):
+        _run_loop(client, {}, context_window=200000)
+
+
+def test_loop_raises_on_choice_error_after_generation_started():
+    client = _FakeClient([{
+        "choices": [{
+            "message": {"content": "partial"},
+            "finish_reason": "error",
+            "error": {"code": 502, "message": "provider disconnected"},
+        }],
+    }])
+
+    with pytest.raises(RuntimeError, match="provider disconnected"):
+        _run_loop(client, {}, context_window=200000)
