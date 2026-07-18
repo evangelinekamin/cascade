@@ -44,6 +44,9 @@ class MainScreen(Screen):
 
     _STREAM_BATCH_INTERVAL_SECONDS = 0.03
     _STREAM_BATCH_MAX_CHARS = 1024
+    # A stream pause longer than this, right after a sentence, becomes a paragraph
+    # break -- a model that pauses between thoughts then reads as separate paragraphs.
+    _PAUSE_NEWLINE_SECONDS = 0.8
     # Tool-using chat is a light agent: more than the 5-round default so a model
     # can read a few files before answering, but well under /solve's 15 -- chat is
     # not a verified build, and big edit-test-commit tasks belong in /solve.
@@ -701,8 +704,18 @@ class MainScreen(Screen):
             cancellation_scope = getattr(prov, "cancellation_scope", None)
             scope = cancellation_scope(live_run.token) if callable(cancellation_scope) else nullcontext()
             with scope:
+                last_time = time.monotonic()
+                ended_sentence = False
                 for chunk in self._coalesce_stream_chunks(prov.stream(messages, final_system)):
                     live_run.checkpoint()
+                    now = time.monotonic()
+                    chunk = self._pause_paragraph_break(
+                        chunk, ended_sentence, now - last_time, self._PAUSE_NEWLINE_SECONDS
+                    )
+                    last_time = now
+                    stripped = chunk.rstrip()
+                    if stripped:
+                        ended_sentence = stripped[-1] in ".!?:"
                     full_response.append(chunk)
                     self._emit_for_run(run, self._on_stream_chunk, chunk)
 
@@ -760,6 +773,20 @@ class MainScreen(Screen):
             live_run.add_cost(float(getattr(prov, "last_cost", None) or 0.0))
             live_run.finish(RunOutcome.FAILED, error=str(e))
             self._emit_for_run(run, self._on_stream_error, str(e), terminal=True)
+
+    @staticmethod
+    def _pause_paragraph_break(
+        chunk: str, ended_sentence: bool, gap: float, threshold: float
+    ) -> str:
+        """Prefix *chunk* with a paragraph break after a long, sentence-ending pause.
+
+        A model that stops between thoughts then reads as separate paragraphs. Only
+        breaks when the previous text ended a sentence (``.!?:``) -- never mid-sentence
+        -- and never doubles an existing leading newline, so it can't mangle output.
+        """
+        if ended_sentence and gap > threshold and not chunk.startswith("\n"):
+            return "\n\n" + chunk
+        return chunk
 
     @classmethod
     def _coalesce_stream_chunks(cls, chunks: Iterator[str]) -> Iterator[str]:
