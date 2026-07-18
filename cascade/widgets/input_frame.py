@@ -258,8 +258,10 @@ class ModeIndicator(Static):
         provider = MODES.get(self._mode, {"provider": "gemini"})["provider"]
         accent = get_accent(provider)
         t = Text()
-        t.append("\u2500\u2500\u2500 ", style=f"dim {PALETTE.text_muted}")
+        # Frame the mode name in its own accent (the dashes were double-dimmed to
+        # near-black); the bold name still stands out against the plain-weight rule.
+        t.append("\u2500\u2500\u2500 ", style=accent)
         t.append(self._mode, style=f"bold {accent}")
-        t.append(" \u2500\u2500\u2500 ", style=f"dim {PALETTE.text_muted}")
+        t.append(" \u2500\u2500\u2500 ", style=accent)
         t.append("shift+tab", style=f"dim {PALETTE.text_dim}")
         return t
