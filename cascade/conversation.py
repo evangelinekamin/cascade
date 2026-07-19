@@ -14,6 +14,11 @@ from typing import TYPE_CHECKING
 from .context.budget import compact_threshold, current_tokens, window_for
 from .episodes import Episode, compact_to_episodes, episodes_to_context
 
+# Raw messages kept in the provider payload; older turns must be carried
+# by compaction episodes, so exceeding this is itself a compaction trigger
+# (otherwise the clip in state_messages_to_provider silently drops them).
+RAW_MESSAGE_WINDOW = 40
+
 if TYPE_CHECKING:
     from .providers.usage import Usage
     from .state import ChatMessage
@@ -56,7 +61,7 @@ def state_messages_to_provider(
     target_provider: str,
     policy: str = "summary",
     episodes: list[Episode] | None = None,
-    max_messages: int = 40,
+    max_messages: int = RAW_MESSAGE_WINDOW,
     max_chars: int = 80_000,
 ) -> list["Message"]:
     """Convert CascadeState messages to provider-ready message list.
@@ -132,6 +137,29 @@ def state_messages_to_provider(
 def estimate_tokens(messages: list["Message"]) -> int:
     """Rough token estimate. ~1 token per 4 chars for English text."""
     return sum(len(m.get("content", "")) for m in messages) // 4
+
+
+def should_compact(
+    chat_messages: list["ChatMessage"],
+    provider: str,
+    model: str = "",
+    configured_window: int | None = None,
+    anchor: "Usage | None" = None,
+) -> bool:
+    """Compaction decision for the live conversation (pre-clip).
+
+    Fires when token occupancy (anchored on the last round's real usage
+    plus a chars/4 estimate) exceeds the window's compaction threshold,
+    OR when the active message count exceeds RAW_MESSAGE_WINDOW — beyond
+    which state_messages_to_provider would silently drop turns that no
+    episode carries yet.
+    """
+    active = [m for m in chat_messages if not m.metadata.get("compacted")]
+    if len(active) > RAW_MESSAGE_WINDOW:
+        return True
+    window = window_for(provider, model, configured_window)
+    chars = sum(len(m.content) for m in active)
+    return current_tokens(anchor, chars) > compact_threshold(window)
 
 
 def needs_compaction(

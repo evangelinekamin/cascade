@@ -473,24 +473,25 @@ class MainScreen(Screen):
 
         # Build conversation history from state, injecting episodes
         from ..conversation import (
-            state_messages_to_provider, needs_compaction,
+            state_messages_to_provider, should_compact,
             compact_messages, compact_messages_with_episodes,
         )
+        from ..episodes import prune_live_episodes
 
-        # Episode-based compaction: if approaching context limit, convert
-        # old messages to episodes instead of burning tokens on summarization
+        # Episode-based compaction BEFORE building the payload: convert old
+        # turns to episodes when real occupancy crosses the threshold or the
+        # raw window would silently clip them. Anchored on the last round's
+        # actual usage; the tail is a chars/4 estimate.
         chat_messages = list(self.app.state.messages)
         episode_list = list(self.app.state.episodes)
 
-        messages = state_messages_to_provider(
-            messages=chat_messages,
-            target_provider=provider_name,
-            policy=self._memory_policy,
-            episodes=episode_list if episode_list else None,
-        )
-
-        # Auto-compact with episodes if approaching context window limit
-        if messages and needs_compaction(messages, provider_name):
+        if chat_messages and should_compact(
+            chat_messages,
+            provider_name,
+            model=prov.config.model or "",
+            configured_window=prov.config.context_window,
+            anchor=prov.last_round_usage,
+        ):
             try:
                 active_messages = [
                     msg for msg in chat_messages
@@ -500,26 +501,30 @@ class MainScreen(Screen):
                     chat_messages, keep_recent=6,
                 )
                 compacted_count = max(len(active_messages) - len(remaining), 0)
-                _call(
-                    self.app.state.apply_episode_compaction,
-                    compacted_count,
-                    new_episodes,
-                )
-                # Rebuild messages with the new episodes
-                all_episodes = episode_list + new_episodes
-                messages = state_messages_to_provider(
-                    messages=remaining,
-                    target_provider=provider_name,
-                    policy=self._memory_policy,
-                            episodes=all_episodes,
-                )
+                if compacted_count > 0 or new_episodes:
+                    kept_exchanges = sum(1 for m in remaining if m.role == "you")
+                    _call(
+                        self.app.state.apply_episode_compaction,
+                        compacted_count,
+                        new_episodes,
+                    )
+                    _call(self.app.state.prune_live_episodes, kept_exchanges)
+                    # Mirror the state change locally: this worker builds the
+                    # payload from its own snapshot, not by re-reading state.
+                    episode_list = prune_live_episodes(
+                        episode_list, kept_exchanges,
+                    ) + new_episodes
+                    chat_messages = remaining
             except Exception as ep_err:
                 import logging
                 logging.getLogger("cascade").warning("Episode compaction failed: %s", ep_err)
-                try:
-                    messages = compact_messages(messages, prov, keep_recent=6)
-                except Exception as legacy_err:
-                    logging.getLogger("cascade").warning("Legacy compaction also failed: %s", legacy_err)
+
+        messages = state_messages_to_provider(
+            messages=chat_messages,
+            target_provider=provider_name,
+            policy=self._memory_policy,
+            episodes=episode_list if episode_list else None,
+        )
 
         # Run BEFORE_ASK hooks (legacy)
         cli_app.hook_runner.run_hooks(HookEvent.BEFORE_ASK, context={

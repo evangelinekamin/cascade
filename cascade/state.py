@@ -194,6 +194,12 @@ class CascadeState:
 
         self.episodes.extend(episodes)
 
+    def prune_live_episodes(self, keep_last: int) -> None:
+        """Drop live episodes superseded by compaction (see episodes module)."""
+        from .episodes import prune_live_episodes
+
+        self.episodes = prune_live_episodes(self.episodes, keep_last)
+
     def post_stream_chunk(self, provider: str, chunk: str, done: bool = False) -> None:
         self._post(StreamChunk(provider, chunk, done))
 

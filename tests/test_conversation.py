@@ -305,3 +305,100 @@ def test_off_policy_restricts_episodes_to_own_provider():
     assert "Done here." in contents
     assert "Winner output." in contents
     assert "Done elsewhere." not in contents
+
+
+class TestShouldCompact:
+    """Pre-clip compaction trigger: token threshold OR raw-window overflow."""
+
+    @staticmethod
+    def _turns(n, content="hello world, a normal short message"):
+        out = []
+        for i in range(n):
+            out.append(ChatMessage(role="you", content=f"[turn {i}] {content}"))
+            out.append(ChatMessage(role="claude", content=f"[reply {i}] {content}"))
+        return out
+
+    def test_small_conversation_does_not_compact(self):
+        from cascade.conversation import should_compact
+        assert should_compact(self._turns(5), "claude") is False
+
+    def test_more_than_raw_window_active_messages_compacts(self):
+        """Beyond RAW_MESSAGE_WINDOW the clip would silently drop turns."""
+        from cascade.conversation import should_compact
+        assert should_compact(self._turns(21), "claude") is True  # 42 messages
+
+    def test_compacted_messages_do_not_count_toward_the_window(self):
+        from cascade.conversation import should_compact
+        msgs = self._turns(21)
+        for m in msgs[:10]:
+            m.metadata["compacted"] = True
+        assert should_compact(msgs, "claude") is False
+
+    def test_anchor_occupancy_triggers_before_char_estimate_would(self):
+        from cascade.conversation import should_compact
+        from cascade.providers.usage import Usage
+
+        msgs = self._turns(3)  # tiny tail
+        anchor = Usage(input=100_000, output=2_000, cache_read=75_000)
+        # claude window 200k -> threshold 171k; anchored total 177k exceeds it
+        assert should_compact(msgs, "claude", anchor=anchor) is True
+        assert should_compact(msgs, "claude") is False
+
+
+def test_long_conversation_retains_old_context_via_compaction_episodes():
+    """Regression: >40-message chats must not amnesia turns beyond the clip.
+
+    Mirrors the worker sequence: should_compact -> episode compaction ->
+    live-episode pruning -> payload build. The old topic must survive into
+    the provider payload through the episode block.
+    """
+    from cascade.conversation import (
+        compact_messages_with_episodes,
+        should_compact,
+        state_messages_to_provider,
+    )
+    from cascade.episodes import generate_episode, prune_live_episodes
+
+    messages = []
+    episodes = []
+    for i in range(25):
+        user = f"topic-{i}: please work on feature_{i}.py"
+        reply = f"Done with feature_{i}.py implementation."
+        messages.append(ChatMessage(role="you", content=user))
+        messages.append(ChatMessage(role="claude", content=reply))
+        episodes.append(generate_episode(user, reply, "claude"))
+
+    assert should_compact(messages, "claude") is True
+
+    new_episodes, remaining = compact_messages_with_episodes(messages, keep_recent=6)
+    kept_exchanges = sum(1 for m in remaining if m.role == "you")
+    episodes = prune_live_episodes(episodes, kept_exchanges) + new_episodes
+    for m in messages[:-6]:
+        m.metadata["compacted"] = True
+
+    payload = state_messages_to_provider(
+        messages, "claude", policy="summary", episodes=episodes,
+    )
+    contents = " ".join(m["content"] for m in payload)
+    assert "[Prior session context]" in contents
+    # Newest-first rendering under the char cap keeps recent compacted
+    # topics; a mid-history topic well beyond the raw window must survive.
+    assert "topic-20" in contents
+    # And the kept raw tail is not duplicated by its own live episodes.
+    assert contents.count("Done with feature_24.py implementation.") == 1
+
+
+def test_prune_live_episodes_keeps_non_live_and_recent_live():
+    from cascade.episodes import generate_episode, prune_live_episodes
+
+    eps = [
+        generate_episode("old live 1", "done", "claude"),
+        generate_episode("compacted", "done", "claude", source="compaction"),
+        generate_episode("old live 2", "done", "gemini"),
+        generate_episode("recent live", "done", "claude"),
+    ]
+    pruned = prune_live_episodes(eps, keep_last=1)
+    objectives = [ep.objective for ep in pruned]
+    assert objectives == ["compacted", "recent live"]
+
+    assert [ep.objective for ep in prune_live_episodes(eps, keep_last=0)] == ["compacted"]

@@ -249,6 +249,22 @@ def episodes_to_context(episodes: list[Episode], max_chars: int = 4000) -> str:
     return header + "\n\n" + "\n\n".join(blocks)
 
 
+def prune_live_episodes(
+    episodes: list[Episode],
+    keep_last: int,
+) -> list[Episode]:
+    """Drop live episodes superseded by compaction, order-preserving.
+
+    After compaction, old turns are carried by their new "compaction"
+    episodes; the per-turn live episodes covering them are redundant.
+    Keeps every non-live episode plus the last ``keep_last`` live ones
+    (those mirroring the raw turns that were kept).
+    """
+    live_indices = [i for i, ep in enumerate(episodes) if ep.source == "live"]
+    drop = set(live_indices[:-keep_last] if keep_last > 0 else live_indices)
+    return [ep for i, ep in enumerate(episodes) if i not in drop]
+
+
 def compact_to_episodes(
     messages: list["ChatMessage"],
     keep_recent: int = 6,

@@ -1242,6 +1242,7 @@ class CommandHandler:
             self.app.notify("Nothing to compact (6 or fewer active messages)")
             return
         state.apply_episode_compaction(compacted_count, episodes)
+        state.prune_live_episodes(sum(1 for m in remaining if m.role == "you"))
         self.app.notify(
             f"Compacted {compacted_count} messages into {len(episodes)} episodes"
             f" (kept last {len(remaining)})"
@@ -1331,6 +1332,9 @@ class CommandHandler:
                 )
                 compacted_count = max(len(self.app.state.messages) - len(remaining), 0)
                 self.app.state.apply_episode_compaction(compacted_count, new_episodes)
+                self.app.state.prune_live_episodes(
+                    sum(1 for m in remaining if m.role == "you")
+                )
             except Exception:
                 pass
 
