@@ -3,6 +3,7 @@
 from .base import BasePlugin
 from .file_ops import FileOpsPlugin
 from .execution import ExecPlugin
+from .web_fetch import WebPlugin
 from .registry import register_plugin, get_plugin_registry
 
 # Import reflection plugin to trigger registration
@@ -12,6 +13,7 @@ __all__ = [
     "BasePlugin",
     "FileOpsPlugin",
     "ExecPlugin",
+    "WebPlugin",
     "ReflectionPlugin",
     "register_plugin",
     "get_plugin_registry",

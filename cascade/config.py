@@ -139,6 +139,8 @@ class ConfigManager:
                 # Opt-in shell tool for direct-API chat models (test/build).
                 # Off by default -- it runs real commands in the launch dir.
                 "exec": False,
+                # Opt-in local web fetch (permission-gated network egress).
+                "web": False,
             },
             "workflows": {
                 "verify": {
@@ -420,6 +422,7 @@ class ConfigManager:
             "reflection": True,
             "file_ops": True,
             "exec": False,
+            "web": False,
         }
         config = self.data.get("tools", {})
         return {**defaults, **config} if config else defaults

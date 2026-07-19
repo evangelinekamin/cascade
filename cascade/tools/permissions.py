@@ -78,6 +78,19 @@ _NEVER_AUTO_SHELL = (
     re.compile(r":\(\)\s*\{"),
 )
 
+# Read-only documentation hosts auto-approved for web_fetch under the auto
+# posture -- GET-only reference material, the low-risk egress case.
+PREAPPROVED_FETCH_DOMAINS = (
+    "docs.python.org",
+    "developer.mozilla.org",
+    "docs.rs",
+    "pkg.go.dev",
+    "readthedocs.io",
+    "docs.github.com",
+    "peps.python.org",
+    "man7.org",
+)
+
 _SHELL_SPLIT = re.compile(r"(?<!\|)\|(?!\|)|\|\||&&|;")
 
 _RULE_RE = re.compile(r"^\s*([A-Za-z_][\w-]*)\s*(?:\((.*)\))?\s*$")
@@ -125,6 +138,16 @@ def _primary_arg(tool_name: str, arguments: dict) -> str:
         if isinstance(value, str) and value:
             return value
     return ""
+
+
+def _url_host(url: str) -> str:
+    """Lowercased hostname of a URL, for domain-scoped fetch rules."""
+    from urllib.parse import urlsplit
+
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
 
 
 def _touches_sacred(text: str) -> Optional[str]:
@@ -210,13 +233,33 @@ class PermissionEngine:
             if rule.matches(tool_name, primary):
                 return Verdict("deny", f"deny rule {rule.tool}", "deny-rule")
 
+        is_fetch = tool_name in ("web_fetch", "web_search") or "url" in arguments
         is_shell = "command" in arguments and isinstance(arguments.get("command"), str)
-        is_write = self._is_write_tool(tool, tool_name)
+        is_write = self._is_write_tool(tool, tool_name) and not is_fetch
 
         if (is_shell or is_write) and (hit := _touches_sacred(primary)):
             return Verdict(
                 "ask", f"touches sacred path ({hit})", "sacred",
             )
+
+        # Network egress: gated separately from filesystem writes (it is the
+        # primary exfiltration lever). Auto-approve only preapproved
+        # read-only docs domains; every other host asks once.
+        if is_fetch:
+            for rule in self._ask:
+                if rule.matches(tool_name, primary):
+                    return Verdict("ask", f"ask rule {rule.tool}", "ask-rule")
+            host = _url_host(primary)
+            if self._grant_key(tool_name, host) in self._session_grants:
+                return Verdict("allow", "host granted this session", "session-grant")
+            for rule in self._allow:
+                if rule.matches(tool_name, primary) or rule.matches(tool_name, host):
+                    return Verdict("allow", f"allow rule {rule.tool}", "allow-rule")
+            if host and any(host == d or host.endswith("." + d) for d in PREAPPROVED_FETCH_DOMAINS):
+                return Verdict("allow", f"preapproved docs domain ({host})", "docs-allowlist")
+            if self.posture == "readonly":
+                return Verdict("deny", "readonly posture blocks network egress", "posture")
+            return Verdict("ask", f"fetch from {host or 'unknown host'}", "network")
 
         if is_shell:
             # Whole command first (pipe-spanning patterns like curl|sh are
@@ -281,6 +324,10 @@ class PermissionEngine:
         verdict = self.evaluate(tool, tool_name, arguments)
         primary = _primary_arg(tool_name, arguments)
 
+        # Session grants for fetch are keyed by host, not the full URL, so
+        # "always allow docs.foo.com" covers every page on that host.
+        grant_arg = _url_host(primary) if verdict.rule == "network" else primary
+
         if verdict.decision == "ask":
             if self.ask_handler is not None:
                 answer = "deny"
@@ -289,7 +336,7 @@ class PermissionEngine:
                 except Exception:
                     answer = "deny"
                 if answer == "always":
-                    self.grant_session(tool_name, primary)
+                    self.grant_session(tool_name, grant_arg)
                     verdict = Verdict("allow", "approved (always this session)", verdict.rule)
                 elif answer == "allow":
                     verdict = Verdict("allow", "approved by user", verdict.rule)
