@@ -19,7 +19,7 @@ from ..episodes import Episode
 _DEFAULT_DB_PATH = "~/.config/cascade/history.db"
 
 # Bumped when _migrate() gains a new step. Guarded by PRAGMA user_version.
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class HistoryDB:
@@ -83,6 +83,23 @@ class HistoryDB:
                 );
                 CREATE INDEX IF NOT EXISTS idx_episodes_session
                     ON episodes(session_id, timestamp);
+            """)
+            self._conn.execute("PRAGMA user_version = 1")
+            self._conn.commit()
+            version = 1
+        if version < 2:
+            # Carried context lives in its OWN table: sessions.metadata is
+            # rewritten wholesale by BranchingSession._save_state on every
+            # recorded message, which silently wiped anything stored there.
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS session_context (
+                    session_id          TEXT PRIMARY KEY
+                                        REFERENCES sessions(id) ON DELETE CASCADE,
+                    compaction_summary  TEXT NOT NULL DEFAULT '',
+                    compacted_through   INTEGER NOT NULL DEFAULT 0,
+                    compaction_boundary TEXT NOT NULL DEFAULT '',
+                    compaction_count    INTEGER NOT NULL DEFAULT 0
+                );
             """)
             self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             self._conn.commit()
@@ -236,14 +253,19 @@ class HistoryDB:
         episodes: list[Episode],
         compaction_summary: str = "",
         compacted_through: int = 0,
+        compaction_boundary: str = "",
+        compaction_count: int = 0,
     ) -> None:
         """Snapshot the session's episode list, carried summary, and coverage.
 
         Replace-all semantics: the in-memory list is the source of truth
         (pruning must propagate), so the stored set always mirrors it.
-        ``compacted_through`` records how many leading messages were flagged
-        compacted at snapshot time -- resume re-marks exactly that many, so
-        turns the episodes do not cover are never hidden from the payload.
+        Coverage is stored two ways: ``compaction_boundary`` (content prefix
+        of the newest compacted chat message -- stable across the DB
+        round-trip) and ``compacted_through`` (count of compacted chat
+        messages, the fallback when the boundary is ambiguous). Stored in
+        session_context, never sessions.metadata -- the branching writer
+        rewrites that wholesale.
         """
         self._conn.execute(
             "DELETE FROM episodes WHERE session_id = ?", (session_id,)
@@ -263,21 +285,29 @@ class HistoryDB:
                 for ep in episodes
             ],
         )
-        row = self._conn.execute(
-            "SELECT metadata FROM sessions WHERE id = ?", (session_id,)
-        ).fetchone()
-        if row is not None:
-            meta = json.loads(row["metadata"] or "{}")
-            meta["compaction_summary"] = compaction_summary
-            meta["compacted_through"] = int(compacted_through)
-            self._conn.execute(
-                "UPDATE sessions SET metadata = ? WHERE id = ?",
-                (json.dumps(meta), session_id),
-            )
+        self._conn.execute(
+            "INSERT INTO session_context "
+            "(session_id, compaction_summary, compacted_through, "
+            " compaction_boundary, compaction_count) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "compaction_summary = excluded.compaction_summary, "
+            "compacted_through = excluded.compacted_through, "
+            "compaction_boundary = excluded.compaction_boundary, "
+            "compaction_count = excluded.compaction_count",
+            (
+                session_id, compaction_summary, int(compacted_through),
+                compaction_boundary, int(compaction_count),
+            ),
+        )
         self._conn.commit()
 
-    def load_context(self, session_id: str) -> tuple[list[Episode], str, int]:
-        """Load persisted episodes, carried summary, and compaction coverage."""
+    def load_context(self, session_id: str) -> dict:
+        """Load persisted context carry-over for a session.
+
+        Returns {episodes, compaction_summary, compacted_through,
+        compaction_boundary, compaction_count} with empty defaults.
+        """
         rows = self._conn.execute(
             "SELECT * FROM episodes WHERE session_id = ? ORDER BY timestamp ASC",
             (session_id,),
@@ -297,19 +327,22 @@ class HistoryDB:
             )
             for r in rows
         ]
-        session = self._conn.execute(
-            "SELECT metadata FROM sessions WHERE id = ?", (session_id,)
+        row = self._conn.execute(
+            "SELECT * FROM session_context WHERE session_id = ?", (session_id,)
         ).fetchone()
-        summary = ""
-        compacted_through = 0
-        if session is not None:
-            meta = json.loads(session["metadata"] or "{}")
-            summary = str(meta.get("compaction_summary") or "")
-            try:
-                compacted_through = int(meta.get("compacted_through") or 0)
-            except (TypeError, ValueError):
-                compacted_through = 0
-        return episodes, summary, compacted_through
+        out = {
+            "episodes": episodes,
+            "compaction_summary": "",
+            "compacted_through": 0,
+            "compaction_boundary": "",
+            "compaction_count": 0,
+        }
+        if row is not None:
+            out["compaction_summary"] = row["compaction_summary"] or ""
+            out["compacted_through"] = int(row["compacted_through"] or 0)
+            out["compaction_boundary"] = row["compaction_boundary"] or ""
+            out["compaction_count"] = int(row["compaction_count"] or 0)
+        return out
 
     # -- helpers --
 

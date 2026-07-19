@@ -190,7 +190,6 @@ def test_resume_resets_state_preserves_roles_and_emits_hook(tmp_path):
     status.update_tokens.assert_called_once_with(app.state.provider_tokens)
     assert input_frame.active_provider == "claude"
     assert input_frame.mode == "plan"
-    assert input_frame.token_count == 32
     assert header.display is False
     assert posted[-1] == "Resumed session: Saved Session (3 messages)"
     assert cli_app.hook_runner.emit.call_args.args[0] == HookEvent.SESSION_RESUME

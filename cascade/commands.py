@@ -1371,6 +1371,34 @@ class CommandHandler:
         lines.append("Use /resume <id> to continue a session.")
         self._post_system("\n".join(lines))
 
+    def _restore_compaction_coverage(self, boundary: str, count: int) -> None:
+        """Re-flag compacted messages on the rebuilt (DB-derived) list.
+
+        The live list and the DB round-trip differ in composition (command
+        lines, system rows), so a positional count alone is unreliable.
+        Primary key: the content prefix of the newest compacted chat message
+        (stable across the round-trip). Fallback: flag the first ``count``
+        chat messages oldest-first.
+        """
+        messages = self.app.state.messages
+        boundary_idx = -1
+        if boundary:
+            for i, m in enumerate(messages):
+                if m.role != "system" and m.content[:200] == boundary:
+                    boundary_idx = i
+        if boundary_idx >= 0:
+            for m in messages[: boundary_idx + 1]:
+                if m.role != "system":
+                    m.metadata["compacted"] = True
+            return
+        flagged = 0
+        for m in messages:
+            if flagged >= count:
+                break
+            if m.role != "system":
+                m.metadata["compacted"] = True
+                flagged += 1
+
     def _cmd_resume(self, args: list[str]) -> None:
         """Resume a previous session by loading its messages."""
         if not args:
@@ -1422,21 +1450,19 @@ class CommandHandler:
         # heuristic regeneration below cannot reproduce).
         restored = False
         try:
-            stored_episodes, stored_summary, compacted_through = (
-                self.app.db.load_context(session["id"])
-            )
-            if stored_episodes or stored_summary:
-                self.app.state.episodes = list(stored_episodes)
-                if stored_summary:
-                    self.app.state.set_compaction_summary(stored_summary)
-                # Re-mark exactly the coverage recorded at snapshot time:
-                # apply_episode_compaction flags oldest-first, so the first
-                # N messages are precisely the episode-carried ones. Turns
-                # after the last compaction stay raw (their live episodes
-                # were persisted too, and the window trigger handles growth).
-                count = min(compacted_through, len(self.app.state.messages))
-                for m in self.app.state.messages[:count]:
-                    m.metadata["compacted"] = True
+            stored = self.app.db.load_context(session["id"])
+            if stored["episodes"] or stored["compaction_summary"]:
+                self.app.state.episodes = list(stored["episodes"])
+                if stored["compaction_summary"]:
+                    self.app.state.set_compaction_summary(
+                        stored["compaction_summary"]
+                    )
+                self.app.state.compaction_count = int(
+                    stored["compaction_count"] or 0
+                )
+                self._restore_compaction_coverage(
+                    stored["compaction_boundary"], stored["compacted_through"],
+                )
                 restored = True
         except Exception:
             restored = False
@@ -1489,7 +1515,6 @@ class CommandHandler:
             frame = self.app.screen.query_one(InputFrame)
             frame.active_provider = self.app.state.active_provider
             frame.mode = self.app.state.mode
-            frame.token_count = self.app.state.total_tokens
             try:
                 self.app.screen.query_one(ProviderGhostTable).set_active(self.app.state.active_provider)
             except Exception:

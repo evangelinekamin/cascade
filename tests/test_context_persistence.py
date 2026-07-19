@@ -25,11 +25,16 @@ class TestContextPersistence:
             ]
             db.save_context(
                 session["id"], eps, "1. Primary Request: parser work",
-                compacted_through=12,
+                compacted_through=12, compaction_boundary="Fix cascade/state.py",
+                compaction_count=3,
             )
 
-            loaded, summary, compacted_through = db.load_context(session["id"])
-            assert compacted_through == 12
+            stored = db.load_context(session["id"])
+            loaded = stored["episodes"]
+            summary = stored["compaction_summary"]
+            assert stored["compacted_through"] == 12
+            assert stored["compaction_boundary"] == "Fix cascade/state.py"
+            assert stored["compaction_count"] == 3
             assert summary == "1. Primary Request: parser work"
             assert [e.objective for e in loaded] == [e.objective for e in eps]
             assert loaded[0].source == "compaction"
@@ -47,7 +52,8 @@ class TestContextPersistence:
             db.save_context(session["id"], first, "")
             db.save_context(session["id"], first[-2:], "kept summary")
 
-            loaded, summary, _ = db.load_context(session["id"])
+            stored = db.load_context(session["id"])
+            loaded, summary = stored["episodes"], stored["compaction_summary"]
             assert len(loaded) == 2
             assert summary == "kept summary"
             db.close()
@@ -56,10 +62,10 @@ class TestContextPersistence:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = _db(tmpdir)
             session = db.create_session()
-            loaded, summary, compacted_through = db.load_context(session["id"])
-            assert loaded == []
-            assert summary == ""
-            assert compacted_through == 0
+            stored = db.load_context(session["id"])
+            assert stored["episodes"] == []
+            assert stored["compaction_summary"] == ""
+            assert stored["compacted_through"] == 0
             db.close()
 
     def test_migration_is_idempotent_and_versioned(self):
@@ -67,14 +73,13 @@ class TestContextPersistence:
             path = str(Path(tmpdir) / "history.db")
             db = HistoryDB(path)
             version = db._conn.execute("PRAGMA user_version").fetchone()[0]
-            assert version >= 1
+            assert version >= 2
             db.close()
             # Re-opening must not fail or re-run migrations destructively
             db2 = HistoryDB(path)
             session = db2.create_session()
             db2.save_context(session["id"], [generate_episode("x", "y", "claude")], "s")
-            loaded, _, _ = db2.load_context(session["id"])
-            assert len(loaded) == 1
+            assert len(db2.load_context(session["id"])["episodes"]) == 1
             db2.close()
 
     def test_deleting_session_cascades_episodes(self):
@@ -86,3 +91,29 @@ class TestContextPersistence:
             rows = db._conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
             assert rows == 0
             db.close()
+
+
+    def test_branching_writes_cannot_clobber_carried_context(self):
+        """Regression (review-critical): BranchingSession rewrites
+        sessions.metadata wholesale on every recorded message; carried
+        context must live where that writer cannot touch it."""
+        from cascade.history.branching import BranchingSession
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = _db(tmpdir)
+            session = db.create_session(provider="claude")
+            db.save_context(
+                session["id"],
+                [generate_episode("x", "y", "claude", source="compaction")],
+                "TIER2 SUMMARY",
+                compacted_through=8,
+                compaction_boundary="x",
+                compaction_count=1,
+            )
+            bs = BranchingSession(db, session["id"])
+            bs.add_message(role="user", content="next message", provider="")
+
+            stored = db.load_context(session["id"])
+            assert stored["compaction_summary"] == "TIER2 SUMMARY"
+            assert stored["compacted_through"] == 8
+            assert stored["compaction_count"] == 1

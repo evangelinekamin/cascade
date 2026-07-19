@@ -298,14 +298,19 @@ class CascadeTUI(App):
         if self._db_session is None:
             return
         try:
-            compacted_through = sum(
-                1 for m in self.state.messages if m.metadata.get("compacted")
-            )
+            chat_roles = lambda m: m.role != "system"
+            compacted_chat = [
+                m for m in self.state.messages
+                if m.metadata.get("compacted") and chat_roles(m)
+            ]
+            boundary = compacted_chat[-1].content[:200] if compacted_chat else ""
             self.db.save_context(
                 self._db_session["id"],
                 list(self.state.episodes),
                 self.state.compaction_summary,
-                compacted_through=compacted_through,
+                compacted_through=len(compacted_chat),
+                compaction_boundary=boundary,
+                compaction_count=self.state.compaction_count,
             )
         except Exception:
             pass
