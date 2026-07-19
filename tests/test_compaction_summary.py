@@ -89,7 +89,7 @@ class TestSummarizeGuards:
 
         assert summarize_for_compaction(ask, _msgs(5)) is None
 
-    def test_failure_retries_once_with_reduced_range(self):
+    def test_overflow_failure_retries_with_reduced_range_and_visible_gap(self):
         calls = []
 
         def ask(prompt, system):
@@ -101,7 +101,25 @@ class TestSummarizeGuards:
         result = summarize_for_compaction(ask, _msgs(10))
         assert result is not None
         assert len(calls) == 2
-        assert "[earlier turns truncated" in calls[1]
+        # Halved range, and the gap is surfaced to the summarizer explicitly
+        assert "earlier turns were dropped" in calls[1]
+        assert len(calls[1]) < len(calls[0])
+
+    def test_transient_failure_retries_full_range(self):
+        """A network blip must not amputate half the conversation."""
+        calls = []
+
+        def ask(prompt, system):
+            calls.append(prompt)
+            if len(calls) == 1:
+                raise RuntimeError("connection reset by peer")
+            return "1. Primary Request and Intent\n" + "Solid summary content. " * 20
+
+        result = summarize_for_compaction(ask, _msgs(10))
+        assert result is not None
+        assert len(calls) == 2
+        assert calls[1] == calls[0]
+        assert "earlier turns were dropped" not in calls[1]
 
     def test_double_failure_returns_none(self):
         def ask(prompt, system):
@@ -153,3 +171,17 @@ class TestInjection:
         assert len(blocks) == 1
         assert "SUMMARY BODY" in blocks[0]["content"]
         assert "old task" in blocks[0]["content"]
+
+
+class TestPolicyGate:
+    def test_summary_never_injected_under_policy_off(self):
+        """policy 'off' opted out of cross-model context; the carried summary
+        mixes providers by construction and must respect that."""
+        msgs = [ChatMessage(role="you", content="continue")]
+        result = state_messages_to_provider(
+            msgs, "claude", policy="off",
+            compaction_summary="gemini-derived content " * 20,
+        )
+        contents = " ".join(m["content"] for m in result)
+        assert "gemini-derived" not in contents
+        assert "[Prior session context]" not in contents

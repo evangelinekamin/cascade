@@ -256,3 +256,26 @@ def test_condense_for_cli_marks_elision_and_respects_budget():
     assert "[turn 29]" in context
     assert "[turn 0]" not in context
     assert result.endswith("final request")
+
+
+def test_condense_for_cli_never_drops_context_blocks_under_budget_pressure():
+    """Review-critical regression: the episode/summary block is the sole
+    carrier of compacted history -- budget pressure must squeeze raw turns,
+    never the block."""
+    config = ProviderConfig(api_key="key", model="mock")
+    provider = MockProvider(config)
+    block = "[Prior session context]\n" + ("episode detail " * 2200)  # ~35k chars
+    messages = [{"role": "user", "content": block}]
+    messages += [
+        {"role": "assistant", "content": f"[turn {i}] " + "x" * 1_800}
+        for i in range(20)
+    ]
+    messages.append({"role": "user", "content": "final request"})
+
+    result = provider._condense_for_cli(messages)
+    context = result.split("Current request:")[0]
+    assert "[Prior session context]" in context
+    assert "episode detail" in context
+    # Raw turns shrank to the floor but the newest still made it in
+    assert "[turn 19]" in context
+    assert result.endswith("final request")

@@ -126,7 +126,9 @@ class ConfigManager:
                 # full    -> carry recent full transcript across providers
                 "cross_model_memory": "summary",
                 # Re-compact summary every N assistant turns in summary mode.
-                "summary_turn_interval": 6,
+                "compaction_summary": True,
+                "compaction_summary": True,
+            "summary_turn_interval": 6,
                 # Preferred provider to generate summaries (or "auto").
                 # Hard cap for compact summary text included in prompts.
                 "summary_max_chars": 1800,
@@ -379,6 +381,8 @@ class ConfigManager:
         except Exception:
             max_chars = 1800
         merged["summary_max_chars"] = max(400, max_chars)
+
+        merged["compaction_summary"] = bool(merged.get("compaction_summary", True))
 
 
         return merged

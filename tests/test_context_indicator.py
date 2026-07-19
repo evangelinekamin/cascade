@@ -106,3 +106,102 @@ class TestContextCommandOccupancy:
         handler._cmd_context([])
         assert "unknown" in posted[0]
         assert "since compaction" in posted[0]
+
+
+class TestSummaryBreaker:
+    """MainScreen._generate_compaction_summary guard behavior (review gap)."""
+
+    def _screen(self):
+        from cascade.screens.main import MainScreen
+
+        class _TestableScreen(MainScreen):
+            def __init__(self):  # bypass Screen/Textual initialization
+                self._compaction_summary_enabled = True
+                self._summary_failures = 0
+                self._mode = "plan"
+                self._fake_app = None
+
+            @property
+            def app(self):  # Screen.app is a read-only Textual property
+                return self._fake_app
+
+        return _TestableScreen()
+
+    def _prov_and_app(self, screen, ask_behavior):
+        from types import SimpleNamespace
+        from cascade.providers.base import ProviderConfig
+
+        class FakeProv:
+            def __init__(self, config):
+                self.config = config
+
+            def ask_single(self, prompt, system=None):
+                return ask_behavior(prompt)
+
+        prov = FakeProv(ProviderConfig(api_key="k", model="base-model"))
+        state = SimpleNamespace(compaction_summary="")
+        cli_app = SimpleNamespace(
+            config=SimpleNamespace(get_model_for=lambda p, m, fast=True: "fast-model"),
+        )
+        screen._fake_app = SimpleNamespace(state=state, cli_app=cli_app)
+        return prov
+
+    def _big_range(self):
+        from cascade.state import ChatMessage
+
+        return [ChatMessage(role="you", content="z" * 6000)]
+
+    def test_two_failures_trip_the_session_breaker(self):
+        screen = self._screen()
+
+        def fail(prompt):
+            raise RuntimeError("provider down")
+
+        prov = self._prov_and_app(screen, fail)
+        assert screen._generate_compaction_summary(prov, "claude", self._big_range()) is None
+        assert screen._compaction_summary_enabled is True
+        assert screen._generate_compaction_summary(prov, "claude", self._big_range()) is None
+        assert screen._compaction_summary_enabled is False
+        # Disabled: returns None without touching the provider
+        assert screen._generate_compaction_summary(prov, "claude", self._big_range()) is None
+
+    def test_small_range_does_not_count_as_failure(self):
+        from cascade.state import ChatMessage
+
+        screen = self._screen()
+        prov = self._prov_and_app(screen, lambda p: "x")
+        small = [ChatMessage(role="you", content="tiny")]
+        assert screen._generate_compaction_summary(prov, "claude", small) is None
+        assert screen._summary_failures == 0
+
+    def test_success_resets_failure_count_and_uses_fast_model(self):
+        seen = {}
+        screen = self._screen()
+
+        def ok(prompt):
+            return "1. Primary Request and Intent\n" + "Good content. " * 40
+
+        prov = self._prov_and_app(screen, ok)
+
+        original_type = type(prov)
+        built = {}
+        real_init = original_type.__init__
+
+        def spy_init(self, config):
+            built["model"] = config.model
+            built["max_tokens"] = config.max_tokens
+            real_init(self, config)
+
+        original_type.__init__ = spy_init
+        try:
+            screen._summary_failures = 1
+            result = screen._generate_compaction_summary(
+                prov, "claude", self._big_range(),
+            )
+        finally:
+            original_type.__init__ = real_init
+
+        assert result is not None
+        assert screen._summary_failures == 0
+        assert built["model"] == "fast-model"
+        assert built["max_tokens"] == 8000

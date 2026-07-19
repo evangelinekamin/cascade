@@ -136,6 +136,10 @@ class CascadeState:
     # -- Mutators ----------------------------------------------------------
 
     def set_provider(self, provider: str, mode: str) -> None:
+        if provider != self.active_provider:
+            # Occupancy is per-provider: pricing one provider's usage
+            # against another's window lies. Unknown until it responds.
+            self.context_anchor = None
         self.active_provider = provider
         self.mode = mode
         self._post(ProviderChanged(provider, mode))

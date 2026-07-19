@@ -402,3 +402,35 @@ def test_prune_live_episodes_keeps_non_live_and_recent_live():
     assert objectives == ["compacted", "recent live"]
 
     assert [ep.objective for ep in prune_live_episodes(eps, keep_last=0)] == ["compacted"]
+
+
+class TestUnsentTail:
+    def test_tail_counts_only_messages_after_last_provider_reply(self):
+        from cascade.conversation import unsent_tail_chars
+
+        msgs = _msgs(("you", "a" * 100), ("claude", "b" * 5000), ("you", "c" * 300))
+        assert unsent_tail_chars(msgs) == 300
+
+    def test_tail_zero_when_conversation_ends_with_provider(self):
+        from cascade.conversation import unsent_tail_chars
+
+        msgs = _msgs(("you", "a" * 100), ("claude", "b" * 5000))
+        assert unsent_tail_chars(msgs) == 0
+
+    def test_anchored_should_compact_does_not_double_count(self):
+        """Review finding: anchor + whole-list estimate diverged ~2x from
+        the displayed number and fired compaction early."""
+        from cascade.conversation import should_compact
+        from cascade.providers.usage import Usage
+
+        # 160k tokens anchored on a 200k window (threshold 171k). The raw
+        # transcript re-estimates to ~40k tokens; double-counting would put
+        # occupancy at ~200k and fire. Correct accounting: 160k + tiny tail.
+        msgs = _msgs(
+            *[("you", "x" * 8000), ("claude", "y" * 8000)] * 10,
+            ("you", "the new prompt"),
+        )
+        anchor = Usage(input=155_000, output=5_000)
+        assert should_compact(msgs, "claude", anchor=anchor) is False
+        near = Usage(input=168_000, output=4_000)
+        assert should_compact(msgs, "claude", anchor=near) is True

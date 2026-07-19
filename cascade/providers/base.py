@@ -239,32 +239,41 @@ class BaseProvider(ABC):
         if not earlier:
             return current_prompt
 
-        def _line(msg: Message) -> str:
-            role_label = "User" if msg["role"] == "user" else "Assistant"
+        # Partition: injected context blocks are ALWAYS included (they are
+        # the sole carrier of compacted history -- dropping them under
+        # budget pressure would be silent amnesia); the budget governs raw
+        # turns only, shrunk by whatever the blocks consume.
+        blocks: list[tuple[int, str]] = []
+        raw_turns: list[tuple[int, str]] = []
+        for idx, msg in enumerate(earlier):
             content = msg["content"]
             if content.startswith(self._CLI_CONTEXT_BLOCK_PREFIXES):
-                return content
+                blocks.append((idx, content))
+                continue
+            role_label = "User" if msg["role"] == "user" else "Assistant"
             if len(content) > self._CLI_CONTEXT_MESSAGE_CAP:
                 elided = len(content) - self._CLI_CONTEXT_MESSAGE_CAP
                 content = (
                     content[: self._CLI_CONTEXT_MESSAGE_CAP]
                     + f" [... {elided} chars elided]"
                 )
-            return f"{role_label}: {content}"
+            raw_turns.append((idx, f"{role_label}: {content}"))
 
-        kept: list[str] = []
+        block_chars = sum(len(text) for _, text in blocks)
+        raw_budget = max(self._CLI_CONTEXT_BUDGET - block_chars, 4_000)
+
+        kept: list[tuple[int, str]] = list(blocks)
         total = 0
-        for msg in reversed(earlier):
-            line = _line(msg)
-            if total + len(line) > self._CLI_CONTEXT_BUDGET and kept:
+        for idx, line in reversed(raw_turns):
+            if total + len(line) > raw_budget and total > 0:
                 break
-            kept.append(line)
+            kept.append((idx, line))
             total += len(line) + 1
-        kept.reverse()
+        kept.sort(key=lambda pair: pair[0])
 
         return (
             "Previous conversation context:\n"
-            + "\n".join(kept)
+            + "\n".join(text for _, text in kept)
             + "\n\nCurrent request:\n"
             + current_prompt
         )

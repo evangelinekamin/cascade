@@ -1317,6 +1317,9 @@ class CommandHandler:
         state.mark_compaction()
         if hasattr(self.app, "persist_context"):
             self.app.persist_context()
+        screen_now = self.app.screen
+        if hasattr(screen_now, "_refresh_context_display"):
+            screen_now._refresh_context_display()
         self.app.notify(
             f"Compacted {compacted_count} messages into {len(episodes)} episodes"
             f" (kept last {len(remaining)})"
@@ -1335,9 +1338,18 @@ class CommandHandler:
                 prov, state.active_provider, compacted_msgs, custom=custom,
             )
             if summary:
-                self.app.call_from_thread(state.set_compaction_summary, summary)
-                if hasattr(self.app, "persist_context"):
-                    self.app.call_from_thread(self.app.persist_context)
+                def _apply() -> None:
+                    state.set_compaction_summary(summary)
+                    if hasattr(self.app, "persist_context"):
+                        self.app.persist_context()
+
+                # _run_in_worker normally puts us on a worker thread, but
+                # tests (and future call sites) may run this inline on the
+                # app thread, where call_from_thread raises.
+                try:
+                    self.app.call_from_thread(_apply)
+                except Exception:
+                    _apply()
                 return "Compaction summary updated"
             return "Compaction summary skipped (range too small or summarizer unavailable)"
 

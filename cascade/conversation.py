@@ -84,6 +84,11 @@ def state_messages_to_provider(
 
     injectable = _injectable_episodes(episodes or [], target_provider, policy)
     context_parts: list[str] = []
+    # The carried summary mixes providers by construction; policy "off"
+    # opted out of cross-model context entirely, so it never injects there
+    # (episodes get the same treatment in _injectable_episodes).
+    if compaction_summary and policy == "off":
+        compaction_summary = ""
     if compaction_summary:
         context_parts.append(
             "Structured summary of compacted earlier turns:\n"
@@ -153,6 +158,21 @@ def estimate_tokens(messages: list["Message"]) -> int:
     return sum(len(m.get("content", "")) for m in messages) // 4
 
 
+def unsent_tail_chars(messages: list["ChatMessage"]) -> int:
+    """Chars of messages appended after the last provider response.
+
+    The occupancy anchor (last round's real usage) already accounts for
+    every message the model has seen; only the trailing user/system tail
+    since that response needs estimating.
+    """
+    tail = 0
+    for msg in reversed(messages):
+        if msg.role not in ("you", "system"):
+            break
+        tail += len(msg.content)
+    return tail
+
+
 def should_compact(
     chat_messages: list["ChatMessage"],
     provider: str,
@@ -172,7 +192,12 @@ def should_compact(
     if len(active) > RAW_MESSAGE_WINDOW:
         return True
     window = window_for(provider, model, configured_window)
-    chars = sum(len(m.content) for m in active)
+    if anchor is not None:
+        # The anchor already covers everything sent; estimating the whole
+        # list on top of it double-counts (~2x) and fires compaction early.
+        chars = unsent_tail_chars(active)
+    else:
+        chars = sum(len(m.content) for m in active)
     return current_tokens(anchor, chars) > compact_threshold(window)
 
 
@@ -283,6 +308,18 @@ def validate_compaction_summary(summary: str) -> bool:
     return True
 
 
+def _looks_like_overflow(exc: Exception) -> bool:
+    """Heuristic: does this provider error indicate a too-large request?"""
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "context", "token", "too large", "too long", "413",
+            "length", "maximum", "exceed",
+        )
+    )
+
+
 def summarize_for_compaction(
     ask,
     compacted: list["ChatMessage"],
@@ -304,14 +341,25 @@ def summarize_for_compaction(
     )
     try:
         summary = ask(prompt, SUMMARY_SYSTEM_PROMPT)
-    except Exception:
-        half = compacted[len(compacted) // 2:]
-        retry_prompt = build_compaction_summary_prompt(
-            half, previous_summary, custom_instructions,
-            max_input_chars=SUMMARY_MAX_INPUT_CHARS // 2,
-        )
+    except Exception as exc:
+        if _looks_like_overflow(exc):
+            # Size-shaped failure: drop the oldest half with an explicit
+            # marker so the gap is visible in the produced summary.
+            half = compacted[len(compacted) // 2:]
+            retry_prompt = build_compaction_summary_prompt(
+                half, previous_summary, custom_instructions,
+                max_input_chars=SUMMARY_MAX_INPUT_CHARS // 2,
+            )
+            retry_prompt = (
+                retry_prompt
+                + "\n\nNote: earlier turns were dropped to fit this request; "
+                "state that explicitly in the Pending Tasks section."
+            )
+        else:
+            # Transient failure: plain retry, full range intact.
+            retry_prompt = prompt
         try:
-            summary = ask(_TRUNCATION_MARKER + "\n\n" + retry_prompt, SUMMARY_SYSTEM_PROMPT)
+            summary = ask(retry_prompt, SUMMARY_SYSTEM_PROMPT)
         except Exception:
             return None
 

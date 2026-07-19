@@ -491,12 +491,15 @@ class MainScreen(Screen):
         if not isinstance(summary_text, str):
             summary_text = ""
 
+        state_anchor = self.app.state.context_anchor
+        if not isinstance(state_anchor, Usage):
+            state_anchor = None
         if chat_messages and should_compact(
             chat_messages,
             provider_name,
             model=prov.config.model or "",
             configured_window=prov.config.context_window,
-            anchor=prov.last_round_usage,
+            anchor=state_anchor,
         ):
             try:
                 active_messages = [
@@ -520,24 +523,32 @@ class MainScreen(Screen):
                     )
                     _call(self.app.state.prune_live_episodes, kept_exchanges)
                     _call(self.app.state.mark_compaction)
+                    # Queue the durable bookkeeping BEFORE the (slow) tier-2
+                    # summary call so a mid-summary cancel still leaves the
+                    # compaction fully applied, visible, and persisted.
+                    _call(
+                        self._post_compaction_note,
+                        f"compacted {compacted_count} turns into "
+                        f"{len(new_episodes)} episodes",
+                    )
+                    _call(self._refresh_context_display)
+                    _call(self.app.persist_context)
                     # Tier 2: structured summary of the compacted range on a
                     # fast-tier clone. Episodes already carry the content, so
                     # a failed/skipped summary degrades quality, not safety.
-                    new_summary = self._generate_compaction_summary(
-                        prov, provider_name, compacted_msgs,
-                    )
+                    new_summary = None
+                    if live_run.token is None or not live_run.token.cancelled:
+                        new_summary = self._generate_compaction_summary(
+                            prov, provider_name, compacted_msgs,
+                        )
                     if new_summary:
                         summary_text = new_summary
-                        _call(self.app.state.set_compaction_summary, new_summary)
-                    note = (
-                        f"compacted {compacted_count} turns into "
-                        f"{len(new_episodes)} episodes"
-                    )
-                    if new_summary:
-                        note += " + summary"
-                    _call(self._post_compaction_note, note)
-                    _call(self._refresh_context_display)
-                    _call(self.app.persist_context)
+                        # Plain call_from_thread: idempotent state/DB
+                        # snapshots must survive a cancelled run.
+                        self.app.call_from_thread(
+                            self.app.state.set_compaction_summary, new_summary,
+                        )
+                        self.app.call_from_thread(self.app.persist_context)
                     # Mirror the state change locally: this worker builds the
                     # payload from its own snapshot, not by re-reading state.
                     episode_list = prune_live_episodes(
@@ -677,6 +688,11 @@ class MainScreen(Screen):
             if hasattr(cli_app, "record_turn"):
                 cli_app.record_turn(provider_name, prompt, response_text)
 
+            # Orchestration ran in lane clones; the base provider's anchor
+            # is stale for this turn. Honest display: unknown until the
+            # next direct response.
+            _call(self.app.state.set_context_anchor, None)
+            _call(self._refresh_context_display)
             total_tokens = result.input_tokens + result.output_tokens
             episode = generate_episode(
                 user_content=prompt,
@@ -992,7 +1008,7 @@ class MainScreen(Screen):
                 if isinstance(candidate, str) and candidate:
                     fast_model = candidate
             clone = type(prov)(
-                dc_replace(cfg, model=fast_model, temperature=0.2, max_tokens=1600)
+                dc_replace(cfg, model=fast_model, temperature=0.2, max_tokens=8000)
             )
             summary = summarize_for_compaction(
                 clone.ask_single,
@@ -1061,7 +1077,11 @@ class MainScreen(Screen):
             frame.context_label = "ctx ?" if state.compaction_count else ""
             return
 
-        tokens = anchor.total
+        from ..conversation import unsent_tail_chars
+        from ..context.budget import estimate_tokens_from_chars
+
+        active = [m for m in state.messages if not m.metadata.get("compacted")]
+        tokens = anchor.total + estimate_tokens_from_chars(unsent_tail_chars(active))
         pct = min(tokens * 100 // threshold, 999) if threshold > 0 else 0
         bar.update_context(tokens, threshold, warn, state.compaction_count)
         if tokens >= 1000:
