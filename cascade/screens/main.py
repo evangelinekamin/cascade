@@ -537,6 +537,7 @@ class MainScreen(Screen):
                         note += " + summary"
                     _call(self._post_compaction_note, note)
                     _call(self._refresh_context_display)
+                    _call(self.app.persist_context)
                     # Mirror the state change locally: this worker builds the
                     # payload from its own snapshot, not by re-reading state.
                     episode_list = prune_live_episodes(

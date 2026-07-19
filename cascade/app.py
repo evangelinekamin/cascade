@@ -289,6 +289,23 @@ class CascadeTUI(App):
             self._branching_session = BranchingSession(self.db, session["id"])
         return self._branching_session
 
+    def persist_context(self) -> None:
+        """Snapshot episodes + compaction summary for the active session.
+
+        Called after compaction events; a session is only created if one
+        already exists (no phantom sessions for empty chats).
+        """
+        if self._db_session is None:
+            return
+        try:
+            self.db.save_context(
+                self._db_session["id"],
+                list(self.state.episodes),
+                self.state.compaction_summary,
+            )
+        except Exception:
+            pass
+
     def record_message(self, role: str, content: str, token_count: int = 0) -> None:
         """Record a message to the history database."""
         session = self.ensure_session()

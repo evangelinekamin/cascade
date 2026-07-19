@@ -1315,6 +1315,8 @@ class CommandHandler:
         state.apply_episode_compaction(compacted_count, episodes)
         state.prune_live_episodes(sum(1 for m in remaining if m.role == "you"))
         state.mark_compaction()
+        if hasattr(self.app, "persist_context"):
+            self.app.persist_context()
         self.app.notify(
             f"Compacted {compacted_count} messages into {len(episodes)} episodes"
             f" (kept last {len(remaining)})"
@@ -1334,6 +1336,8 @@ class CommandHandler:
             )
             if summary:
                 self.app.call_from_thread(state.set_compaction_summary, summary)
+                if hasattr(self.app, "persist_context"):
+                    self.app.call_from_thread(self.app.persist_context)
                 return "Compaction summary updated"
             return "Compaction summary skipped (range too small or summarizer unavailable)"
 
@@ -1413,7 +1417,25 @@ class CommandHandler:
                 )
                 self.app.state.total_tokens += token_count
 
-        if len(self.app.state.messages) > 12:
+        # Restore carried context: persisted episodes + compaction summary
+        # survive restarts with full fidelity (including tier-2 summaries the
+        # heuristic regeneration below cannot reproduce).
+        restored = False
+        try:
+            stored_episodes, stored_summary = self.app.db.load_context(session["id"])
+            if stored_episodes or stored_summary:
+                self.app.state.episodes = list(stored_episodes)
+                if stored_summary:
+                    self.app.state.set_compaction_summary(stored_summary)
+                if len(self.app.state.messages) > 6 and stored_episodes:
+                    compacted_count = len(self.app.state.messages) - 6
+                    for m in self.app.state.messages[:compacted_count]:
+                        m.metadata["compacted"] = True
+                restored = True
+        except Exception:
+            restored = False
+
+        if not restored and len(self.app.state.messages) > 12:
             try:
                 from .conversation import compact_messages_with_episodes
 

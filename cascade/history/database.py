@@ -13,9 +13,13 @@ from pathlib import Path
 from typing import Optional
 
 from .wordid import generate_word_id
+from ..episodes import Episode
 
 
 _DEFAULT_DB_PATH = "~/.config/cascade/history.db"
+
+# Bumped when _migrate() gains a new step. Guarded by PRAGMA user_version.
+_SCHEMA_VERSION = 1
 
 
 class HistoryDB:
@@ -30,6 +34,7 @@ class HistoryDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._create_tables()
+        self._migrate()
 
     def _create_tables(self) -> None:
         self._conn.executescript("""
@@ -56,6 +61,31 @@ class HistoryDB:
             CREATE INDEX IF NOT EXISTS idx_sessions_updated
                 ON sessions(updated_at DESC);
         """)
+
+    def _migrate(self) -> None:
+        """Apply guarded, versioned schema migrations."""
+        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if version < 1:
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS episodes (
+                    id          TEXT NOT NULL,
+                    session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    timestamp   REAL NOT NULL,
+                    provider    TEXT NOT NULL DEFAULT '',
+                    objective   TEXT NOT NULL DEFAULT '',
+                    actions     TEXT NOT NULL DEFAULT '[]',
+                    outcome     TEXT NOT NULL DEFAULT '',
+                    artifacts   TEXT NOT NULL DEFAULT '[]',
+                    tokens      INTEGER NOT NULL DEFAULT 0,
+                    turn_count  INTEGER NOT NULL DEFAULT 1,
+                    source      TEXT NOT NULL DEFAULT 'live',
+                    PRIMARY KEY (session_id, id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_episodes_session
+                    ON episodes(session_id, timestamp);
+            """)
+            self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+            self._conn.commit()
 
     def _unique_word_id(self, max_attempts: int = 20) -> str:
         """Generate a word-based ID that doesn't collide with existing sessions."""
@@ -197,6 +227,79 @@ class HistoryDB:
             (session_id,),
         ).fetchall()
         return [self._row_to_message(r) for r in rows]
+
+    # -- context carry-over (episodes + compaction summary) --
+
+    def save_context(
+        self,
+        session_id: str,
+        episodes: list[Episode],
+        compaction_summary: str = "",
+    ) -> None:
+        """Snapshot the session's episode list and carried summary.
+
+        Replace-all semantics: the in-memory list is the source of truth
+        (pruning must propagate), so the stored set always mirrors it.
+        """
+        self._conn.execute(
+            "DELETE FROM episodes WHERE session_id = ?", (session_id,)
+        )
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO episodes "
+            "(id, session_id, timestamp, provider, objective, actions, "
+            " outcome, artifacts, tokens, turn_count, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    ep.id, session_id, ep.timestamp, ep.provider, ep.objective,
+                    json.dumps(list(ep.actions)), ep.outcome,
+                    json.dumps(list(ep.artifacts)), ep.tokens_consumed,
+                    ep.raw_turn_count, ep.source,
+                )
+                for ep in episodes
+            ],
+        )
+        row = self._conn.execute(
+            "SELECT metadata FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is not None:
+            meta = json.loads(row["metadata"] or "{}")
+            meta["compaction_summary"] = compaction_summary
+            self._conn.execute(
+                "UPDATE sessions SET metadata = ? WHERE id = ?",
+                (json.dumps(meta), session_id),
+            )
+        self._conn.commit()
+
+    def load_context(self, session_id: str) -> tuple[list[Episode], str]:
+        """Load the persisted episode list and carried summary for a session."""
+        rows = self._conn.execute(
+            "SELECT * FROM episodes WHERE session_id = ? ORDER BY timestamp ASC",
+            (session_id,),
+        ).fetchall()
+        episodes = [
+            Episode(
+                id=r["id"],
+                timestamp=r["timestamp"],
+                provider=r["provider"],
+                objective=r["objective"],
+                actions=tuple(json.loads(r["actions"])),
+                outcome=r["outcome"],
+                artifacts=tuple(json.loads(r["artifacts"])),
+                tokens_consumed=r["tokens"],
+                raw_turn_count=r["turn_count"],
+                source=r["source"],
+            )
+            for r in rows
+        ]
+        session = self._conn.execute(
+            "SELECT metadata FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        summary = ""
+        if session is not None:
+            meta = json.loads(session["metadata"] or "{}")
+            summary = str(meta.get("compaction_summary") or "")
+        return episodes, summary
 
     # -- helpers --
 
