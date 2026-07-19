@@ -96,6 +96,32 @@ class TestUploadCommand:
         mock_server.stop.assert_called_once()
         assert "stopped" in posted[0].lower()
 
+    def test_upload_defaults_to_loopback_host(self):
+        """Security: the unauthenticated upload server must not bind the LAN
+        unless --host is given explicitly."""
+        handler, ctx, posted = self._make_handler()
+        constructed = {}
+
+        class _FakeServer:
+            running = False
+
+            def __init__(self, _ctx, host, port):
+                constructed["host"] = host
+                constructed["port"] = port
+
+            def start(self):
+                return f"http://{constructed['host']}:{constructed['port']}"
+
+        with patch.dict(
+            "sys.modules", {}, clear=False,
+        ), patch("cascade.web.server.FileUploaderServer", _FakeServer):
+            handler._cmd_upload([])
+        assert constructed["host"] == "127.0.0.1"
+
+        with patch("cascade.web.server.FileUploaderServer", _FakeServer):
+            handler._cmd_upload(["--host", "0.0.0.0"])
+        assert constructed["host"] == "0.0.0.0"
+
     def test_upload_already_running(self):
         handler, ctx, posted = self._make_handler()
         mock_server = MagicMock()
@@ -216,6 +242,23 @@ class TestConfigReloadCommand:
         assert "Config reloaded." in posted[-1]
         assert "Added: new" in posted[-1]
         assert "Removed: old" in posted[-1]
+
+    @patch("cascade.auth.detect_all")
+    def test_config_reload_rebuilds_hook_runner_before_provider_init(self, mock_detect):
+        """The fresh hook runner must exist when _init_providers re-wires."""
+        mock_detect.return_value = []
+        handler, cli_app, posted = self._make_handler()
+
+        fresh_runner = MagicMock(name="fresh_runner")
+        cli_app._build_hook_runner = MagicMock(return_value=fresh_runner)
+        order = []
+        cli_app._build_hook_runner.side_effect = lambda: order.append("hooks") or fresh_runner
+        cli_app._init_providers.side_effect = lambda: order.append("providers")
+
+        handler._cmd_config(["reload"])
+
+        assert cli_app.hook_runner is fresh_runner
+        assert order == ["hooks", "providers"]
 
 
 class TestLoginCommand:

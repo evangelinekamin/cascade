@@ -1183,6 +1183,10 @@ class CommandHandler:
         from .auth import detect_all
         cli_app.credentials = detect_all()
         cli_app._apply_detected_credentials()
+        # Rebuild hooks from the fresh config BEFORE provider init so the
+        # trailing _wire_provider_hooks attaches the new runner.
+        if hasattr(cli_app, "_build_hook_runner"):
+            cli_app.hook_runner = cli_app._build_hook_runner()
         cli_app._init_providers()
 
         # Rebuild prompt pipeline

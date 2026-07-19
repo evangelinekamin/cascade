@@ -8,7 +8,6 @@ def _make_app(policy: str = "summary") -> CascadeCore:
     app.memory_config = {
         "cross_model_memory": policy,
         "summary_turn_interval": 2,
-        "summary_provider": "auto",
         "summary_max_chars": 1200,
     }
     app._conversation = []

@@ -128,7 +128,6 @@ class ConfigManager:
                 # Re-compact summary every N assistant turns in summary mode.
                 "summary_turn_interval": 6,
                 # Preferred provider to generate summaries (or "auto").
-                "summary_provider": "auto",
                 # Hard cap for compact summary text included in prompts.
                 "summary_max_chars": 1800,
             },
@@ -359,7 +358,6 @@ class ConfigManager:
         defaults: Dict[str, Any] = {
             "cross_model_memory": "summary",
             "summary_turn_interval": 6,
-            "summary_provider": "auto",
             "summary_max_chars": 1800,
         }
         config = self.data.get("memory", {})
@@ -382,8 +380,6 @@ class ConfigManager:
             max_chars = 1800
         merged["summary_max_chars"] = max(400, max_chars)
 
-        provider = str(merged.get("summary_provider", "auto") or "auto").lower()
-        merged["summary_provider"] = provider
 
         return merged
 

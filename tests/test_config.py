@@ -353,13 +353,12 @@ def test_memory_config_invalid_values_are_sanitized():
             "cross_model_memory": "totally-invalid",
             "summary_turn_interval": 0,
             "summary_max_chars": 1,
-            "summary_provider": "",
         }
         cfg = manager.get_memory_config()
         assert cfg["cross_model_memory"] == "summary"
         assert cfg["summary_turn_interval"] == 1
         assert cfg["summary_max_chars"] == 400
-        assert cfg["summary_provider"] == "auto"
+        assert "summary_provider" not in cfg
 
 
 def test_orchestration_defaults_use_cerebras_through_openrouter():

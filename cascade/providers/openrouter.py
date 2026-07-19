@@ -262,7 +262,7 @@ class OpenRouterProvider(BaseProvider):
                 max_rounds=max_rounds,
                 on_tool_event=on_tool_event,
                 on_usage=lambda usage: setattr(self, "_last_usage", usage),
-                    on_round_usage=lambda usage: setattr(self, "_last_round_usage", usage),
+                on_round_usage=lambda usage: setattr(self, "_last_round_usage", usage),
                 hook_runner=self.hook_runner,
                 context_window=window_for(
                     "openrouter", self.config.model, self.config.context_window,
@@ -291,7 +291,7 @@ class OpenRouterProvider(BaseProvider):
                     max_rounds=max_rounds,
                     on_tool_event=on_tool_event,
                     on_usage=lambda usage: setattr(self, "_last_usage", usage),
-                    on_round_usage=lambda usage: setattr(self, "_last_round_usage", usage),
+                on_round_usage=lambda usage: setattr(self, "_last_round_usage", usage),
                 hook_runner=self.hook_runner,
                     context_window=window_for(
                     "openrouter", self.config.model, self.config.context_window,

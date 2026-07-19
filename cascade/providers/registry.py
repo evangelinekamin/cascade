@@ -35,7 +35,7 @@ def register_provider(name: str):
 # must never be reloaded: reloading recreates their classes (Usage,
 # ProviderResponse, ...), breaking isinstance/equality against instances
 # created before the reload.
-_NON_PROVIDER_MODULES = {"base", "registry", "response", "retry", "usage", "__init__"}
+_NON_PROVIDER_MODULES = {"base", "registry", "response", "usage", "__init__"}
 
 
 def discover_providers() -> None:

@@ -178,7 +178,10 @@ def _lane_provider(app, provider_name: str, model: str, preferences: dict):
             model=model,
             provider_preferences=dict(preferences),
         )
-        return type(original)(config)
+        clone = type(original)(config)
+        # Clones must keep the tool-call hook gate the original was wired with.
+        clone.hook_runner = getattr(original, "hook_runner", None)
+        return clone
     except Exception:
         return None
 
