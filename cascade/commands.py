@@ -1024,7 +1024,9 @@ class CommandHandler:
             )
             return
 
-        host = "0.0.0.0"
+        # Loopback by default: unauthenticated endpoint. /upload --host
+        # 0.0.0.0 exposes it on the LAN deliberately (e.g. phone uploads).
+        host = "127.0.0.1"
         port = 9222
         for i, p in enumerate(args):
             if p == "--host" and i + 1 < len(args):

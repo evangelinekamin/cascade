@@ -100,7 +100,7 @@ class TestUploadCommand:
         handler, ctx, posted = self._make_handler()
         mock_server = MagicMock()
         mock_server.running = True
-        mock_server.host = "0.0.0.0"
+        mock_server.host = "127.0.0.1"
         mock_server.port = 9222
         handler._upload_server = mock_server
         handler._cmd_upload([])

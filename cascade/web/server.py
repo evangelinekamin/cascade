@@ -35,7 +35,9 @@ class FileUploaderServer:
     def __init__(
         self,
         context_builder: ContextBuilder,
-        host: str = "0.0.0.0",
+        # Loopback only: this is an unauthenticated upload endpoint for the
+        # local TUI. Pass an explicit host to expose it on a LAN deliberately.
+        host: str = "127.0.0.1",
         port: int = 9222,
         max_upload_bytes: int = 5 * 1024 * 1024,
     ):
