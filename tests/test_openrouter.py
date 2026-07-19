@@ -7,6 +7,7 @@ import pytest
 
 from cascade.providers.base import ProviderConfig
 from cascade.providers.openrouter import OpenRouterProvider
+from cascade.providers.usage import Usage
 
 
 def test_openrouter_accepts_provider_config():
@@ -135,7 +136,7 @@ def test_openrouter_stream_falls_back_on_retryable_status():
         chunks = list(provider.stream_single("Reply with exactly OK."))
 
     assert chunks == ["OK"]
-    assert provider.last_usage == (7, 2)
+    assert provider.last_usage == Usage(input=7, output=2)
     first_call = mock_stream.call_args_list[0].kwargs["json"]
     second_call = mock_stream.call_args_list[1].kwargs["json"]
     assert first_call["model"] == "qwen/qwen3.5-9b"
@@ -300,7 +301,7 @@ def test_openrouter_structured_response_uses_schema_and_required_provider_params
         "strict": True,
         "schema": schema,
     }
-    assert provider.last_usage == (12, 5)
+    assert provider.last_usage == Usage(input=12, output=5, cost=0.001)
     assert provider.last_cost == 0.001
     assert provider.last_generation_id == "gen-route"
 
@@ -329,5 +330,5 @@ def test_openrouter_tool_loop_captures_usage_cost():
 
     assert text == "done"
     assert log == []
-    assert provider.last_usage == (20, 4)
+    assert provider.last_usage == Usage(input=20, output=4, cost=0.0025)
     assert provider.last_cost == pytest.approx(0.0025)

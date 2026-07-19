@@ -12,6 +12,7 @@ import httpx
 
 from cascade.providers.base import BaseProvider, ProviderConfig, Message
 from cascade.tools.schema import callable_to_tool_def
+from cascade.providers.usage import Usage
 
 
 def _make_tools():
@@ -291,7 +292,7 @@ class TestOpenAIToolCalling:
             assert "function" in tool_def
 
         assert result == "OK"
-        assert prov.last_usage == (7, 2)
+        assert prov.last_usage == Usage(input=7, output=2)
 
 
 class TestToolLoopExhaustion:
@@ -467,7 +468,7 @@ class TestOpenRouterToolCalling:
         with patch.object(prov.client, "post", return_value=mock_response):
             result, log = prov.ask_with_tools(_msgs("test"), tools)
             assert result == "OK"
-            assert prov.last_usage == (9, 3)
+            assert prov.last_usage == Usage(input=9, output=3)
 
     def test_openrouter_tool_calling_falls_back_on_503(self):
         from cascade.providers.openrouter import OpenRouterProvider

@@ -31,16 +31,24 @@ def register_provider(name: str):
     return decorator
 
 
-def discover_providers() -> None:
-    """Import all modules in the providers package to trigger @register_provider decorators.
+# Support modules that define shared types but register no providers. They
+# must never be reloaded: reloading recreates their classes (Usage,
+# ProviderResponse, ...), breaking isinstance/equality against instances
+# created before the reload.
+_NON_PROVIDER_MODULES = {"base", "registry", "response", "retry", "usage", "__init__"}
 
-    If a module is already imported (cached in sys.modules), it is reloaded
-    so that the @register_provider decorators re-execute. This keeps the
-    registry consistent even after clear_registry().
+
+def discover_providers() -> None:
+    """Import all provider modules to trigger @register_provider decorators.
+
+    If a provider module is already imported (cached in sys.modules), it is
+    reloaded so that the @register_provider decorators re-execute. This keeps
+    the registry consistent even after clear_registry(). Support modules
+    (underscore-prefixed or listed in _NON_PROVIDER_MODULES) are left alone.
     """
     package = importlib.import_module("cascade.providers")
     for _importer, module_name, _is_pkg in pkgutil.iter_modules(package.__path__):
-        if module_name in ("base", "registry", "__init__"):
+        if module_name in _NON_PROVIDER_MODULES or module_name.startswith("_"):
             continue
         fqn = f"cascade.providers.{module_name}"
         if fqn in sys.modules:

@@ -6,6 +6,7 @@ import httpx
 from .base import BaseProvider, ProviderConfig, Message, ToolEventCallback
 from .registry import register_provider
 from ._openai_tools import openai_ask_with_tools
+from .usage import Usage
 
 if TYPE_CHECKING:
     from ..tools.schema import ToolDef
@@ -25,7 +26,6 @@ class OpenRouterProvider(BaseProvider):
         self.base_url = config.base_url or "https://openrouter.ai/api/v1"
         self.client = httpx.Client(timeout=60.0)
         self._last_generation_id: Optional[str] = None
-        self._last_cost: Optional[float] = None
 
     @property
     def last_generation_id(self) -> Optional[str]:
@@ -35,7 +35,7 @@ class OpenRouterProvider(BaseProvider):
     @property
     def last_cost(self) -> Optional[float]:
         """Reported request cost when OpenRouter includes it in usage."""
-        return self._last_cost
+        return self._last_usage.cost if self._last_usage else None
 
     def _headers(self) -> dict:
         return {
@@ -123,13 +123,7 @@ class OpenRouterProvider(BaseProvider):
 
                 usage = data.get("usage")
                 if usage:
-                    self._last_usage = (
-                        usage.get("prompt_tokens", 0),
-                        usage.get("completion_tokens", 0),
-                    )
-                    cost = usage.get("cost")
-                    if isinstance(cost, (int, float)):
-                        self._last_cost = float(cost)
+                    self._last_usage = Usage.from_openai(usage)
                 choices = data.get("choices", [])
                 if choices:
                     delta = choices[0].get("delta", {})
@@ -149,7 +143,6 @@ class OpenRouterProvider(BaseProvider):
         """Stream tokens from OpenRouter."""
         self._last_usage = None
         self._last_generation_id = None
-        self._last_cost = None
         try:
             yield from self._stream_with_model(self.config.model, messages, system)
         except httpx.HTTPStatusError as exc:
@@ -204,7 +197,6 @@ class OpenRouterProvider(BaseProvider):
 
         self._last_usage = None
         self._last_generation_id = None
-        self._last_cost = None
         try:
             response = self.client.post(url, json=payload, headers=self._headers())
             response.raise_for_status()
@@ -219,13 +211,7 @@ class OpenRouterProvider(BaseProvider):
             raise RuntimeError(f"OpenRouter structured response failed: {data['error']}")
         usage = data.get("usage") or {}
         if usage:
-            self._last_usage = (
-                usage.get("prompt_tokens", 0),
-                usage.get("completion_tokens", 0),
-            )
-            cost = usage.get("cost")
-            if isinstance(cost, (int, float)):
-                self._last_cost = float(cost)
+            self._last_usage = Usage.from_openai(usage)
 
         choices = data.get("choices") or []
         if not choices:
@@ -256,7 +242,6 @@ class OpenRouterProvider(BaseProvider):
     ) -> tuple[str, list[dict]]:
         """OpenAI-compatible tool calling via OpenRouter."""
         self._last_usage = None
-        self._last_cost = None
         try:
             return openai_ask_with_tools(
                 client=self.client,
@@ -271,7 +256,6 @@ class OpenRouterProvider(BaseProvider):
                 max_rounds=max_rounds,
                 on_tool_event=on_tool_event,
                 on_usage=lambda usage: setattr(self, "_last_usage", usage),
-                on_cost=lambda cost: setattr(self, "_last_cost", cost),
                 context_window=self.config.context_window,
                 provider_preferences=self.config.provider_preferences,
                 check_cancelled=self.raise_if_cancelled,
@@ -297,7 +281,6 @@ class OpenRouterProvider(BaseProvider):
                     max_rounds=max_rounds,
                     on_tool_event=on_tool_event,
                     on_usage=lambda usage: setattr(self, "_last_usage", usage),
-                    on_cost=lambda cost: setattr(self, "_last_cost", cost),
                     context_window=self.config.context_window,
                     provider_preferences=self.config.provider_preferences,
                     check_cancelled=self.raise_if_cancelled,

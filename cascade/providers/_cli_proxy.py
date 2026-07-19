@@ -12,8 +12,10 @@ import os
 import re
 import signal
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterator, Optional
+
+from .usage import Usage
 
 
 ACTIVITY_PREFIX = "[[cascade_activity]] "
@@ -42,7 +44,7 @@ class CLIEventHandler:
     """Base class for provider-specific CLI JSON event handlers."""
 
     def __init__(self) -> None:
-        self.last_usage: Optional[tuple[int, int]] = None
+        self.last_usage: Optional[Usage] = None
         self.error_lines: list[str] = []
         self.saw_text: bool = False
 
@@ -98,7 +100,7 @@ class GeminiEventHandler(CLIEventHandler):
                 in_t = stats.get("input_tokens", 0)
                 out_t = stats.get("output_tokens", 0)
                 if isinstance(in_t, int) and isinstance(out_t, int):
-                    self.last_usage = (in_t, out_t)
+                    self.last_usage = Usage(input=in_t, output=out_t)
                 duration = stats.get("duration_ms")
                 if isinstance(duration, int):
                     yield ("activity", f"done in {duration}ms")
@@ -167,18 +169,16 @@ class ClaudeEventHandler(CLIEventHandler):
                                 yield ("text", block)
                     usage = message.get("usage", {})
                     if isinstance(usage, dict):
-                        in_t = usage.get("input_tokens")
-                        out_t = usage.get("output_tokens")
-                        if isinstance(in_t, int) and isinstance(out_t, int):
-                            self.last_usage = (in_t, out_t)
+                        parsed = Usage.from_anthropic(usage)
+                        if parsed.total:
+                            self.last_usage = parsed
 
         elif ev_type == "result":
             usage = event.get("usage", {})
             if isinstance(usage, dict):
-                in_t = usage.get("input_tokens")
-                out_t = usage.get("output_tokens")
-                if isinstance(in_t, int) and isinstance(out_t, int):
-                    self.last_usage = (in_t, out_t)
+                parsed = Usage.from_anthropic(usage)
+                if parsed.total:
+                    self.last_usage = parsed
             duration = event.get("duration_ms")
             if isinstance(duration, int):
                 yield ("activity", f"done in {duration}ms")
@@ -245,15 +245,14 @@ class ClaudeEventHandler(CLIEventHandler):
 
         elif inner_type == "message_start":
             usage = inner.get("message", {}).get("usage", {})
-            in_t = usage.get("input_tokens", 0)
-            if isinstance(in_t, int):
-                self.last_usage = (in_t, 0)
+            if isinstance(usage, dict):
+                self.last_usage = Usage.from_anthropic(usage)
 
         elif inner_type == "message_delta":
             out_t = inner.get("usage", {}).get("output_tokens")
             if isinstance(out_t, int):
-                prev = self.last_usage or (0, 0)
-                self.last_usage = (prev[0], out_t)
+                prev = self.last_usage or Usage()
+                self.last_usage = replace(prev, output=out_t)
 
     def on_non_json_line(self, line: str) -> Optional[str]:
         self.error_lines.append(line)
@@ -311,7 +310,14 @@ class CodexEventHandler(CLIEventHandler):
             in_t = usage.get("input_tokens")
             out_t = usage.get("output_tokens")
             if isinstance(in_t, int) and isinstance(out_t, int):
-                self.last_usage = (in_t, out_t)
+                # Codex reports cached_input_tokens as a subset of input_tokens.
+                cached = usage.get("cached_input_tokens")
+                cached = cached if isinstance(cached, int) else 0
+                self.last_usage = Usage(
+                    input=max(in_t - cached, 0),
+                    output=out_t,
+                    cache_read=cached,
+                )
             yield ("activity", "turn completed")
 
     def _handle_item(self, item: dict) -> Iterator[tuple[str, str]]:

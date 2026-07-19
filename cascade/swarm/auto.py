@@ -19,6 +19,7 @@ from typing import Callable, Optional
 
 from .fanout import run_fanout
 from .lifecycle import CancellationToken, RunCancelled, RunContext, TaskStatus
+from ..providers.usage import Usage
 from .outcome import RunOutcome
 from .pipeline import run_pipeline
 from .solve import run_solve
@@ -286,8 +287,8 @@ def select_workflow(
         if cancel_token is not None:
             cancel_token.checkpoint()
         workflow, reason, confidence, worker_tier = _parse_route_payload(payload)
-        usage = router.last_usage or (0, 0)
-        cost = float(getattr(router, "last_cost", None) or 0.0)
+        usage = router.last_usage or Usage()
+        cost = usage.cost or 0.0
         return RouteDecision(
             workflow=workflow,
             reason=reason,
@@ -295,8 +296,8 @@ def select_workflow(
             worker_tier=worker_tier,
             router_provider=provider_name,
             router_model=model,
-            input_tokens=usage[0],
-            output_tokens=usage[1],
+            input_tokens=usage.prompt_total,
+            output_tokens=usage.output,
             cost=cost,
         )
     except RunCancelled:
@@ -471,8 +472,8 @@ def execute_auto(
                     on_tool_event=on_tool_event,
                 )
             _checkpoint()
-            usage = provider.last_usage or (0, 0)
-            execution_cost = float(getattr(provider, "last_cost", None) or 0.0)
+            usage = provider.last_usage or Usage()
+            execution_cost = usage.cost or 0.0
             if run_context is not None:
                 run_context.add_cost(execution_cost)
             outcome = RunOutcome.SUCCEEDED if response.strip() else RunOutcome.FAILED
@@ -491,8 +492,8 @@ def execute_auto(
                 outcome,
                 text,
                 provider_name,
-                route_in + usage[0],
-                route_out + usage[1],
+                route_in + usage.prompt_total,
+                route_out + usage.output,
                 route_cost + execution_cost,
             )
         except Exception as exc:

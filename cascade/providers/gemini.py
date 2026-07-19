@@ -13,6 +13,7 @@ import httpx
 from .base import BaseProvider, ProviderConfig, Message, ToolEvent, ToolEventCallback
 from ._cli_proxy import CLIProxyConfig, GeminiEventHandler, stream_cli_proxy
 from .registry import register_provider
+from .usage import Usage
 
 if TYPE_CHECKING:
     from ..tools.schema import ToolDef
@@ -157,10 +158,10 @@ class GeminiProvider(BaseProvider):
                                             if "text" in part:
                                                 yield part["text"]
                             usage = data.get("usageMetadata", {})
-                            in_t = usage.get("promptTokenCount", 0)
-                            out_t = usage.get("candidatesTokenCount", 0)
-                            if in_t or out_t:
-                                self._last_usage = (in_t, out_t)
+                            if usage:
+                                parsed = Usage.from_gemini(usage)
+                                if parsed.total:
+                                    self._last_usage = parsed
                         except json.JSONDecodeError:
                             continue
         except Exception as e:

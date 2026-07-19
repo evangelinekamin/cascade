@@ -7,6 +7,8 @@ import threading
 from typing import Optional, Iterator, Callable, TypedDict, TYPE_CHECKING
 from dataclasses import dataclass, field
 
+from .usage import Usage
+
 if TYPE_CHECKING:
     from ..tools.schema import ToolDef
 
@@ -61,7 +63,7 @@ class BaseProvider(ABC):
     def __init__(self, config: ProviderConfig):
         self.config = config
         self.name = self.__class__.__name__
-        self._last_usage: Optional[tuple[int, int]] = None
+        self._last_usage: Optional[Usage] = None
         self._last_activity: Optional[str] = None
         self._last_activity_key: Optional[str] = None
         self._emit_activity: bool = False
@@ -69,8 +71,8 @@ class BaseProvider(ABC):
         self._cancellation = threading.local()
 
     @property
-    def last_usage(self) -> Optional[tuple[int, int]]:
-        """Token usage from last ask/stream call: (input_tokens, output_tokens)."""
+    def last_usage(self) -> Optional[Usage]:
+        """Normalized token usage accumulated over the last ask/stream call."""
         return self._last_usage
 
     @property

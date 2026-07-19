@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from cascade.providers.base import ProviderConfig
 from cascade.providers.openai_provider import OpenAIProvider
+from cascade.providers.usage import Usage
 
 
 def test_openai_accepts_provider_config():
@@ -111,7 +112,7 @@ def test_stream_cli_parses_agent_message_and_usage():
         chunks = list(provider.stream_single("Reply with OK"))
 
     assert chunks == ["OK"]
-    assert provider.last_usage == (9, 2)
+    assert provider.last_usage == Usage(input=9, output=2)
 
 
 def test_oauth_token_without_codex_binary_returns_clear_error():
@@ -143,7 +144,7 @@ def test_cli_proxy_uses_focused_workspace_for_non_agentic_file_audit(tmp_path):
         captured["workspace_note"] = Path(cfg.cwd, "CASCADE_WORKSPACE.md").read_text(
             encoding="utf-8",
         )
-        handler.last_usage = (11, 3)
+        handler.last_usage = Usage(input=11, output=3)
         yield "OK"
 
     with patch("cascade.providers.openai_provider.shutil.which", return_value="/usr/bin/codex"):
@@ -168,7 +169,7 @@ def test_cli_proxy_uses_focused_workspace_for_non_agentic_file_audit(tmp_path):
     assert captured["mirrored_file"] == "export const value = 1;\n"
     assert "Mirrored files:" in captured["workspace_note"]
     assert str(workspace_root) in captured["cwd"]
-    assert provider.last_usage == (11, 3)
+    assert provider.last_usage == Usage(input=11, output=3)
 
 
 def test_cli_proxy_keeps_repo_workspace_for_agentic_requests(tmp_path):
@@ -219,9 +220,9 @@ def test_cli_proxy_reuses_codex_session_for_repeated_focused_workspace_requests(
         })
         if len(calls) == 1:
             handler.thread_id = "thread-123"
-            handler.last_usage = (10, 2)
+            handler.last_usage = Usage(input=10, output=2)
         else:
-            handler.last_usage = (12, 3)
+            handler.last_usage = Usage(input=12, output=3)
         yield "OK"
 
     with patch("cascade.providers.openai_provider.shutil.which", return_value="/usr/bin/codex"):
@@ -248,7 +249,7 @@ def test_cli_proxy_reuses_codex_session_for_repeated_focused_workspace_requests(
     assert calls[0]["cwd"] == calls[1]["cwd"]
     assert "Previous conversation context:" not in calls[1]["cmd_args"][-1]
     assert "Current request:\nAudit frontend/src/lib/api.ts again and rank the risks." in calls[1]["cmd_args"][-1]
-    assert provider.last_usage == (12, 3)
+    assert provider.last_usage == Usage(input=12, output=3)
 
 
 def test_cli_proxy_retries_fresh_exec_when_cached_session_fails(tmp_path):
@@ -262,13 +263,13 @@ def test_cli_proxy_retries_fresh_exec_when_cached_session_fails(tmp_path):
         calls.append(list(cfg.cmd_args))
         if len(calls) == 1:
             handler.thread_id = "thread-123"
-            handler.last_usage = (10, 2)
+            handler.last_usage = Usage(input=10, output=2)
             yield "OK"
             return
         if len(calls) == 2:
             raise RuntimeError("session not found")
         handler.thread_id = "thread-456"
-        handler.last_usage = (11, 4)
+        handler.last_usage = Usage(input=11, output=4)
         yield "OK"
 
     with patch("cascade.providers.openai_provider.shutil.which", return_value="/usr/bin/codex"):
@@ -303,7 +304,7 @@ def test_resume_prompt_keeps_full_replay_when_synthetic_context_present(tmp_path
 
     def _fake_stream(cfg, handler, emit_activity):
         calls.append(list(cfg.cmd_args))
-        handler.last_usage = (9, 2)
+        handler.last_usage = Usage(input=9, output=2)
         yield "OK"
 
     with patch("cascade.providers.openai_provider.shutil.which", return_value="/usr/bin/codex"):

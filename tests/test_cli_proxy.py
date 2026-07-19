@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+from cascade.providers.usage import Usage
 from cascade.providers._cli_proxy import (
     ACTIVITY_PREFIX,
     CLIProxyConfig,
@@ -79,7 +80,7 @@ def test_stream_yields_text_from_handler():
         chunks = list(stream_cli_proxy(_cfg(cli_name="gemini"), handler, emit_activity=False))
 
     assert chunks == ["hello"]
-    assert handler.last_usage == (5, 1)
+    assert handler.last_usage == Usage(input=5, output=1)
 
 
 def test_handles_non_json_lines():
@@ -159,7 +160,7 @@ def test_usage_captured_in_handler():
     with patch("cascade.providers._cli_proxy.subprocess.Popen", popen_cls):
         list(stream_cli_proxy(_cfg(), handler, emit_activity=False))
 
-    assert handler.last_usage == (100, 50)
+    assert handler.last_usage == Usage(input=100, output=50)
 
 
 def test_error_on_nonzero_exit():
@@ -226,7 +227,7 @@ def test_gemini_handler_event_types():
     events = list(handler.on_json_event({
         "type": "result", "stats": {"input_tokens": 10, "output_tokens": 5, "duration_ms": 200},
     }))
-    assert handler.last_usage == (10, 5)
+    assert handler.last_usage == Usage(input=10, output=5)
     assert ("activity", "done in 200ms") in events
 
     # non-JSON line: skip cached credentials
@@ -269,7 +270,7 @@ def test_claude_handler_stream_events():
         "usage": {"input_tokens": 20, "output_tokens": 10},
         "duration_ms": 500,
     }))
-    assert handler.last_usage == (20, 10)
+    assert handler.last_usage == Usage(input=20, output=10)
     assert ("activity", "done in 500ms") in events
 
     # rate_limit_event
@@ -343,7 +344,7 @@ def test_claude_handler_assistant_fallback():
         },
     }))
     assert ("text", "hello world") in events
-    assert handler.last_usage == (8, 3)
+    assert handler.last_usage == Usage(input=8, output=3)
 
 
 def test_claude_handler_suppresses_auth_failure_text():
@@ -409,7 +410,7 @@ def test_codex_handler_item_completed():
         "type": "turn.completed",
         "usage": {"input_tokens": 15, "output_tokens": 7},
     }))
-    assert handler.last_usage == (15, 7)
+    assert handler.last_usage == Usage(input=15, output=7)
     assert ("activity", "turn completed") in events
 
     # error event

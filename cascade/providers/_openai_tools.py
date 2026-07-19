@@ -10,6 +10,7 @@ from typing import Callable, Optional, TYPE_CHECKING
 import httpx
 
 from .base import ToolEvent, ToolEventCallback
+from .usage import Usage
 
 if TYPE_CHECKING:
     from .base import Message
@@ -202,8 +203,7 @@ def openai_ask_with_tools(
     system: Optional[str] = None,
     max_rounds: int = 5,
     on_tool_event: ToolEventCallback = None,
-    on_usage: Optional[Callable[[tuple[int, int]], None]] = None,
-    on_cost: Optional[Callable[[float], None]] = None,
+    on_usage: Optional[Callable[[Usage], None]] = None,
     context_window: int = 128000,
     provider_preferences: Optional[dict] = None,
     check_cancelled: Optional[Callable[[], None]] = None,
@@ -257,9 +257,7 @@ def openai_ask_with_tools(
 
     tool_log = []
     content = ""
-    total_input_tokens = 0
-    total_output_tokens = 0
-    total_cost = 0.0
+    total_usage = Usage()
     budget = int(context_window * _CONTEXT_BUDGET_FRACTION)
     seen_reads: set[tuple[str, str]] = set()
     doom_streak = 0
@@ -268,24 +266,17 @@ def openai_ask_with_tools(
     run_counts: dict[str, int] = {}
 
     def _capture_usage(data: dict) -> None:
-        nonlocal total_input_tokens, total_output_tokens, total_cost
+        nonlocal total_usage
         usage = data.get("usage", {})
         if not isinstance(usage, dict):
             return
-        in_t = usage.get("prompt_tokens", usage.get("input_tokens", 0))
-        out_t = usage.get("completion_tokens", usage.get("output_tokens", 0))
-        if isinstance(in_t, int) and isinstance(out_t, int):
-            total_input_tokens += in_t
-            total_output_tokens += out_t
-        cost = usage.get("cost")
-        if isinstance(cost, (int, float)):
-            total_cost += float(cost)
+        parsed = Usage.from_openai(usage)
+        if parsed.total or parsed.cost:
+            total_usage = total_usage.add(parsed)
 
     def _finalize_usage() -> None:
-        if on_usage is not None and (total_input_tokens or total_output_tokens):
-            on_usage((total_input_tokens, total_output_tokens))
-        if on_cost is not None and total_cost:
-            on_cost(total_cost)
+        if on_usage is not None and (total_usage.total or total_usage.cost):
+            on_usage(total_usage)
 
     def _checkpoint() -> None:
         if check_cancelled is not None:

@@ -10,6 +10,7 @@ from cascade.providers.base import ProviderConfig
 from cascade.screens.main import MainScreen
 from cascade.swarm.auto import RouteDecision, WorkflowKind
 from cascade.swarm.outcome import RunOutcome
+from cascade.providers.usage import Usage
 
 
 class _Config:
@@ -57,7 +58,7 @@ class _FakeOpenRouter:
 
     def __init__(self, config):
         self.config = config
-        self.last_usage = (11, 3)
+        self.last_usage = Usage(input=11, output=3)
         self.tools = None
         type(self).last_instance = self
 
@@ -68,7 +69,7 @@ class _FakeOpenRouter:
     def ask_with_tools(self, messages, tools, **kwargs):
         self.tools = tools
         self.tool_call = (messages, kwargs)
-        self.last_usage = (20, 8)
+        self.last_usage = Usage(input=20, output=8)
         return "Found it in cascade/config.py.", []
 
 

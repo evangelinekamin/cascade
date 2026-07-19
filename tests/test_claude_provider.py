@@ -6,6 +6,7 @@ import pytest
 
 from cascade.providers.base import ProviderConfig
 from cascade.providers.claude import ClaudeProvider
+from cascade.providers.usage import Usage
 
 
 def test_uses_cli_proxy_for_oauth_token_when_claude_binary_exists():
@@ -54,7 +55,7 @@ def test_stream_cli_parses_deltas_and_usage():
         chunks = list(provider.stream_single("Say hello"))
 
     assert chunks == ["Hel", "lo"]
-    assert provider.last_usage == (11, 3)
+    assert provider.last_usage == Usage(input=11, output=3)
 
 
 def test_oauth_token_without_claude_binary_returns_clear_error():

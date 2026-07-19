@@ -17,6 +17,7 @@ from textual.widgets import Input, Static
 
 from ..episodes import generate_episode
 from ..providers.base import ProviderConfig, ToolEvent
+from ..providers.usage import Usage
 from ..widgets.header import WelcomeHeader, ProviderGhostTable
 from ..widgets.message import ChatHistory, MessageWidget, ThinkingIndicator
 from ..widgets.input_frame import InputFrame
@@ -743,10 +744,10 @@ class MainScreen(Screen):
                 cli_app.record_turn(provider_name, prompt, response_text)
 
             # Generate episode for this interaction
-            usage = prov.last_usage or (0, 0)
-            live_run.add_tokens(usage[0], usage[1])
-            live_run.add_cost(float(getattr(prov, "last_cost", None) or 0.0))
-            total_tokens = usage[0] + usage[1]
+            usage = prov.last_usage or Usage()
+            live_run.add_tokens(usage.prompt_total, usage.output)
+            live_run.add_cost(usage.cost or 0.0)
+            total_tokens = usage.total
             episode = generate_episode(
                 user_content=prompt,
                 assistant_content=response_text,
@@ -769,8 +770,8 @@ class MainScreen(Screen):
                 self._on_stream_done,
                 provider_name,
                 response_text,
-                usage[0],
-                usage[1],
+                usage.prompt_total,
+                usage.output,
                 terminal=True,
             )
 
@@ -781,14 +782,14 @@ class MainScreen(Screen):
             })
 
         except RunCancelled as exc:
-            usage = prov.last_usage or (0, 0)
-            live_run.add_tokens(usage[0], usage[1])
-            live_run.add_cost(float(getattr(prov, "last_cost", None) or 0.0))
+            usage = prov.last_usage or Usage()
+            live_run.add_tokens(usage.prompt_total, usage.output)
+            live_run.add_cost(usage.cost or 0.0)
             live_run.finish(RunOutcome.CANCELLED, error=str(exc))
         except Exception as e:
-            usage = prov.last_usage or (0, 0)
-            live_run.add_tokens(usage[0], usage[1])
-            live_run.add_cost(float(getattr(prov, "last_cost", None) or 0.0))
+            usage = prov.last_usage or Usage()
+            live_run.add_tokens(usage.prompt_total, usage.output)
+            live_run.add_cost(usage.cost or 0.0)
             live_run.finish(RunOutcome.FAILED, error=str(e))
             self._emit_for_run(run, self._on_stream_error, str(e), terminal=True)
 
@@ -882,10 +883,10 @@ class MainScreen(Screen):
                 cli_app.record_turn(provider_name, prompt, response_text)
 
             # Generate episode with tool call data
-            usage = prov.last_usage or (0, 0)
-            live_run.add_tokens(usage[0], usage[1])
-            live_run.add_cost(float(getattr(prov, "last_cost", None) or 0.0))
-            total_tokens = usage[0] + usage[1]
+            usage = prov.last_usage or Usage()
+            live_run.add_tokens(usage.prompt_total, usage.output)
+            live_run.add_cost(usage.cost or 0.0)
+            total_tokens = usage.total
             episode = generate_episode(
                 user_content=prompt,
                 assistant_content=response_text,
@@ -907,7 +908,7 @@ class MainScreen(Screen):
             self._emit_for_run(
                 run,
                 self._on_tool_done,
-                provider_name, response_text, usage[0], usage[1], tool_log,
+                provider_name, response_text, usage.prompt_total, usage.output, tool_log,
                 terminal=True,
             )
 
@@ -918,14 +919,14 @@ class MainScreen(Screen):
             })
 
         except RunCancelled as exc:
-            usage = prov.last_usage or (0, 0)
-            live_run.add_tokens(usage[0], usage[1])
-            live_run.add_cost(float(getattr(prov, "last_cost", None) or 0.0))
+            usage = prov.last_usage or Usage()
+            live_run.add_tokens(usage.prompt_total, usage.output)
+            live_run.add_cost(usage.cost or 0.0)
             live_run.finish(RunOutcome.CANCELLED, error=str(exc))
         except Exception as e:
-            usage = prov.last_usage or (0, 0)
-            live_run.add_tokens(usage[0], usage[1])
-            live_run.add_cost(float(getattr(prov, "last_cost", None) or 0.0))
+            usage = prov.last_usage or Usage()
+            live_run.add_tokens(usage.prompt_total, usage.output)
+            live_run.add_cost(usage.cost or 0.0)
             live_run.finish(RunOutcome.FAILED, error=str(e))
             self._emit_for_run(run, self._on_stream_error, str(e), terminal=True)
 

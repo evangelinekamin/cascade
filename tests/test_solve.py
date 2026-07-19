@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import cascade.swarm.solve as solve_mod
 from cascade.providers.base import ProviderConfig
+from cascade.providers.usage import Usage
 from cascade.swarm.solve import (
     DEFAULT_TEST_CMD,
     SolveResult,
@@ -314,7 +315,7 @@ def test_run_solve_accumulates_and_reports_token_usage(monkeypatch):
     app = MagicMock()
     prov = MagicMock()
     prov.config = SimpleNamespace(model="frontier")
-    prov.last_usage = (100, 40)  # each agent iteration reports this usage
+    prov.last_usage = Usage(input=100, output=40)  # each agent iteration reports this usage
     app.providers = {"openai": prov}
     app.config.get_default_provider.return_value = "openai"
     app.config.get_model_for = MagicMock(

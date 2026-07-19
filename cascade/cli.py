@@ -18,6 +18,7 @@ from .prompts.layers import (
 )
 from .providers.registry import discover_providers, get_registry
 from .providers.response import ProviderResponse
+from .providers.usage import Usage
 from .tools import build_tool_registry
 from .ui import render_header, render_response, render_comparison
 from .ui.output import render_error, stream_response
@@ -313,11 +314,11 @@ class CascadeCore:
             response = prov.ask(messages, final_system)
 
         # Capture response metadata from provider
-        usage = prov.last_usage or (0, 0)
+        usage = prov.last_usage or Usage()
         self.last_response_meta = ProviderResponse(
             text=response,
-            input_tokens=usage[0],
-            output_tokens=usage[1],
+            input_tokens=usage.prompt_total,
+            output_tokens=usage.output,
             model=prov.config.model,
             provider=prov.name,
         )

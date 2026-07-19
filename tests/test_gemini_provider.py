@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from cascade.providers.base import ProviderConfig
 from cascade.providers.gemini import GeminiProvider
+from cascade.providers.usage import Usage
 
 
 def test_uses_cli_proxy_for_oauth_token_when_gemini_binary_exists():
@@ -52,7 +53,7 @@ def test_stream_cli_parses_assistant_messages_and_usage():
         chunks = list(provider.stream_single("Say hello"))
 
     assert chunks == ["Hel", "lo"]
-    assert provider.last_usage == (10, 4)
+    assert provider.last_usage == Usage(input=10, output=4)
 
 
 def test_gemini_has_use_oauth_cli_attribute():

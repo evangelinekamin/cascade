@@ -17,6 +17,7 @@ from cascade.swarm import (
     CompetitionResult,
 )
 from cascade.swarm.worktree import WorktreeManager
+from cascade.providers.usage import Usage
 
 
 def _mock_provider(name, response=None, model="test-model", judge_payload=None):
@@ -25,7 +26,7 @@ def _mock_provider(name, response=None, model="test-model", judge_payload=None):
     prov.name = name
     prov.config = MagicMock()
     prov.config.model = model
-    prov.last_usage = (100, 50)
+    prov.last_usage = Usage(input=100, output=50)
 
     def _ask_single(prompt, system=None):
         if system is not None:
@@ -86,7 +87,7 @@ class _CodeProvider:
         self.name = name
         self.config = MagicMock()
         self.config.model = f"{name}-model"
-        self.last_usage = (80, 20)
+        self.last_usage = Usage(input=80, output=20)
         self._use_cli_proxy = True
         self._workdir = None
         self._judge_payload = judge_payload

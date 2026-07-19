@@ -5,9 +5,11 @@ import json
 import os
 import shutil
 import httpx
+from dataclasses import replace
 from .base import BaseProvider, ProviderConfig, Message, ToolEvent, ToolEventCallback
 from ._cli_proxy import CLIProxyConfig, ClaudeEventHandler, stream_cli_proxy
 from .registry import register_provider
+from .usage import Usage
 
 if TYPE_CHECKING:
     from ..tools.schema import ToolDef
@@ -148,12 +150,11 @@ class ClaudeProvider(BaseProvider):
                                 usage = data.get("usage", {})
                                 out_tokens = usage.get("output_tokens", 0)
                                 if out_tokens:
-                                    prev = self._last_usage or (0, 0)
-                                    self._last_usage = (prev[0], out_tokens)
+                                    prev = self._last_usage or Usage()
+                                    self._last_usage = replace(prev, output=out_tokens)
                             elif data.get("type") == "message_start":
                                 usage = data.get("message", {}).get("usage", {})
-                                in_tokens = usage.get("input_tokens", 0)
-                                self._last_usage = (in_tokens, 0)
+                                self._last_usage = Usage.from_anthropic(usage)
                         except json.JSONDecodeError:
                             continue
         except Exception as e:
@@ -212,13 +213,11 @@ class ClaudeProvider(BaseProvider):
                 return f"Error: {e}", tool_log
             self.raise_if_cancelled()
 
-            # Capture token usage
-            usage = data.get("usage", {})
-            in_t = usage.get("input_tokens", 0)
-            out_t = usage.get("output_tokens", 0)
-            if in_t or out_t:
-                prev = self._last_usage or (0, 0)
-                self._last_usage = (prev[0] + in_t, prev[1] + out_t)
+            # Capture token usage (accumulated across tool rounds)
+            round_usage = Usage.from_anthropic(data.get("usage", {}))
+            if round_usage.total:
+                prev = self._last_usage or Usage()
+                self._last_usage = prev.add(round_usage)
 
             # Check stop reason
             stop_reason = data.get("stop_reason", "end_turn")

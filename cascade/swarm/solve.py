@@ -16,6 +16,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Callable, Optional
 
+from ..providers.usage import Usage
 from .lifecycle import (
     CancellationToken,
     RunCancelled,
@@ -714,11 +715,8 @@ def run_verified_task(
             response = run_agent_in_worktree(agent, prompt, path, **agent_kwargs)
             if on_tokens is not None:
                 usage = getattr(agent, "last_usage", None)
-                if isinstance(usage, tuple) and len(usage) == 2:
-                    try:
-                        on_tokens(int(usage[0]), int(usage[1]))
-                    except (TypeError, ValueError):
-                        pass
+                if isinstance(usage, Usage):
+                    on_tokens(usage.prompt_total, usage.output)
             cost = getattr(agent, "last_cost", None)
             if on_cost is not None and isinstance(cost, (int, float)) and cost:
                 on_cost(float(cost))

@@ -29,6 +29,7 @@ from threading import Lock
 from typing import Callable, List, Optional
 
 from .lifecycle import CancellationToken, RunCancelled, RunContext, TaskStatus
+from ..providers.usage import Usage
 from .outcome import RunOutcome
 from .solve import (
     _annotate_verification,
@@ -249,11 +250,8 @@ def plan_subtasks(
         if cancel_token is not None:
             cancel_token.checkpoint()
         usage = getattr(director, "last_usage", None)
-        if on_tokens is not None and isinstance(usage, tuple) and len(usage) == 2:
-            try:
-                on_tokens(int(usage[0]), int(usage[1]))
-            except (TypeError, ValueError):
-                pass
+        if on_tokens is not None and isinstance(usage, Usage):
+            on_tokens(usage.prompt_total, usage.output)
         cost = getattr(director, "last_cost", None)
         if on_cost is not None and isinstance(cost, (int, float)) and cost:
             on_cost(float(cost))

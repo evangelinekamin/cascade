@@ -11,6 +11,7 @@ from typing import Callable, Optional, TYPE_CHECKING
 from .schema import CompetitionEntry, CompetitionJudgment, CompetitionResult
 from .workspace import run_agent_in_worktree
 from .worktree import WorktreeManager, WorktreeSnapshot
+from ..providers.usage import Usage
 
 if TYPE_CHECKING:
     from ..cli import CascadeCore
@@ -128,11 +129,11 @@ class CompetitionOrchestrator:
         start = time.monotonic()
         try:
             response = provider.ask_single(objective)
-            usage = provider.last_usage or (0, 0)
+            usage = provider.last_usage or Usage()
             return CompetitionEntry(
                 provider=provider_name,
                 response=response,
-                tokens=usage[0] + usage[1],
+                tokens=usage.total,
                 duration_seconds=time.monotonic() - start,
                 success=True,
             )
@@ -316,13 +317,13 @@ class CompetitionOrchestrator:
             system = self._build_competition_system(_CODE_SYSTEM)
             prompt = self._build_code_prompt(objective, worktree_path)
             response = run_agent_in_worktree(provider, prompt, worktree_path, system=system)
-            usage = provider.last_usage or (0, 0)
+            usage = provider.last_usage or Usage()
             snapshot = self._safe_snapshot(manager, worktree_path)
             if not self._has_code_changes(snapshot):
                 return CompetitionEntry(
                     provider=provider_name,
                     response=response,
-                    tokens=usage[0] + usage[1],
+                    tokens=usage.total,
                     duration_seconds=time.monotonic() - start,
                     success=False,
                     error="no changes produced",
@@ -332,7 +333,7 @@ class CompetitionOrchestrator:
             return CompetitionEntry(
                 provider=provider_name,
                 response=response,
-                tokens=usage[0] + usage[1],
+                tokens=usage.total,
                 duration_seconds=time.monotonic() - start,
                 success=True,
                 worktree_path=worktree_path,

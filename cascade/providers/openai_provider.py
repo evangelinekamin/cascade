@@ -12,6 +12,7 @@ from typing import Optional, Iterator, TYPE_CHECKING
 import httpx
 from .base import BaseProvider, ProviderConfig, Message, ToolEventCallback
 from ._cli_proxy import CLIProxyConfig, CodexEventHandler, stream_cli_proxy
+from .usage import Usage
 from ._openai_tools import openai_ask_with_tools
 from .registry import register_provider
 
@@ -610,10 +611,7 @@ class OpenAIProvider(BaseProvider):
                         data = json.loads(data_str)
                         usage = data.get("usage")
                         if usage:
-                            self._last_usage = (
-                                usage.get("prompt_tokens", 0),
-                                usage.get("completion_tokens", 0),
-                            )
+                            self._last_usage = Usage.from_openai(usage)
                         choices = data.get("choices", [])
                         if choices:
                             delta = choices[0].get("delta", {})
