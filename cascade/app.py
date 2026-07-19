@@ -298,10 +298,14 @@ class CascadeTUI(App):
         if self._db_session is None:
             return
         try:
+            compacted_through = sum(
+                1 for m in self.state.messages if m.metadata.get("compacted")
+            )
             self.db.save_context(
                 self._db_session["id"],
                 list(self.state.episodes),
                 self.state.compaction_summary,
+                compacted_through=compacted_through,
             )
         except Exception:
             pass

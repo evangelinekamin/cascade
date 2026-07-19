@@ -1422,15 +1422,21 @@ class CommandHandler:
         # heuristic regeneration below cannot reproduce).
         restored = False
         try:
-            stored_episodes, stored_summary = self.app.db.load_context(session["id"])
+            stored_episodes, stored_summary, compacted_through = (
+                self.app.db.load_context(session["id"])
+            )
             if stored_episodes or stored_summary:
                 self.app.state.episodes = list(stored_episodes)
                 if stored_summary:
                     self.app.state.set_compaction_summary(stored_summary)
-                if len(self.app.state.messages) > 6 and stored_episodes:
-                    compacted_count = len(self.app.state.messages) - 6
-                    for m in self.app.state.messages[:compacted_count]:
-                        m.metadata["compacted"] = True
+                # Re-mark exactly the coverage recorded at snapshot time:
+                # apply_episode_compaction flags oldest-first, so the first
+                # N messages are precisely the episode-carried ones. Turns
+                # after the last compaction stay raw (their live episodes
+                # were persisted too, and the window trigger handles growth).
+                count = min(compacted_through, len(self.app.state.messages))
+                for m in self.app.state.messages[:count]:
+                    m.metadata["compacted"] = True
                 restored = True
         except Exception:
             restored = False

@@ -235,11 +235,15 @@ class HistoryDB:
         session_id: str,
         episodes: list[Episode],
         compaction_summary: str = "",
+        compacted_through: int = 0,
     ) -> None:
-        """Snapshot the session's episode list and carried summary.
+        """Snapshot the session's episode list, carried summary, and coverage.
 
         Replace-all semantics: the in-memory list is the source of truth
         (pruning must propagate), so the stored set always mirrors it.
+        ``compacted_through`` records how many leading messages were flagged
+        compacted at snapshot time -- resume re-marks exactly that many, so
+        turns the episodes do not cover are never hidden from the payload.
         """
         self._conn.execute(
             "DELETE FROM episodes WHERE session_id = ?", (session_id,)
@@ -265,14 +269,15 @@ class HistoryDB:
         if row is not None:
             meta = json.loads(row["metadata"] or "{}")
             meta["compaction_summary"] = compaction_summary
+            meta["compacted_through"] = int(compacted_through)
             self._conn.execute(
                 "UPDATE sessions SET metadata = ? WHERE id = ?",
                 (json.dumps(meta), session_id),
             )
         self._conn.commit()
 
-    def load_context(self, session_id: str) -> tuple[list[Episode], str]:
-        """Load the persisted episode list and carried summary for a session."""
+    def load_context(self, session_id: str) -> tuple[list[Episode], str, int]:
+        """Load persisted episodes, carried summary, and compaction coverage."""
         rows = self._conn.execute(
             "SELECT * FROM episodes WHERE session_id = ? ORDER BY timestamp ASC",
             (session_id,),
@@ -296,10 +301,15 @@ class HistoryDB:
             "SELECT metadata FROM sessions WHERE id = ?", (session_id,)
         ).fetchone()
         summary = ""
+        compacted_through = 0
         if session is not None:
             meta = json.loads(session["metadata"] or "{}")
             summary = str(meta.get("compaction_summary") or "")
-        return episodes, summary
+            try:
+                compacted_through = int(meta.get("compacted_through") or 0)
+            except (TypeError, ValueError):
+                compacted_through = 0
+        return episodes, summary, compacted_through
 
     # -- helpers --
 

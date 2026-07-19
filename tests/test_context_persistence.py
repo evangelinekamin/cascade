@@ -23,9 +23,13 @@ class TestContextPersistence:
                 ),
                 generate_episode("Live turn", "Replied.", "gemini"),
             ]
-            db.save_context(session["id"], eps, "1. Primary Request: parser work")
+            db.save_context(
+                session["id"], eps, "1. Primary Request: parser work",
+                compacted_through=12,
+            )
 
-            loaded, summary = db.load_context(session["id"])
+            loaded, summary, compacted_through = db.load_context(session["id"])
+            assert compacted_through == 12
             assert summary == "1. Primary Request: parser work"
             assert [e.objective for e in loaded] == [e.objective for e in eps]
             assert loaded[0].source == "compaction"
@@ -43,7 +47,7 @@ class TestContextPersistence:
             db.save_context(session["id"], first, "")
             db.save_context(session["id"], first[-2:], "kept summary")
 
-            loaded, summary = db.load_context(session["id"])
+            loaded, summary, _ = db.load_context(session["id"])
             assert len(loaded) == 2
             assert summary == "kept summary"
             db.close()
@@ -52,9 +56,10 @@ class TestContextPersistence:
         with tempfile.TemporaryDirectory() as tmpdir:
             db = _db(tmpdir)
             session = db.create_session()
-            loaded, summary = db.load_context(session["id"])
+            loaded, summary, compacted_through = db.load_context(session["id"])
             assert loaded == []
             assert summary == ""
+            assert compacted_through == 0
             db.close()
 
     def test_migration_is_idempotent_and_versioned(self):
@@ -68,7 +73,7 @@ class TestContextPersistence:
             db2 = HistoryDB(path)
             session = db2.create_session()
             db2.save_context(session["id"], [generate_episode("x", "y", "claude")], "s")
-            loaded, _ = db2.load_context(session["id"])
+            loaded, _, _ = db2.load_context(session["id"])
             assert len(loaded) == 1
             db2.close()
 
