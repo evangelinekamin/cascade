@@ -57,7 +57,6 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("history", "/history [limit]", "List recent chat sessions"),
     CommandDef("resume", "/resume <id>", "Resume a previous session"),
     CommandDef("export", "/export [id]", "Export session messages to a file"),
-    CommandDef("swarm", "/swarm <task>", "Multi-model swarm dispatch"),
     CommandDef("solve", "/solve <task>", "Code a task in an isolated worktree, verified by tests"),
     CommandDef("pipeline", "/pipeline <objective>", "Decompose a build into ordered steps, each verified by tests"),
     CommandDef("fanout", "/fanout <objective>", "Split into independent subtasks, build each verified in its own worktree, then merge"),
@@ -145,7 +144,6 @@ class CommandHandler:
             "history": self._cmd_history,
             "resume": self._cmd_resume,
             "export": self._cmd_export,
-            "swarm": self._cmd_swarm,
             "solve": self._cmd_solve,
             "pipeline": self._cmd_pipeline,
             "fanout": self._cmd_fanout,
@@ -1468,81 +1466,6 @@ class CommandHandler:
         except Exception:
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.app.notify(f"Time: {now}")
-
-    def _cmd_swarm(self, args: list[str]) -> None:
-        """Multi-model swarm dispatch: plan, execute, synthesize."""
-        if not args:
-            self._post_system("Usage: /swarm <task description>")
-            return
-
-        objective = " ".join(args)
-        cli_app = getattr(self.app, "cli_app", None)
-        if cli_app is None:
-            self._post_system("Swarm requires CLI app.")
-            return
-
-        available = list(cli_app.providers.keys())
-        if len(available) < 2:
-            self._post_system(
-                f"Swarm needs 2+ providers. Have: {available}. "
-                f"Use /login to add more."
-            )
-            return
-
-        self._post_system(
-            f"Swarm dispatching: {objective}\n"
-            f"Providers: {', '.join(available)}"
-        )
-        self._record_command_line(f"/swarm {objective}", title=f"[Swarm] {objective}")
-
-        def _on_progress(stage: str, detail: str) -> None:
-            self.app.call_from_thread(self._post_system, f"[{stage}] {detail}")
-
-        def _worker() -> None:
-            try:
-                from .swarm import SwarmOrchestrator
-                swarm = SwarmOrchestrator(cli_app)
-                result = swarm.execute(objective, on_progress=_on_progress)
-
-                # Format result
-                lines = [f"Swarm complete. Providers used: {', '.join(result.providers_used)}"]
-                lines.append(f"Total tokens: {result.total_tokens:,}")
-                lines.append("")
-
-                for sr in result.subtask_results:
-                    status = "OK" if sr.success else f"FAIL: {sr.error}"
-                    lines.append(f"  [{sr.task_id}] {sr.provider}: {status}")
-
-                lines.append("")
-                lines.append("--- Synthesis ---")
-                lines.append(result.synthesis)
-
-                final = "\n".join(lines)
-                self.app.call_from_thread(self._post_system, final)
-                self.app.call_from_thread(self._record_history_message, "system", final)
-
-                # Record in state
-                self.app.call_from_thread(
-                    self.app.state.add_message,
-                    "system", f"[Swarm] {objective}",
-                )
-                # Record synthesis as a message from the orchestrator
-                if result.synthesis:
-                    from .episodes import generate_episode
-                    episode = generate_episode(
-                        user_content=f"[Swarm] {objective}",
-                        assistant_content=result.synthesis,
-                        provider="swarm",
-                        tokens=result.total_tokens,
-                    )
-                    self.app.call_from_thread(self.app.state.add_episode, episode)
-
-            except Exception as e:
-                self.app.call_from_thread(self._post_system, f"Swarm error: {e}")
-                self.app.call_from_thread(self._record_history_message, "system", f"Swarm error: {e}")
-
-        screen = self.app.screen
-        screen.run_worker(_worker, thread=True, exclusive=False)
 
     def _cmd_log(self, args: list[str]) -> None:
         """Open a scrollable view of the last /solve's activity + verified diff."""
