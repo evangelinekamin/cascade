@@ -23,15 +23,28 @@ if TYPE_CHECKING:
 def _injectable_episodes(
     episodes: list[Episode],
     target_provider: str,
+    policy: str = "summary",
 ) -> list[Episode]:
-    """Episodes worth injecting for this provider.
+    """Episodes worth injecting for this provider under this policy.
 
-    "live" episodes mirror turns that are still present as raw messages,
-    so injecting them for the same provider would send the content twice.
-    They are injected only cross-provider (the raw window drops other
-    providers' turns). Non-live episodes (compaction, orchestration) are
-    the sole carrier of their content and always inject.
+    "live" episodes mirror turns that are still present as raw messages.
+    Under "summary" the raw window drops other providers' turns, so live
+    episodes inject cross-provider only. Under "full" every provider's
+    raw turns are already included — live episodes never inject. Under
+    "off" the user opted out of cross-model context entirely.
+
+    Non-live episodes (compaction, orchestration) are the sole carrier of
+    their content and inject everywhere — except that "off" restricts
+    them to the target provider's own history plus orchestration results.
     """
+    if policy == "full":
+        return [ep for ep in episodes if ep.source != "live"]
+    if policy == "off":
+        return [
+            ep for ep in episodes
+            if ep.source != "live"
+            and (ep.provider == target_provider or ep.source == "orchestration")
+        ]
     return [
         ep for ep in episodes
         if ep.source != "live" or ep.provider != target_provider
@@ -63,7 +76,7 @@ def state_messages_to_provider(
         if not msg.metadata.get("compacted")
     ]
 
-    injectable = _injectable_episodes(episodes or [], target_provider)
+    injectable = _injectable_episodes(episodes or [], target_provider, policy)
     if injectable:
         episode_context = episodes_to_context(injectable, max_chars=max_chars // 4)
         if episode_context:

@@ -268,3 +268,40 @@ def test_episode_compaction_marks_messages_so_it_does_not_repeat():
     later_episodes, later_remaining = compact_messages_with_episodes(state.messages, keep_recent=2)
     assert later_episodes == []
     assert [m.content for m in later_remaining] == ["Current", "Working"]
+
+
+def test_full_policy_never_injects_live_episodes():
+    """Under "full" every provider's raw turns are present -- live episodes
+    would always duplicate."""
+    from cascade.episodes import generate_episode
+
+    messages = _msgs(
+        ("you", "Plan it"),
+        ("claude", "The plan."),
+    )
+    episodes = [generate_episode("Plan it", "The plan.", "claude")]
+    result = state_messages_to_provider(
+        messages, "openai", policy="full", episodes=episodes,
+    )
+    contents = " ".join(m["content"] for m in result)
+    assert "[Prior session context]" not in contents
+    assert contents.count("The plan.") == 1
+
+
+def test_off_policy_restricts_episodes_to_own_provider():
+    """"off" means no cross-model context, including via episodes."""
+    from cascade.episodes import generate_episode
+
+    messages = _msgs(("you", "Continue"))
+    episodes = [
+        generate_episode("Other work", "Done elsewhere.", "gemini", source="compaction"),
+        generate_episode("My work", "Done here.", "claude", source="compaction"),
+        generate_episode("[Compete] task", "Winner output.", "compete", source="orchestration"),
+    ]
+    result = state_messages_to_provider(
+        messages, "claude", policy="off", episodes=episodes,
+    )
+    contents = " ".join(m["content"] for m in result)
+    assert "Done here." in contents
+    assert "Winner output." in contents
+    assert "Done elsewhere." not in contents
