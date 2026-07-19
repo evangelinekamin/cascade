@@ -38,6 +38,31 @@ class GeminiProvider(BaseProvider):
             os.getenv("CASCADE_GEMINI_ACTIVITY", default_activity).lower()
             not in ("0", "false", "no", "off")
         )
+        self._approval_mode_supported: Optional[bool] = None
+
+    def _supports_approval_mode(self) -> bool:
+        """Whether this gemini CLI advertises --approval-mode (version-gated).
+
+        Cached per instance. Probes `gemini --help`; if the probe fails we
+        assume support (the flag is standard on current builds) rather than
+        silently dropping the posture mapping.
+        """
+        if self._approval_mode_supported is not None:
+            return self._approval_mode_supported
+        supported = True
+        if self._gemini_bin:
+            try:
+                import subprocess
+
+                out = subprocess.run(
+                    [self._gemini_bin, "--help"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                supported = "--approval-mode" in (out.stdout + out.stderr)
+            except Exception:
+                supported = True
+        self._approval_mode_supported = supported
+        return supported
 
     def get_fallback_model(self) -> Optional[str]:
         """Fall back from Gemini Pro to Flash on rate limits."""
@@ -92,15 +117,18 @@ class GeminiProvider(BaseProvider):
         )
         approval = {
             "auto": "yolo",
-            "safe": "auto_edit",
+            "safe": "default",
             "readonly": "default",
         }.get(posture, "yolo")
         cmd = [
             self._gemini_bin, "-p", full_prompt,
             "--output-format", "stream-json",
-            "--approval-mode", approval,
-            "--include-directories", workdir,
         ]
+        # --approval-mode is version-gated; only pass it when this gemini
+        # build advertises it, so an older CLI is not broken outright.
+        if approval != "default" and self._supports_approval_mode():
+            cmd.extend(["--approval-mode", approval])
+        cmd.extend(["--include-directories", workdir])
         if self.config.model:
             cmd.extend(["--model", self.config.model])
 

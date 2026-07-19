@@ -886,12 +886,16 @@ def run_solve(
         )
     if provider_preferences_override is not None:
         try:
+            _original = provider
             provider = type(provider)(
                 replace(
                     provider.config,
                     provider_preferences=dict(provider_preferences_override),
                 )
             )
+            # The re-instantiated provider must keep the wired gates.
+            provider.hook_runner = getattr(_original, "hook_runner", None)
+            provider.permission_engine = getattr(_original, "permission_engine", None)
         except Exception as exc:
             if run_context is not None:
                 run_context.task_status(

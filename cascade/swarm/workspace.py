@@ -378,6 +378,15 @@ def run_agent_in_worktree(
         if callable(cancellation_scope) and cancel_token is not None
         else nullcontext()
     )
+    # Scope the permission gate to the worktree: WorkspaceTools already
+    # confine writes here, so in-worktree edits should auto-approve while
+    # the sacred/dangerous-shell floors still catch escapes (curl|sh,
+    # rm -rf ~). Without this, the launch-cwd-rooted engine would treat
+    # every legitimate worktree write as an out-of-workspace ask and, in a
+    # headless lane, escalate to a hard stop. Restored in the finally.
+    engine = getattr(provider, "permission_engine", None)
+    scoped = engine.for_workspace(worktree_path) if engine is not None else None
+
     with ctx, cancel_ctx:
         if cancel_token is not None:
             cancel_token.checkpoint()
@@ -386,13 +395,19 @@ def run_agent_in_worktree(
             if cancel_token is not None:
                 cancel_token.checkpoint()
             return response
-        response, _tool_log = provider.ask_with_tools(
-            [{"role": "user", "content": prompt}],
-            WorkspaceTools(worktree_path, cancel_token=cancel_token).build(),
-            system=system,
-            max_rounds=max_rounds,
-            on_tool_event=on_tool_event,
-        )
+        if scoped is not None:
+            provider.permission_engine = scoped
+        try:
+            response, _tool_log = provider.ask_with_tools(
+                [{"role": "user", "content": prompt}],
+                WorkspaceTools(worktree_path, cancel_token=cancel_token).build(),
+                system=system,
+                max_rounds=max_rounds,
+                on_tool_event=on_tool_event,
+            )
+        finally:
+            if scoped is not None:
+                provider.permission_engine = engine
         if cancel_token is not None:
             cancel_token.checkpoint()
         return response

@@ -78,9 +78,12 @@ class ClaudeProvider(BaseProvider):
         posture = getattr(
             getattr(self, "permission_engine", None), "posture", "auto",
         )
+        # -p is non-interactive: it cannot prompt for approval, so "safe"
+        # (mutations must be asked) maps to plan, not acceptEdits -- the
+        # latter would silently auto-approve every edit, inverting safe.
         proxy_mode = {
             "auto": "bypassPermissions",
-            "safe": "acceptEdits",
+            "safe": "plan",
             "readonly": "plan",
         }.get(posture, "bypassPermissions")
         cmd = [

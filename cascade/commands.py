@@ -1313,7 +1313,12 @@ class CommandHandler:
                 self._post_system("Posture must be auto, safe, or readonly.")
                 return
             engine.posture = new_posture
-            self._post_system(f"Permission posture: {new_posture}")
+            # The setter revokes session grants so a looser posture's "always"
+            # cannot outrank the new one.
+            self._post_system(
+                f"Permission posture: {new_posture} (this session; "
+                "set permissions.posture in config to persist)"
+            )
             return
 
         lines = [

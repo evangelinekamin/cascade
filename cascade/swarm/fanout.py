@@ -276,12 +276,15 @@ def _clone_provider(provider):
     if provider is None:
         return None
     try:
-        return type(provider)(replace(provider.config))
+        clone = type(provider)(replace(provider.config))
     except Exception:
         clone = deepcopy(provider)
         if clone is provider:
             raise RuntimeError("provider could not be isolated for a parallel worker")
-        return clone
+    # Clones must keep the hook + permission gates the original was wired with.
+    clone.hook_runner = getattr(provider, "hook_runner", None)
+    clone.permission_engine = getattr(provider, "permission_engine", None)
+    return clone
 
 
 def run_fanout(

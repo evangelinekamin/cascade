@@ -98,7 +98,11 @@ class CascadeCore:
 
         cfg = self.config.get_permissions_config()
         project = self.project.permissions if isinstance(self.project.permissions, dict) else {}
-        posture = str(project.get("posture") or cfg["posture"])
+        # Project posture, if present, wins -- but a typo must fail CLOSED
+        # (to safe) rather than silently opening full auto. PermissionEngine
+        # normalizes again, so this is belt-and-suspenders.
+        raw_posture = project.get("posture") or cfg["posture"]
+        posture = PermissionEngine.normalize_posture(raw_posture)
 
         def _merged(key: str) -> tuple:
             extra = project.get(key)

@@ -141,8 +141,9 @@ class ConcurrentToolExecutor(ToolExecutor):
         tools: dict[str, ToolDef],
         hook_runner: Optional[HookRunner] = None,
         max_workers: Optional[int] = None,
+        permissions=None,
     ):
-        super().__init__(tools, hook_runner)
+        super().__init__(tools, hook_runner, permissions=permissions)
         self._max_workers = max_workers
 
     def execute_batch(self, calls: list[Call]) -> list[str]:
