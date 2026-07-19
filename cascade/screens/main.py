@@ -23,7 +23,7 @@ from ..widgets.message import ChatHistory, MessageWidget, ThinkingIndicator
 from ..widgets.input_frame import InputFrame
 from ..widgets.status_bar import StatusBar
 from ..widgets.stream_message import StreamMessage
-from ..widgets.tool_call import ToolCallWidget
+from ..widgets.tool_call import ToolCallWidget, render_tool_widget
 from ..theme import PALETTE, MODE_CYCLE, MODES, get_provider_theme
 from ..commands import CommandHandler
 from ..hooks import HookContext, HookEvent
@@ -1156,10 +1156,8 @@ class MainScreen(Screen):
                 self._thinking.set_label(f"{event.tool_name} done")
             chat = self.query_one(ChatHistory)
             follow = self._should_follow_chat(chat)
-            chat.mount(ToolCallWidget(
-                tool_name=event.tool_name,
-                tool_input=event.tool_input,
-                tool_output=event.tool_output,
+            chat.mount(render_tool_widget(
+                event.tool_name, event.tool_input, event.tool_output,
             ))
             if follow:
                 self._scroll_chat_end(chat, force=True)
