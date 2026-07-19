@@ -61,6 +61,7 @@ def state_messages_to_provider(
     target_provider: str,
     policy: str = "summary",
     episodes: list[Episode] | None = None,
+    compaction_summary: str = "",
     max_messages: int = RAW_MESSAGE_WINDOW,
     max_chars: int = 80_000,
 ) -> list["Message"]:
@@ -82,17 +83,30 @@ def state_messages_to_provider(
     ]
 
     injectable = _injectable_episodes(episodes or [], target_provider, policy)
+    context_parts: list[str] = []
+    if compaction_summary:
+        context_parts.append(
+            "Structured summary of compacted earlier turns:\n"
+            + compaction_summary
+        )
     if injectable:
         episode_context = episodes_to_context(injectable, max_chars=max_chars // 4)
         if episode_context:
-            result.append({
-                "role": "user",
-                "content": f"[Prior session context]\n{episode_context}",
-            })
-            result.append({
-                "role": "assistant",
-                "content": "Understood, I have the episode context from prior interactions.",
-            })
+            context_parts.append(episode_context)
+    if context_parts:
+        body = "\n\n".join(context_parts)
+        result.append({
+            "role": "user",
+            "content": (
+                "[Prior session context]\n" + body + "\n\n"
+                "Continue seamlessly from this context. Do not acknowledge, "
+                "recap, or refer to this summary in your replies."
+            ),
+        })
+        result.append({
+            "role": "assistant",
+            "content": "Understood, I have the episode context from prior interactions.",
+        })
 
     if policy == "off":
         for msg in visible_messages[-max_messages:]:
@@ -179,6 +193,129 @@ def needs_compaction(
     window = window_for(provider, model, configured_window)
     chars = sum(len(m.get("content", "")) for m in messages)
     return current_tokens(anchor, chars) > compact_threshold(window)
+
+
+_SUMMARY_SECTIONS = """1. Primary Request and Intent
+2. Key Technical Concepts
+3. Files and Code Sections (exact paths; why each matters; short verbatim snippets only when load-bearing)
+4. Errors and Fixes (include any user corrections verbatim)
+5. Problem Solving (approaches tried, what worked, what was ruled out)
+6. All User Messages (condensed, chronological)
+7. Pending Tasks
+8. Current Work and Next Step (quote the most recent instructions verbatim to prevent drift)"""
+
+SUMMARY_SYSTEM_PROMPT = (
+    "You produce structured context-compaction summaries for an ongoing "
+    "coding session. Fidelity over brevity: preserve exact file paths, "
+    "decisions, error messages, and user corrections. Output only the "
+    "summary, nothing else."
+)
+
+# Compacted ranges smaller than this are carried fine by episodes alone --
+# an LLM call would cost more than it preserves.
+SUMMARY_MIN_CHARS = 4_000
+
+# Defensive cap on the summarization request itself (~37k tokens). Beyond
+# this the oldest turns are dropped with an explicit truncation marker.
+SUMMARY_MAX_INPUT_CHARS = 150_000
+
+_TRUNCATION_MARKER = "[earlier turns truncated to fit the compaction request]"
+
+
+def build_compaction_summary_prompt(
+    compacted: list["ChatMessage"],
+    previous_summary: str = "",
+    custom_instructions: str = "",
+    max_input_chars: int = SUMMARY_MAX_INPUT_CHARS,
+) -> str:
+    """Build the tier-2 summarization prompt from FULL message contents.
+
+    Never pre-truncates individual messages -- that destroys exactly what
+    the summary needs. If the whole transcript exceeds ``max_input_chars``
+    the oldest turns are dropped with an explicit marker instead.
+    """
+    blocks: list[str] = []
+    for msg in compacted:
+        label = "User" if msg.role == "you" else msg.role.capitalize()
+        blocks.append(f"{label}: {msg.content}")
+
+    transcript = "\n\n".join(blocks)
+    if len(transcript) > max_input_chars:
+        kept: list[str] = []
+        total = 0
+        for block in reversed(blocks):
+            if total + len(block) > max_input_chars:
+                break
+            kept.append(block)
+            total += len(block) + 2
+        kept.reverse()
+        transcript = _TRUNCATION_MARKER + "\n\n" + "\n\n".join(kept)
+
+    parts = [
+        "The following older conversation turns are being compacted out of "
+        "the context window. Write a structured summary with EXACTLY these "
+        "sections:",
+        _SUMMARY_SECTIONS,
+    ]
+    if previous_summary:
+        parts.append(
+            "A previous summary already covers even earlier turns -- merge "
+            "it forward so nothing is lost:\n" + previous_summary
+        )
+    if custom_instructions:
+        parts.append("Additional instructions: " + custom_instructions)
+    parts.append("Conversation to compact:\n\n" + transcript)
+    return "\n\n".join(parts)
+
+
+def validate_compaction_summary(summary: str) -> bool:
+    """Reject empty, trivially short, or error-shaped summarizer output.
+
+    Originals are never destroyed regardless (messages are only flagged
+    compacted), but an invalid summary must not become injected context.
+    """
+    text = (summary or "").strip()
+    if len(text) < 200:
+        return False
+    lowered = text.lower()
+    if lowered.startswith(("error", "i cannot", "i can't", "sorry")):
+        return False
+    return True
+
+
+def summarize_for_compaction(
+    ask,
+    compacted: list["ChatMessage"],
+    previous_summary: str = "",
+    custom_instructions: str = "",
+) -> str | None:
+    """Run the tier-2 summary through ``ask(prompt, system) -> str``.
+
+    Returns the validated summary, or None when the range is too small to
+    be worth a model call, the call fails, or the output fails validation.
+    One retry with the oldest half dropped covers request-overflow errors.
+    """
+    total_chars = sum(len(m.content) for m in compacted)
+    if total_chars < SUMMARY_MIN_CHARS:
+        return None
+
+    prompt = build_compaction_summary_prompt(
+        compacted, previous_summary, custom_instructions,
+    )
+    try:
+        summary = ask(prompt, SUMMARY_SYSTEM_PROMPT)
+    except Exception:
+        half = compacted[len(compacted) // 2:]
+        retry_prompt = build_compaction_summary_prompt(
+            half, previous_summary, custom_instructions,
+            max_input_chars=SUMMARY_MAX_INPUT_CHARS // 2,
+        )
+        try:
+            summary = ask(_TRUNCATION_MARKER + "\n\n" + retry_prompt, SUMMARY_SYSTEM_PROMPT)
+        except Exception:
+            return None
+
+    return summary.strip() if validate_compaction_summary(summary) else None
 
 
 def compact_messages_with_episodes(

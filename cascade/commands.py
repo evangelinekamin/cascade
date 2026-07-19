@@ -1295,7 +1295,10 @@ class CommandHandler:
         self.app.notify("Chat cleared (history preserved)")
 
     def _cmd_compact(self, args: list[str]) -> None:
-        """Compact older turns into episode records, freeing raw context."""
+        """Compact older turns into episodes; optional focus steers the summary.
+
+        Usage: /compact [focus instructions for the summary]
+        """
         from .conversation import compact_messages_with_episodes
 
         state = self.app.state
@@ -1307,12 +1310,34 @@ class CommandHandler:
         if compacted_count <= 0 or not episodes:
             self.app.notify("Nothing to compact (6 or fewer active messages)")
             return
+        remaining_ids = {id(m) for m in remaining}
+        compacted_msgs = [m for m in active if id(m) not in remaining_ids]
         state.apply_episode_compaction(compacted_count, episodes)
         state.prune_live_episodes(sum(1 for m in remaining if m.role == "you"))
+        state.mark_compaction()
         self.app.notify(
             f"Compacted {compacted_count} messages into {len(episodes)} episodes"
             f" (kept last {len(remaining)})"
         )
+
+        # Tier-2 summary in a worker (model call must not block the UI).
+        screen = self.app.screen
+        cli_app = getattr(self.app, "cli_app", None)
+        prov = cli_app.providers.get(state.active_provider) if cli_app else None
+        if prov is None or not hasattr(screen, "_generate_compaction_summary"):
+            return
+        custom = " ".join(args).strip()
+
+        def _summarize() -> str:
+            summary = screen._generate_compaction_summary(
+                prov, state.active_provider, compacted_msgs, custom=custom,
+            )
+            if summary:
+                self.app.call_from_thread(state.set_compaction_summary, summary)
+                return "Compaction summary updated"
+            return "Compaction summary skipped (range too small or summarizer unavailable)"
+
+        self._run_in_worker(_summarize, label="compact:summary")
 
     # ------------------------------------------------------------------
     # History / Resume / Export

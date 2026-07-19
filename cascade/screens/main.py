@@ -83,6 +83,8 @@ class MainScreen(Screen):
         self._active_provider = active_provider
         self._mode = mode
         self._memory_policy = "summary"
+        self._compaction_summary_enabled = True
+        self._summary_failures = 0
         self._header_visible = True
         self._cmd_handler: CommandHandler | None = None
         self._thinking: ThinkingIndicator | None = None
@@ -261,6 +263,7 @@ class MainScreen(Screen):
         if cli_app is not None:
             cfg = cli_app.config.get_memory_config()
             self._memory_policy = str(cfg.get("cross_model_memory", "summary"))
+            self._compaction_summary_enabled = bool(cfg.get("compaction_summary", True))
         recovered = int(getattr(self.app, "recovered_run_count", 0) or 0)
         if recovered:
             noun = "run" if recovered == 1 else "runs"
@@ -484,6 +487,9 @@ class MainScreen(Screen):
         # actual usage; the tail is a chars/4 estimate.
         chat_messages = list(self.app.state.messages)
         episode_list = list(self.app.state.episodes)
+        summary_text = self.app.state.compaction_summary
+        if not isinstance(summary_text, str):
+            summary_text = ""
 
         if chat_messages and should_compact(
             chat_messages,
@@ -503,6 +509,10 @@ class MainScreen(Screen):
                 compacted_count = max(len(active_messages) - len(remaining), 0)
                 if compacted_count > 0 or new_episodes:
                     kept_exchanges = sum(1 for m in remaining if m.role == "you")
+                    remaining_ids = {id(m) for m in remaining}
+                    compacted_msgs = [
+                        m for m in active_messages if id(m) not in remaining_ids
+                    ]
                     _call(
                         self.app.state.apply_episode_compaction,
                         compacted_count,
@@ -510,11 +520,22 @@ class MainScreen(Screen):
                     )
                     _call(self.app.state.prune_live_episodes, kept_exchanges)
                     _call(self.app.state.mark_compaction)
-                    _call(
-                        self._post_compaction_note,
-                        f"compacted {compacted_count} turns into "
-                        f"{len(new_episodes)} episodes",
+                    # Tier 2: structured summary of the compacted range on a
+                    # fast-tier clone. Episodes already carry the content, so
+                    # a failed/skipped summary degrades quality, not safety.
+                    new_summary = self._generate_compaction_summary(
+                        prov, provider_name, compacted_msgs,
                     )
+                    if new_summary:
+                        summary_text = new_summary
+                        _call(self.app.state.set_compaction_summary, new_summary)
+                    note = (
+                        f"compacted {compacted_count} turns into "
+                        f"{len(new_episodes)} episodes"
+                    )
+                    if new_summary:
+                        note += " + summary"
+                    _call(self._post_compaction_note, note)
                     _call(self._refresh_context_display)
                     # Mirror the state change locally: this worker builds the
                     # payload from its own snapshot, not by re-reading state.
@@ -531,6 +552,7 @@ class MainScreen(Screen):
             target_provider=provider_name,
             policy=self._memory_policy,
             episodes=episode_list if episode_list else None,
+            compaction_summary=summary_text,
         )
 
         # Run BEFORE_ASK hooks (legacy)
@@ -932,6 +954,68 @@ class MainScreen(Screen):
             live_run.add_cost(usage.cost or 0.0)
             live_run.finish(RunOutcome.FAILED, error=str(e))
             self._emit_for_run(run, self._on_stream_error, str(e), terminal=True)
+
+    def _generate_compaction_summary(
+        self,
+        prov,
+        provider_name: str,
+        compacted,
+        custom: str = "",
+    ):
+        """Tier-2 structured summary of a compacted range, breaker-guarded.
+
+        Runs on a fast-tier immutable clone of the active provider (never
+        mutates shared config). Two consecutive failures disable the
+        summarizer for the session; episodes still carry the content.
+        Returns the validated summary text or None.
+        """
+        if not self._compaction_summary_enabled:
+            return None
+        from dataclasses import replace as dc_replace
+
+        from ..conversation import SUMMARY_MIN_CHARS, summarize_for_compaction
+
+        if sum(len(m.content) for m in compacted) < SUMMARY_MIN_CHARS:
+            return None
+
+        cli_app = getattr(self.app, "cli_app", None)
+        clone = None
+        summary = None
+        try:
+            cfg = prov.config
+            fast_model = cfg.model
+            if cli_app is not None:
+                candidate = cli_app.config.get_model_for(
+                    provider_name, self._mode, fast=True,
+                )
+                if isinstance(candidate, str) and candidate:
+                    fast_model = candidate
+            clone = type(prov)(
+                dc_replace(cfg, model=fast_model, temperature=0.2, max_tokens=1600)
+            )
+            summary = summarize_for_compaction(
+                clone.ask_single,
+                compacted,
+                previous_summary=self.app.state.compaction_summary,
+                custom_instructions=custom,
+            )
+        except Exception:
+            summary = None
+        finally:
+            client = getattr(clone, "client", None)
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+        if summary is None:
+            self._summary_failures += 1
+            if self._summary_failures >= 2:
+                self._compaction_summary_enabled = False
+        else:
+            self._summary_failures = 0
+        return summary
 
     def _post_compaction_note(self, text: str) -> None:
         """Mount a dim one-line separator noting a compaction event."""
