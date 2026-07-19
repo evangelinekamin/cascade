@@ -8,6 +8,34 @@ from cascade.agents.runner import AgentRunner
 from cascade.providers.base import ProviderConfig
 
 
+class _FakeProvider:
+    """A real (cloneable) provider stand-in that records its config.
+
+    type(inst)(config) works, so AgentRunner's clone path exercises real
+    behavior instead of a MagicMock that swallows overrides.
+    """
+
+    instances: list = []
+
+    def __init__(self, config):
+        self.config = config
+        self.hook_runner = None
+        self.permission_engine = None
+        self.ask_single_error = None
+        _FakeProvider.instances.append(self)
+
+    def ask_single(self, prompt, system=None):
+        if self.ask_single_error:
+            raise self.ask_single_error
+        return f"resp:{self.config.model}:{self.config.temperature}"
+
+    def ask_with_tools(self, messages, tools, system=None):
+        return "tool response", []
+
+    def stream_single(self, prompt, system=None):
+        yield f"chunk:{self.config.model}"
+
+
 def _make_app(
     provider_name="gemini",
     model="gemini-pro",
@@ -81,44 +109,64 @@ class TestAgentRunner:
         assert "write_file" not in passed_tools
         assert "delete" not in passed_tools
 
-    def test_model_override_restored(self):
-        app, prov = _make_app(model="original-model")
-        runner = AgentRunner(app)
-        agent = AgentDef(name="test", model="override-model")
+    def _fake_app(self, model="original-model", temperature=0.7):
+        _FakeProvider.instances = []
+        prov = _FakeProvider(
+            ProviderConfig(api_key="k", model=model, temperature=temperature)
+        )
+        app = MagicMock()
+        app.providers = {"gemini": prov}
+        app.config.get_default_provider.return_value = "gemini"
+        app.tool_registry = {}
+        from cascade.prompts.layers import PromptPipeline
+        app.prompt_pipeline = PromptPipeline()
+        return app, prov
 
-        runner.run(agent, "hello")
-        # After run, model should be restored
+    def test_override_never_mutates_shared_provider(self):
+        app, prov = self._fake_app(model="original-model", temperature=0.7)
+        runner = AgentRunner(app)
+        agent = AgentDef(name="test", model="override-model", temperature=1.5)
+
+        result = runner.run(agent, "hello")
+        # The clone ran with the override; the shared provider is untouched.
+        assert result == "resp:override-model:1.5"
         assert prov.config.model == "original-model"
-
-    def test_temperature_override_restored(self):
-        app, prov = _make_app(temperature=0.7)
-        runner = AgentRunner(app)
-        agent = AgentDef(name="test", temperature=1.5)
-
-        runner.run(agent, "hello")
         assert prov.config.temperature == 0.7
+        # A distinct clone instance was created and carried the gates.
+        assert len(_FakeProvider.instances) == 2
+        clone = _FakeProvider.instances[-1]
+        assert clone is not prov
 
-    def test_model_restored_on_exception(self):
-        app, prov = _make_app(model="original")
-        prov.ask_single.side_effect = RuntimeError("boom")
+    def test_no_override_reuses_shared_provider(self):
+        app, prov = self._fake_app()
         runner = AgentRunner(app)
-        agent = AgentDef(name="test", model="override")
+        agent = AgentDef(name="test")  # no model/temperature override
+        runner.run(agent, "hello")
+        # No clone created -- the shared instance is used directly.
+        assert len(_FakeProvider.instances) == 1
 
-        with pytest.raises(RuntimeError, match="boom"):
-            runner.run(agent, "hello")
-
-        assert prov.config.model == "original"
-
-    def test_temperature_restored_on_exception(self):
-        app, prov = _make_app(temperature=0.5)
-        prov.ask_single.side_effect = RuntimeError("boom")
+    def test_override_clone_carries_gates(self):
+        app, prov = self._fake_app()
+        sentinel_hooks, sentinel_perms = object(), object()
+        prov.hook_runner = sentinel_hooks
+        prov.permission_engine = sentinel_perms
         runner = AgentRunner(app)
-        agent = AgentDef(name="test", temperature=2.0)
+        agent = AgentDef(name="test", model="x")
+        runner.run(agent, "hello")
+        clone = _FakeProvider.instances[-1]
+        assert clone.hook_runner is sentinel_hooks
+        assert clone.permission_engine is sentinel_perms
 
+    def test_provider_exception_propagates(self):
+        app, prov = self._fake_app(model="original")
+        # Error configured on the shared provider is inherited by the clone
+        # config, so make the clone raise by erroring on any instance.
+        _FakeProvider.instances = []
+        prov.ask_single_error = RuntimeError("boom")
+        # Without an override there is no clone: the shared provider raises.
+        runner = AgentRunner(app)
         with pytest.raises(RuntimeError, match="boom"):
-            runner.run(agent, "hello")
-
-        assert prov.config.temperature == 0.5
+            runner.run(AgentDef(name="test"), "hello")
 
     def test_provider_override(self):
         app, _ = _make_app(provider_name="gemini")
@@ -152,14 +200,20 @@ class TestAgentRunner:
         chunks = list(runner.stream(agent, "hello"))
         assert chunks == ["chunk1", "chunk2"]
 
-    def test_stream_restores_model(self):
-        app, prov = _make_app(model="original")
-        prov.stream_single.return_value = iter(["chunk1", "chunk2"])
-        runner = AgentRunner(app)
-        agent = AgentDef(name="test", model="override")
+    def test_stream_override_uses_clone_not_shared(self):
+        _FakeProvider.instances = []
+        prov = _FakeProvider(ProviderConfig(api_key="k", model="original"))
+        app = MagicMock()
+        app.providers = {"gemini": prov}
+        app.config.get_default_provider.return_value = "gemini"
+        app.tool_registry = {}
+        from cascade.prompts.layers import PromptPipeline
+        app.prompt_pipeline = PromptPipeline()
 
-        list(runner.stream(agent, "hello"))
-        assert prov.config.model == "original"
+        runner = AgentRunner(app)
+        chunks = list(runner.stream(AgentDef(name="test", model="override"), "hi"))
+        assert chunks == ["chunk:override"]
+        assert prov.config.model == "original"  # shared untouched
 
     def test_system_prompt_injection(self):
         app, prov = _make_app()
