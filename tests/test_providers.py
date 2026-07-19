@@ -205,3 +205,54 @@ def test_condense_for_cli_with_history():
     assert "User: First question" in result
     assert "Assistant: First answer" in result
     assert "Current request:\nFollow up" in result
+
+
+def test_condense_for_cli_preserves_context_blocks_whole():
+    """Episode/summary blocks are already compact -- never truncate them."""
+    config = ProviderConfig(api_key="key", model="mock")
+    provider = MockProvider(config)
+    block = "[Prior session context]\n" + "episode line\n" * 300  # > per-msg cap
+    messages = [
+        {"role": "user", "content": block},
+        {"role": "assistant", "content": "Understood, I have the episode context from prior interactions."},
+        {"role": "user", "content": "Continue the work"},
+    ]
+    result = provider._condense_for_cli(messages)
+    assert block in result
+    assert "elided" not in result.split("Current request:")[0].split("episode line")[0]
+
+
+def test_condense_for_cli_caps_messages_not_at_500():
+    """Raw turns keep 2k chars each, not the old 500-char stubs."""
+    config = ProviderConfig(api_key="key", model="mock")
+    provider = MockProvider(config)
+    long_answer = "a" * 1_500
+    messages = [
+        {"role": "assistant", "content": long_answer},
+        {"role": "user", "content": "next"},
+    ]
+    result = provider._condense_for_cli(messages)
+    assert long_answer in result  # under the 2k cap: fully preserved
+
+
+def test_condense_for_cli_marks_elision_and_respects_budget():
+    config = ProviderConfig(api_key="key", model="mock")
+    provider = MockProvider(config)
+    messages = [
+        {"role": "assistant", "content": "b" * 10_000},
+        {"role": "user", "content": "next"},
+    ]
+    result = provider._condense_for_cli(messages)
+    assert "chars elided]" in result
+    assert "b" * 2_001 not in result
+
+    # 30 turns of 2k chars each exceeds the 24k budget: oldest are dropped
+    many = [
+        {"role": "user", "content": f"[turn {i}] " + "c" * 2_000}
+        for i in range(30)
+    ] + [{"role": "user", "content": "final request"}]
+    result = provider._condense_for_cli(many)
+    context = result.split("Current request:")[0]
+    assert "[turn 29]" in context
+    assert "[turn 0]" not in context
+    assert result.endswith("final request")

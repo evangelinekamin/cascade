@@ -208,28 +208,66 @@ class BaseProvider(ABC):
             result.append(line)
         return "\n".join(result).strip()
 
+    # Per-message cap for raw history sent to CLI proxies, and the overall
+    # context budget (excluding the current request, which is always full).
+    # The old 6-messages-at-500-chars condensation starved the dominant
+    # subscription path of nearly all conversation memory.
+    _CLI_CONTEXT_MESSAGE_CAP = 2_000
+    _CLI_CONTEXT_BUDGET = 24_000
+
+    # Injected context blocks are already compact by construction (episode
+    # index + structured compaction summary) -- never truncate them.
+    _CLI_CONTEXT_BLOCK_PREFIXES = (
+        "[Prior session context]",
+        "[Conversation summary]",
+        "[Context from",
+    )
+
     def _condense_for_cli(self, messages: list[Message]) -> str:
         """Build a single prompt string from a messages list for CLI proxy mode.
 
-        Extracts the last message as the current prompt and prepends
-        condensed context from earlier messages.
+        The last message is the current request, sent in full. Earlier
+        messages become context: injected context blocks (episodes /
+        compaction summary) are preserved whole; raw turns are capped per
+        message and fitted newest-first into an overall budget, then
+        re-ordered chronologically.
         """
         if not messages:
             return ""
-        context_lines = []
-        for msg in messages[:-1]:
-            role_label = "User" if msg["role"] == "user" else "Assistant"
-            content = msg["content"][:500]
-            context_lines.append(f"{role_label}: {content}")
         current_prompt = messages[-1]["content"]
-        if context_lines:
-            return (
-                "Previous conversation context:\n"
-                + "\n".join(context_lines[-6:])
-                + "\n\nCurrent request:\n"
-                + current_prompt
-            )
-        return current_prompt
+        earlier = messages[:-1]
+        if not earlier:
+            return current_prompt
+
+        def _line(msg: Message) -> str:
+            role_label = "User" if msg["role"] == "user" else "Assistant"
+            content = msg["content"]
+            if content.startswith(self._CLI_CONTEXT_BLOCK_PREFIXES):
+                return content
+            if len(content) > self._CLI_CONTEXT_MESSAGE_CAP:
+                elided = len(content) - self._CLI_CONTEXT_MESSAGE_CAP
+                content = (
+                    content[: self._CLI_CONTEXT_MESSAGE_CAP]
+                    + f" [... {elided} chars elided]"
+                )
+            return f"{role_label}: {content}"
+
+        kept: list[str] = []
+        total = 0
+        for msg in reversed(earlier):
+            line = _line(msg)
+            if total + len(line) > self._CLI_CONTEXT_BUDGET and kept:
+                break
+            kept.append(line)
+            total += len(line) + 1
+        kept.reverse()
+
+        return (
+            "Previous conversation context:\n"
+            + "\n".join(kept)
+            + "\n\nCurrent request:\n"
+            + current_prompt
+        )
 
     @abstractmethod
     def ask(self, messages: list[Message], system: Optional[str] = None) -> str:
