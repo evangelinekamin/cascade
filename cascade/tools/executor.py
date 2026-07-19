@@ -67,6 +67,12 @@ class ToolExecutor:
             verdict = self._permissions.resolve(
                 self._tools.get(tool_name), tool_name, arguments,
             )
+            if verdict.rule == "escalation":
+                # The denial limit is hit: stop the loop rather than let the
+                # model keep re-raising the same blocked call.
+                from .permissions import PermissionAbort
+
+                raise PermissionAbort(verdict.reason)
             if verdict.decision != "allow":
                 return json.dumps({
                     "error": f"Tool '{tool_name}' not permitted: {verdict.reason}",

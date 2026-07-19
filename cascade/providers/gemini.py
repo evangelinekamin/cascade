@@ -110,8 +110,8 @@ class GeminiProvider(BaseProvider):
 
         # Non-interactive gemini CLI previously ran with NO approval flag,
         # leaving its tools in default-deny limbo. Map the posture: auto
-        # gets yolo (tools actually work), safe auto-approves edits only,
-        # readonly stays at the prompting default (tools effectively off).
+        # gets yolo; safe and readonly get the prompting default (which,
+        # non-interactively, means tools requiring approval are declined).
         posture = getattr(
             getattr(self, "permission_engine", None), "posture", "auto",
         )
@@ -228,6 +228,7 @@ class GeminiProvider(BaseProvider):
         self._last_round_usage = None
 
         from ..tools.executor import ToolExecutor
+        from ..tools.permissions import PermissionAbort
 
         executor = ToolExecutor(
             tools,
@@ -318,7 +319,10 @@ class GeminiProvider(BaseProvider):
                         tool_input=tool_args,
                     ))
 
-                result = executor.execute(tool_name, tool_args)
+                try:
+                    result = executor.execute(tool_name, tool_args)
+                except PermissionAbort as exc:
+                    return ("".join(text_parts) + f"\n\n[stopped: {exc}]").strip(), tool_log
                 self.raise_if_cancelled()
                 tool_log.append({
                     "tool": tool_name,

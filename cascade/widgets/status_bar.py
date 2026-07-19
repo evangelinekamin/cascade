@@ -80,11 +80,25 @@ class StatusBar(Static):
         self._override_text: str = ""
         self._flash: str = ""
         self._flash_timer = None
+        self._git_timer = None
 
         if not branch:
             b, d = _git_info()
             self._branch = b
             self._dirty = d
+
+    def on_mount(self) -> None:
+        # The branch/dirty state was a one-time snapshot, so it went stale
+        # after any commit or checkout mid-session. Refresh it on a slow
+        # interval (cheap git calls, off the hot path).
+        self._git_timer = self.set_interval(4.0, self._refresh_git)
+
+    def _refresh_git(self) -> None:
+        branch, dirty = _git_info()
+        if (branch, dirty) != (self._branch, self._dirty):
+            self._branch = branch
+            self._dirty = dirty
+            self.refresh()
 
     def render(self) -> Text:
         t = Text()

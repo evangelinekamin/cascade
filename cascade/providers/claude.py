@@ -71,10 +71,14 @@ class ClaudeProvider(BaseProvider):
 
         prompt = self._condense_for_cli(messages)
         workdir = self.get_working_directory()
-        # Non-interactive `claude -p` cannot prompt for approvals, so the
-        # posture maps onto its permission modes: auto keeps bypass (the
-        # subprocess runs its own tools; cascade-side gates cannot reach
-        # them), safe limits it to edits, readonly plans only.
+        # LIMITATION: a CLI-proxy provider runs its OWN tools inside the
+        # subprocess, which cascade's permission engine cannot see or gate.
+        # The sacred-path / dangerous-shell floors therefore do NOT apply to
+        # proxy tool calls -- only the coarse posture->CLI-mode mapping
+        # below does. The structural floors are enforced on the direct-API
+        # providers (openrouter/openai/local/...), Eve's post-08/05 daily
+        # drivers. Non-interactive `claude -p` cannot prompt, so posture
+        # maps onto its permission modes.
         posture = getattr(
             getattr(self, "permission_engine", None), "posture", "auto",
         )
@@ -197,6 +201,7 @@ class ClaudeProvider(BaseProvider):
         self._last_round_usage = None
 
         from ..tools.executor import ToolExecutor
+        from ..tools.permissions import PermissionAbort
 
         executor = ToolExecutor(
             tools,
@@ -286,7 +291,10 @@ class ClaudeProvider(BaseProvider):
                         tool_input=tool_input,
                     ))
 
-                result = executor.execute(tool_name, tool_input)
+                try:
+                    result = executor.execute(tool_name, tool_input)
+                except PermissionAbort as exc:
+                    return ("".join(text_parts) + f"\n\n[stopped: {exc}]").strip(), tool_log
                 self.raise_if_cancelled()
                 tool_log.append({
                     "tool": tool_name,

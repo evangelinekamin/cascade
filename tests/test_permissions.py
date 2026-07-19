@@ -481,3 +481,153 @@ class TestCascadeCoreWiring:
             {"posture": "auto", "allow": [], "deny": [], "ask": []}, {},
         )
         assert eng.posture == "auto"
+
+
+class TestTransparencyModel:
+    """Re-review round 2: the architectural fix. Auto posture never
+    auto-approves shell whose effect is not visible in its text."""
+
+    def _eng(self, **kw):
+        from pathlib import Path
+        kw.setdefault("workspace_root", str(Path.cwd()))
+        return PermissionEngine(**kw)
+
+    def test_inline_interpreter_code_asks(self):
+        eng = self._eng()
+        for cmd in (
+            'python3 -c "import shutil; shutil.rmtree(\'/x\')"',
+            "perl -e 'unlink glob \"*\"'",
+            "node -e 'process.exit()'",
+            "ruby -e 'x'",
+            "php -r 'x'",
+        ):
+            v = eng.evaluate(_tool("run_command"), "run_command", {"command": cmd})
+            assert v.decision == "ask", cmd
+            assert v.rule == "opaque-shell", cmd
+        # sh -c / bash -c ask too (opaque, or never-auto if the -c body itself
+        # contains a catastrophic literal).
+        for cmd in ("sh -c 'do-thing'", "bash -c 'evil'"):
+            v = eng.evaluate(_tool("run_command"), "run_command", {"command": cmd})
+            assert v.decision == "ask", cmd
+            assert v.rule in ("opaque-shell", "never-auto"), cmd
+
+    def test_variable_indirection_asks(self):
+        eng = self._eng()
+        for cmd in ("c=rm; $c -rf /", "x=sudo; $x reboot", "${EDITOR} /etc/passwd"):
+            v = eng.evaluate(_tool("run_command"), "run_command", {"command": cmd})
+            assert v.decision == "ask", cmd
+
+    def test_interpreter_with_dynamic_argument_asks(self):
+        eng = self._eng()
+        for cmd in ("p=/tmp/x.sh; sh $p", ". $x", "bash $script", "python $mod"):
+            v = eng.evaluate(_tool("run_command"), "run_command", {"command": cmd})
+            assert v.decision == "ask", cmd
+            assert v.rule == "opaque-shell", cmd
+        # source ~/.bashrc asks too -- via the sacred floor (correct).
+        v = eng.evaluate(_tool("run_command"), "run_command",
+                        {"command": "source $HOME/.bashrc"})
+        assert v.decision == "ask"
+
+    def test_transparent_dev_commands_still_auto_approve(self):
+        """Throughput preserved: common dev commands are transparent."""
+        eng = self._eng()
+        for cmd in (
+            "pytest -q", "git status", "git commit -m 'wip'", "npm test",
+            "python script.py", "cargo build --release", "ls -la",
+            "grep -r foo .", "make", "ruff check .", "cat file.txt",
+            "cd src && pytest", "docker build -t x .", "python -m pytest tests/",
+        ):
+            v = eng.evaluate(_tool("run_command"), "run_command", {"command": cmd})
+            assert v.decision == "allow", f"{cmd} -> {v.rule}"
+
+    def test_relative_recursive_rm_asks(self):
+        eng = self._eng()
+        for cmd in ("rm -rf .", "rm -rf ./*", "rm -rf ..", "rm -fr *"):
+            v = eng.evaluate(_tool("run_command"), "run_command", {"command": cmd})
+            assert v.decision == "ask", cmd
+
+    def test_cp_mv_dd_destinations_workspace_checked(self):
+        eng = self._eng()
+        v = eng.evaluate(_tool("run_command"), "run_command",
+                        {"command": "cp secret.txt /etc/passwd"})
+        assert v.decision == "ask"  # sacred or workspace
+        v2 = eng.evaluate(_tool("run_command"), "run_command",
+                         {"command": "dd if=/dev/zero of=/tmp/outside.img"})
+        assert v2.decision == "ask"
+        assert v2.rule == "workspace"
+
+    def test_opaque_shell_not_blanket_grantable(self):
+        eng = self._eng()
+        eng.ask_handler = lambda t, a, v: "always"
+        v = eng.resolve(_tool("run_command"), "run_command", {"command": "python -c 'x'"})
+        assert v.decision == "allow"  # this call
+        asked = []
+        eng.ask_handler = lambda t, a, v: (asked.append(1), "deny")[1]
+        eng.resolve(_tool("run_command"), "run_command", {"command": "python -c 'x'"})
+        assert asked  # asked again, not blanket-granted
+
+
+class TestEscalationStopsLoop:
+    """Denial-limit escalation raises PermissionAbort so the tool loop stops."""
+
+    def test_escalation_raises_permission_abort(self):
+        from cascade.tools.executor import ToolExecutor
+        from cascade.tools.permissions import PermissionAbort
+        from pathlib import Path
+
+        def writer(path: str) -> str:
+            """Write."""
+            return "ok"
+
+        tools = {"write_file": callable_to_tool_def("write_file", writer, "w")}
+        eng = PermissionEngine(posture="safe", workspace_root=str(Path.cwd()))
+        ex = ToolExecutor(tools, permissions=eng)
+        # First two denials return errors; the third trips escalation -> abort
+        assert "not permitted" in ex.execute("write_file", {"path": "/x"})
+        assert "not permitted" in ex.execute("write_file", {"path": "/y"})
+        import pytest
+        with pytest.raises(PermissionAbort):
+            ex.execute("write_file", {"path": "/z"})
+
+    def test_openai_tool_loop_stops_on_escalation(self):
+        import json as _json
+        from cascade.providers.openai_provider import OpenAIProvider
+        from pathlib import Path
+        from unittest.mock import patch, MagicMock
+
+        def _msgs(p):
+            return [{"role": "user", "content": p}]
+
+        def _tool_call_response(name, args, cid):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                "choices": [{"message": {"content": "", "tool_calls": [{
+                    "id": cid, "function": {"name": name, "arguments": _json.dumps(args)},
+                }]}, "finish_reason": "tool_calls"}],
+            }
+            r.raise_for_status = MagicMock()
+            return r
+
+        from cascade.providers.base import ProviderConfig
+        prov = OpenAIProvider(ProviderConfig(api_key="k", model="m", max_tokens=512))
+        prov.permission_engine = PermissionEngine(
+            posture="safe", workspace_root=str(Path.cwd()),
+        )
+
+        def writer(path: str) -> str:
+            """Write."""
+            return "wrote"
+
+        tools = {"write_file": callable_to_tool_def("write_file", writer, "w")}
+        # Distinct denied writes each round (so the doom-loop identical-args
+        # guard does not fire first) -- the denial-escalation must stop it.
+        responses = [
+            _tool_call_response("write_file", {"path": f"/etc/x{i}"}, f"c{i}")
+            for i in range(6)
+        ]
+        with patch.object(prov.client, "post", side_effect=responses):
+            text, log = prov.ask_with_tools(_msgs("go"), tools, max_rounds=6)
+        assert "stopped" in text  # PermissionAbort surfaced
+        assert len(log) < 6  # did not run all rounds

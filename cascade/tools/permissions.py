@@ -36,6 +36,11 @@ if TYPE_CHECKING:
     from .schema import ToolDef
 
 
+class PermissionAbort(Exception):
+    """Raised when the denial-escalation limit is hit: the tool loop must
+    stop and report rather than keep grinding against the gate."""
+
+
 @dataclass(frozen=True)
 class Verdict:
     decision: str  # "allow" | "ask" | "deny"
@@ -88,7 +93,7 @@ _NEVER_AUTO_SHELL = (
     (re.compile(r"(?<![\w-])n(?:et)?c(?:at)?(?![\w-])[^;|&\n]*\s-[a-z]*e"), "netcat exec"),
     (re.compile(r"(?<![\w-])(?:ba|z)?sh\s+-[a-z]*i\b[^;|&\n]*(?:/dev/tcp|>&|<&)"),
      "interactive reverse shell"),
-    (re.compile(r"(?<![\w-])rm\s+(?:-\S+\s+)*(?:-[a-z]*[rf][a-z]*|--recursive|--force)\b[^;|&\n]*\s(?:/[\w.*/@-]*|~\S*|\$\{?HOME\}?\S*)"),
+    (re.compile(r"(?<![\w-])rm\s+(?:-\S+\s+)*(?:-[a-z]*[rf][a-z]*|--recursive|--force)\b[^;|&\n]*\s(?:['\"]?/[\w.*/@-]*|~\S*|\$\{?HOME\}?\S*)"),
      "recursive rm on root/home"),
     (re.compile(r"(?<![\w-])mkfs(?![\w-])"), "mkfs"),
     (re.compile(r"(?<![\w-])dd\b[^;|&\n]*\sof=/dev/"), "dd to a device"),
@@ -106,6 +111,30 @@ _NEVER_AUTO_SHELL = (
 
 # Redirect / write operators whose targets must land in the workspace.
 _REDIRECT_TARGET = re.compile(r"(?:>>?|(?<![\w-])tee(?![\w-])\s+(?:-\S+\s+)*)\s*([^\s;|&>]+)")
+
+# dd of=PATH write destination.
+_DD_TARGET = re.compile(r"(?<![\w-])dd\b[^;|&\n]*\sof=([^\s;|&]+)")
+
+# Inline-code interpreter invocation (python -c, perl -e, node -e, sh -c,
+# php -r) or a stdin/heredoc script -- the intent is NOT visible in the
+# command text, so it can never be auto-approved.
+_INLINE_CODE = re.compile(
+    rf"(?<![\w-])(?:{_INTERPRETERS})\b[^;|&\n]*(?:\s-(?:e|c|r)\b|\s-\s|<<)"
+)
+
+# Command basenames that execute a script/code argument (so a dynamic
+# argument to one means running computed code).
+_CODE_RUNNERS = frozenset({
+    "sh", "bash", "zsh", "ksh", "dash", "fish", "source", ".",
+    "python", "python2", "python3", "perl", "ruby", "node", "php", "eval",
+})
+
+# Recursive/forced rm whose target is dangerous EVEN without an absolute
+# path: current dir, parent, or a glob wipes broadly. (Absolute/home
+# targets are handled by the never-auto rm rule.)
+_RM_RELATIVE_BROAD = re.compile(
+    r"(?<![\w-])rm\s+(?:-\S+\s+)*(?:-[a-z]*[rf][a-z]*|--recursive|--force)\b[^;|&\n]*\s(?:['\"]?\.{1,2}['\"]?(?:\s|$|/)|\S*\*)"
+)
 
 # Read-only documentation hosts auto-approved for web_fetch under the auto
 # posture -- GET-only reference material, the low-risk egress case.
@@ -231,8 +260,47 @@ def _shell_segments(command: str) -> list[str]:
 
 
 def _redirect_targets(command: str) -> list[str]:
-    """Filesystem paths a shell command writes to via > / >> / tee."""
-    return [t.strip().strip("'\"") for t in _REDIRECT_TARGET.findall(command) if t.strip()]
+    """Filesystem paths a shell command writes to (redirect, tee, dd, cp/mv)."""
+    targets = [t for t in _REDIRECT_TARGET.findall(command)]
+    targets += _DD_TARGET.findall(command)
+    # cp/mv/install write to their final argument.
+    for seg in _shell_segments(command):
+        toks = _shell_tokens(seg)
+        if toks and toks[0] in ("cp", "mv", "install") and len(toks) >= 2:
+            dest = toks[-1]
+            if not dest.startswith("-"):
+                targets.append(dest)
+    return [t.strip().strip("'\"") for t in targets if t and t.strip()]
+
+
+def _opaque_shell_reason(command: str) -> Optional[str]:
+    """Why a shell command's effect is NOT visible from its text, or None.
+
+    The never-auto floor is a lexical blocklist and cannot be made complete
+    against shell expansion, so the auto posture never auto-approves a
+    command whose intent is hidden: inline interpreter code (python -c),
+    or a command word assembled at runtime via variable/expansion. Such
+    commands ASK instead. Common transparent dev commands (pytest, git
+    status, python script.py, npm test) are unaffected.
+    """
+    if _INLINE_CODE.search(command):
+        return "inline interpreter code"
+    for seg in _shell_segments(command):
+        stripped = re.sub(r"^(?:\w+=\S*\s+)*", "", seg.strip())
+        if not stripped:
+            continue
+        tokens = stripped.split()
+        word = tokens[0]
+        if "$" in word or "`" in word:
+            return "command word built from an expansion"
+        # An interpreter/sourcer running a dynamic argument executes a
+        # computed script (`sh $p`, `source $x`, `python $mod`).
+        base = word.rsplit("/", 1)[-1]
+        if base in _CODE_RUNNERS and any(
+            "$" in tok or "`" in tok for tok in tokens[1:]
+        ):
+            return "interpreter running a dynamic argument"
+    return None
 
 
 class PermissionEngine:
@@ -377,6 +445,10 @@ class PermissionEngine:
                     return Verdict(
                         "ask", f"dangerous shell construct ({danger})", "never-auto",
                     )
+                if _RM_RELATIVE_BROAD.search(candidate):
+                    return Verdict(
+                        "ask", "recursive rm on '.'/'..'/glob", "never-auto",
+                    )
 
         for rule in self._ask:
             if rule.matches(tool_name, primary):
@@ -403,13 +475,19 @@ class PermissionEngine:
                 return Verdict("ask", "safe posture asks for mutations", "posture")
             return Verdict("allow", "safe posture allows reads", "posture")
 
-        # posture == "auto": auto-approve, but keep writes inside the
-        # workspace. Applies to file tools AND shell redirect targets.
+        # posture == "auto": auto-approve, but only what is transparent and
+        # workspace-contained.
         if is_write and not is_shell:
             path = arguments.get("path") or arguments.get("file_path") or ""
             if isinstance(path, str) and path and not self._in_workspace(path):
                 return Verdict("ask", f"write outside workspace ({path})", "workspace")
         if is_shell:
+            # A command whose effect is not visible in its text (inline
+            # interpreter code, a command word built from an expansion)
+            # can never be auto-approved -- the lexical floor cannot see
+            # through it. It asks instead.
+            if reason := _opaque_shell_reason(primary):
+                return Verdict("ask", f"opaque shell ({reason})", "opaque-shell")
             for target in _redirect_targets(primary):
                 if not self._in_workspace(target):
                     return Verdict(
@@ -449,6 +527,7 @@ class PermissionEngine:
         # "always allow docs.foo.com" covers every page on that host.
         grant_arg = _url_host(primary) if verdict.rule == "network" else primary
 
+        user_approved = False
         if verdict.decision == "ask":
             if self.ask_handler is not None:
                 answer = "deny"
@@ -459,11 +538,12 @@ class PermissionEngine:
                 if answer == "always" and self._is_grantable(verdict.rule):
                     self.grant_session(tool_name, grant_arg)
                     verdict = Verdict("allow", "approved (always this session)", verdict.rule)
+                    user_approved = True
                 elif answer in ("allow", "always"):
-                    # "always" on a non-grantable tier (sacred/never-auto/ask
-                    # rule) approves this one call only -- those tiers are
-                    # never blanket-granted.
+                    # "always" on a non-grantable tier (sacred/never-auto/
+                    # opaque/ask rule) approves this one call only.
                     verdict = Verdict("allow", "approved by user", verdict.rule)
+                    user_approved = True
                 else:
                     verdict = self._deny_and_escalate(
                         verdict, f"not approved: {verdict.reason}",
@@ -475,13 +555,12 @@ class PermissionEngine:
                     "choose a safer approach",
                 )
 
-        if verdict.decision == "allow":
-            # A genuine approval clears the streak; a read auto-allow does
-            # not, so a compromised agent cannot alternate reads to dodge
-            # the consecutive-denial escalation.
-            if verdict.rule != "read-only":
-                with self._lock:
-                    self.consecutive_denials = 0
+        # Only a genuine user approval clears the consecutive streak, so a
+        # compromised agent cannot alternate auto-allowed reads/writes to
+        # keep the escalation counter pinned at zero forever.
+        if user_approved:
+            with self._lock:
+                self.consecutive_denials = 0
 
         self._record(tool_name, primary, verdict)
         return verdict

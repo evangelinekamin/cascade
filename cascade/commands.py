@@ -1329,7 +1329,7 @@ class CommandHandler:
         if engine.audit:
             lines.append("")
             lines.append("Recent decisions:")
-            for tool_name, hint, decision, rule in engine.audit[-15:]:
+            for tool_name, hint, decision, rule in list(engine.audit)[-15:]:
                 arg = f" {hint}" if hint else ""
                 lines.append(f"  [{decision}] {tool_name}{arg}  ({rule})")
         else:

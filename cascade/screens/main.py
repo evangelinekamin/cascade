@@ -1051,6 +1051,7 @@ class MainScreen(Screen):
 
         result: dict = {}
         done = threading.Event()
+        screen_ref: dict = {}
 
         def _show() -> None:
             def _resolved(answer) -> None:
@@ -1058,10 +1059,10 @@ class MainScreen(Screen):
                 done.set()
 
             try:
-                self.app.push_screen(
-                    PermissionScreen(tool_name, arguments, verdict.reason),
-                    _resolved,
+                screen_ref["screen"] = PermissionScreen(
+                    tool_name, arguments, verdict.reason,
                 )
+                self.app.push_screen(screen_ref["screen"], _resolved)
             except Exception:
                 result["answer"] = "deny"
                 done.set()
@@ -1071,6 +1072,20 @@ class MainScreen(Screen):
         except Exception:
             return "deny"
         if not done.wait(timeout=120.0):
+            # Timed out waiting for the user: dismiss the modal so it does
+            # not linger on the screen stack after we return deny.
+            def _dismiss() -> None:
+                scr = screen_ref.get("screen")
+                if scr is not None and scr.is_running:
+                    try:
+                        scr.dismiss("deny")
+                    except Exception:
+                        pass
+
+            try:
+                self.app.call_from_thread(_dismiss)
+            except Exception:
+                pass
             return "deny"
         return result.get("answer", "deny")
 

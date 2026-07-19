@@ -409,7 +409,8 @@ class ConfigManager:
         merged = {**defaults, **(config or {})}
         posture = str(merged.get("posture", "auto")).lower()
         if posture not in ("auto", "safe", "readonly"):
-            posture = "auto"
+            # Fail closed: a typo must not silently open full auto.
+            posture = "safe"
         merged["posture"] = posture
         for key in ("allow", "deny", "ask"):
             value = merged.get(key)

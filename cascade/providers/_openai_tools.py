@@ -11,6 +11,7 @@ import httpx
 
 from .base import ToolEvent, ToolEventCallback
 from .usage import Usage
+from ..tools.permissions import PermissionAbort
 
 if TYPE_CHECKING:
     from .base import Message
@@ -419,7 +420,12 @@ def openai_ask_with_tools(
                 if dedup_key is not None and dedup_key in seen_reads:
                     result = f"[already read above: {dedup_key[1]}]"
                 else:
-                    result = executor.execute(tool_name, tool_args)
+                    try:
+                        result = executor.execute(tool_name, tool_args)
+                    except PermissionAbort as exc:
+                        _finalize_usage()
+                        note = f"\n\n[stopped: {exc}]"
+                        return (content + note).strip(), tool_log
                     if dedup_key is not None:
                         seen_reads.add(dedup_key)
             _checkpoint()
