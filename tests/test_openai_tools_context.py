@@ -367,9 +367,10 @@ def test_loop_does_not_deduplicate_distinct_paths():
 # --------------------------------------------------------------------------- #
 
 
-def test_provider_config_defaults_context_window_to_128k():
+def test_provider_config_context_window_defaults_to_none():
+    """None delegates window resolution to cascade.context.budget.window_for."""
     cfg = ProviderConfig(api_key="k", model="m")
-    assert cfg.context_window == 128000
+    assert cfg.context_window is None
 
 
 def _capture_context_window(module_path: str):

@@ -207,15 +207,15 @@ def test_get_provider_config_still_requires_key_by_default():
         assert manager.get_provider_config("custom") is None
 
 
-def test_provider_config_reads_context_window_default_128k():
-    """A provider without an explicit context_window defaults to 128000."""
+def test_provider_config_context_window_defaults_to_none():
+    """No explicit context_window means None: resolved via context.budget."""
     with tempfile.TemporaryDirectory() as tmpdir:
         config_path = Path(tmpdir) / "config.yaml"
         manager = ConfigManager(str(config_path))
 
         manager.apply_credential("openai", "sk-test-token")
         config = manager.get_provider_config("openai")
-        assert config.context_window == 128000
+        assert config.context_window is None
 
 
 def test_provider_config_reads_explicit_context_window():

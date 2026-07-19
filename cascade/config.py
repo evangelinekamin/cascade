@@ -234,7 +234,7 @@ class ConfigManager:
             temperature=provider_data.get("temperature", 0.7),
             max_tokens=provider_data.get("max_tokens"),
             fallback_model=provider_data.get("fallback_model"),
-            context_window=provider_data.get("context_window", 128000),
+            context_window=provider_data.get("context_window"),
             provider_preferences=provider_data.get("provider_preferences"),
         )
 

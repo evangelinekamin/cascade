@@ -45,9 +45,10 @@ class ProviderConfig:
     temperature: float = 0.7
     max_tokens: Optional[int] = None
     fallback_model: Optional[str] = None
-    # The model's real context window in tokens. Drives tool-loop eviction so
-    # small-window self-hosted models (local/glm at 32K) do not overflow.
-    context_window: int = 128000
+    # The model's real context window in tokens when explicitly configured
+    # (local/glm ship 32768). None means "unknown" — resolve through
+    # cascade.context.budget.window_for, the single accounting authority.
+    context_window: Optional[int] = None
     # OpenRouter upstream-host routing preferences, passed straight through as
     # the request's "provider" field (e.g. {"order": [...], "allow_fallbacks":
     # True}). Pins good-quant hosts so throughput-sorted routing cannot silently

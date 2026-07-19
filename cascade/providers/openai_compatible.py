@@ -24,6 +24,7 @@ from .base import BaseProvider, ProviderConfig, Message, ToolEventCallback
 from .registry import register_provider
 from ._openai_tools import openai_ask_with_tools
 from .usage import Usage
+from ..context.budget import window_for
 
 if TYPE_CHECKING:
     from ..tools.schema import ToolDef
@@ -151,7 +152,9 @@ class OpenAICompatibleProvider(BaseProvider):
             max_rounds=max_rounds,
             on_tool_event=on_tool_event,
             on_usage=lambda usage: setattr(self, "_last_usage", usage),
-            context_window=self.config.context_window,
+            context_window=window_for(
+                "", self.model, self.config.context_window,
+            ),
             check_cancelled=self.raise_if_cancelled,
         )
 

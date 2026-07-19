@@ -13,6 +13,7 @@ import httpx
 from .base import BaseProvider, ProviderConfig, Message, ToolEventCallback
 from ._cli_proxy import CLIProxyConfig, CodexEventHandler, stream_cli_proxy
 from .usage import Usage
+from ..context.budget import window_for
 from ._openai_tools import openai_ask_with_tools
 from .registry import register_provider
 
@@ -649,7 +650,9 @@ class OpenAIProvider(BaseProvider):
             max_rounds=max_rounds,
             on_tool_event=on_tool_event,
             on_usage=lambda usage: setattr(self, "_last_usage", usage),
-            context_window=self.config.context_window,
+            context_window=window_for(
+                "openai", self.config.model, self.config.context_window,
+            ),
             check_cancelled=self.raise_if_cancelled,
         )
 

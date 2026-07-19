@@ -11,22 +11,13 @@ key decisions, artifacts, and outcomes without burning model tokens.
 
 from typing import TYPE_CHECKING
 
+from .context.budget import compact_threshold, current_tokens, window_for
 from .episodes import Episode, compact_to_episodes, episodes_to_context
 
 if TYPE_CHECKING:
+    from .providers.usage import Usage
     from .state import ChatMessage
     from .providers.base import BaseProvider, Message
-
-
-# Rough context window sizes by model family (tokens)
-CONTEXT_WINDOWS: dict[str, int] = {
-    "gemini": 1_000_000,
-    "claude": 200_000,
-    "openai": 200_000,
-    "openrouter": 128_000,
-}
-
-COMPACTION_THRESHOLD = 0.75
 
 
 def state_messages_to_provider(
@@ -122,10 +113,23 @@ def estimate_tokens(messages: list["Message"]) -> int:
     return sum(len(m.get("content", "")) for m in messages) // 4
 
 
-def needs_compaction(messages: list["Message"], provider: str) -> bool:
-    """Return True when estimated tokens exceed the compaction threshold."""
-    window = CONTEXT_WINDOWS.get(provider, 128_000)
-    return estimate_tokens(messages) > int(window * COMPACTION_THRESHOLD)
+def needs_compaction(
+    messages: list["Message"],
+    provider: str,
+    model: str = "",
+    configured_window: int | None = None,
+    anchor: "Usage | None" = None,
+) -> bool:
+    """Return True when context occupancy exceeds the compaction threshold.
+
+    With an ``anchor`` (the last provider response's Usage), occupancy is
+    the anchored total plus a chars/4 estimate of ``messages`` — the
+    caller passes only the un-sent tail. Without one, the whole message
+    list is estimated (legacy behavior).
+    """
+    window = window_for(provider, model, configured_window)
+    chars = sum(len(m.get("content", "")) for m in messages)
+    return current_tokens(anchor, chars) > compact_threshold(window)
 
 
 def compact_messages_with_episodes(
