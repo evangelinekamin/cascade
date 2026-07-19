@@ -551,6 +551,7 @@ class OpenAIProvider(BaseProvider):
                     self._codex_sessions.setdefault(session_key, session_id)
                 if handler.last_usage:
                     self._last_usage = handler.last_usage
+                    self._last_round_usage = handler.last_usage
                 return
 
     def ask(self, messages: list[Message], system: Optional[str] = None) -> str:
@@ -560,6 +561,7 @@ class OpenAIProvider(BaseProvider):
     def stream(self, messages: list[Message], system: Optional[str] = None) -> Iterator[str]:
         """Stream tokens from OpenAI."""
         self._last_usage = None
+        self._last_round_usage = None
         self.reset_activity_state()
         if self._use_cli_proxy:
             yield from self._filter_activity(self._stream_via_cli(messages, system))
@@ -613,6 +615,7 @@ class OpenAIProvider(BaseProvider):
                         usage = data.get("usage")
                         if usage:
                             self._last_usage = Usage.from_openai(usage)
+                            self._last_round_usage = self._last_usage
                         choices = data.get("choices", [])
                         if choices:
                             delta = choices[0].get("delta", {})
@@ -638,6 +641,7 @@ class OpenAIProvider(BaseProvider):
         if self._use_cli_proxy:
             return self.ask(messages, system), []
         self._last_usage = None
+        self._last_round_usage = None
 
         return openai_ask_with_tools(
             client=self.client,
@@ -652,6 +656,7 @@ class OpenAIProvider(BaseProvider):
             max_rounds=max_rounds,
             on_tool_event=on_tool_event,
             on_usage=lambda usage: setattr(self, "_last_usage", usage),
+            on_round_usage=lambda usage: setattr(self, "_last_round_usage", usage),
             hook_runner=self.hook_runner,
             context_window=window_for(
                 "openai", self.config.model, self.config.context_window,

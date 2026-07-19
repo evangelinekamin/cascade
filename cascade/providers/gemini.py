@@ -107,6 +107,7 @@ class GeminiProvider(BaseProvider):
             )
         if handler.last_usage:
             self._last_usage = handler.last_usage
+            self._last_round_usage = handler.last_usage
 
     def ask(self, messages: list[Message], system: Optional[str] = None) -> str:
         """Get a complete response from Gemini."""
@@ -115,6 +116,7 @@ class GeminiProvider(BaseProvider):
     def stream(self, messages: list[Message], system: Optional[str] = None) -> Iterator[str]:
         """Stream tokens from Gemini."""
         self._last_usage = None
+        self._last_round_usage = None
         self.reset_activity_state()
         if self._use_cli_proxy:
             yield from self._filter_activity(self._stream_via_cli(messages, system))
@@ -162,6 +164,7 @@ class GeminiProvider(BaseProvider):
                                 parsed = Usage.from_gemini(usage)
                                 if parsed.total:
                                     self._last_usage = parsed
+                                    self._last_round_usage = parsed
                         except json.JSONDecodeError:
                             continue
         except httpx.HTTPStatusError as exc:
@@ -180,6 +183,8 @@ class GeminiProvider(BaseProvider):
         """Gemini-native tool calling using function_declarations."""
         if self._use_cli_proxy:
             return self.ask(messages, system), []
+        self._last_usage = None
+        self._last_round_usage = None
 
         from ..tools.executor import ToolExecutor
 
@@ -222,6 +227,14 @@ class GeminiProvider(BaseProvider):
             except httpx.RequestError as exc:
                 raise RuntimeError(str(exc)) from exc
             self.raise_if_cancelled()
+
+            round_meta = data.get("usageMetadata", {})
+            if isinstance(round_meta, dict) and round_meta:
+                round_usage = Usage.from_gemini(round_meta)
+                if round_usage.total:
+                    prev = self._last_usage or Usage()
+                    self._last_usage = prev.add(round_usage)
+                    self._last_round_usage = round_usage
 
             # Parse response parts
             candidates = data.get("candidates", [])

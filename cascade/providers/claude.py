@@ -99,6 +99,7 @@ class ClaudeProvider(BaseProvider):
             )
         if handler.last_usage:
             self._last_usage = handler.last_usage
+            self._last_round_usage = handler.last_usage
 
     def ask(self, messages: list[Message], system: Optional[str] = None) -> str:
         """Get a complete response from Claude."""
@@ -107,6 +108,7 @@ class ClaudeProvider(BaseProvider):
     def stream(self, messages: list[Message], system: Optional[str] = None) -> Iterator[str]:
         """Stream tokens from Claude."""
         self._last_usage = None
+        self._last_round_usage = None
         self.reset_activity_state()
         if self._use_cli_proxy:
             yield from self._filter_activity(self._stream_via_cli(messages, system))
@@ -153,9 +155,11 @@ class ClaudeProvider(BaseProvider):
                                 if out_tokens:
                                     prev = self._last_usage or Usage()
                                     self._last_usage = replace(prev, output=out_tokens)
+                                    self._last_round_usage = self._last_usage
                             elif data.get("type") == "message_start":
                                 usage = data.get("message", {}).get("usage", {})
                                 self._last_usage = Usage.from_anthropic(usage)
+                                self._last_round_usage = self._last_usage
                         except json.JSONDecodeError:
                             continue
         except httpx.HTTPStatusError as exc:
@@ -174,6 +178,8 @@ class ClaudeProvider(BaseProvider):
         """Claude-native tool calling using tools array + tool_use/tool_result."""
         if self._use_cli_proxy:
             return self.ask(messages, system), []
+        self._last_usage = None
+        self._last_round_usage = None
 
         from ..tools.executor import ToolExecutor
 
@@ -218,11 +224,13 @@ class ClaudeProvider(BaseProvider):
                 raise RuntimeError(str(exc)) from exc
             self.raise_if_cancelled()
 
-            # Capture token usage (accumulated across tool rounds)
+            # Capture token usage: accumulate for spend, keep the final
+            # round separately as the context anchor.
             round_usage = Usage.from_anthropic(data.get("usage", {}))
             if round_usage.total:
                 prev = self._last_usage or Usage()
                 self._last_usage = prev.add(round_usage)
+                self._last_round_usage = round_usage
 
             # Check stop reason
             stop_reason = data.get("stop_reason", "end_turn")

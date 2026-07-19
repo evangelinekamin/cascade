@@ -204,6 +204,7 @@ def openai_ask_with_tools(
     max_rounds: int = 5,
     on_tool_event: ToolEventCallback = None,
     on_usage: Optional[Callable[[Usage], None]] = None,
+    on_round_usage: Optional[Callable[[Usage], None]] = None,
     hook_runner=None,
     context_window: int = 128000,
     provider_preferences: Optional[dict] = None,
@@ -259,6 +260,7 @@ def openai_ask_with_tools(
     tool_log = []
     content = ""
     total_usage = Usage()
+    round_usage = None
     budget = int(context_window * _CONTEXT_BUDGET_FRACTION)
     seen_reads: set[tuple[str, str]] = set()
     doom_streak = 0
@@ -267,17 +269,20 @@ def openai_ask_with_tools(
     run_counts: dict[str, int] = {}
 
     def _capture_usage(data: dict) -> None:
-        nonlocal total_usage
+        nonlocal total_usage, round_usage
         usage = data.get("usage", {})
         if not isinstance(usage, dict):
             return
         parsed = Usage.from_openai(usage)
         if parsed.total or parsed.cost:
             total_usage = total_usage.add(parsed)
+            round_usage = parsed
 
     def _finalize_usage() -> None:
         if on_usage is not None and (total_usage.total or total_usage.cost):
             on_usage(total_usage)
+        if on_round_usage is not None and round_usage is not None:
+            on_round_usage(round_usage)
 
     def _checkpoint() -> None:
         if check_cancelled is not None:

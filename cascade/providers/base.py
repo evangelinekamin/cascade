@@ -66,6 +66,7 @@ class BaseProvider(ABC):
         self.config = config
         self.name = self.__class__.__name__
         self._last_usage: Optional[Usage] = None
+        self._last_round_usage: Optional[Usage] = None
         # Wired by CascadeCore after construction so TOOL_CALL/TOOL_RESULT
         # hooks (and the permission gate that rides them) fire inside every
         # provider tool loop. None disables hook gating.
@@ -78,8 +79,18 @@ class BaseProvider(ABC):
 
     @property
     def last_usage(self) -> Optional[Usage]:
-        """Normalized token usage accumulated over the last ask/stream call."""
+        """Usage accumulated over the last call (all tool rounds) — spend."""
         return self._last_usage
+
+    @property
+    def last_round_usage(self) -> Optional[Usage]:
+        """Usage of the final request round only — the context anchor.
+
+        Its prompt side already covers the whole conversation the model
+        saw, so context accounting must use this, never the accumulated
+        ``last_usage`` (which re-counts the prompt once per tool round).
+        """
+        return self._last_round_usage
 
     @property
     def last_activity(self) -> Optional[str]:

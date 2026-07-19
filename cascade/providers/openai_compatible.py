@@ -85,6 +85,7 @@ class OpenAICompatibleProvider(BaseProvider):
     def stream(self, messages: list[Message], system: Optional[str] = None) -> Iterator[str]:
         """Stream tokens from the OpenAI-compatible endpoint."""
         self._last_usage = None
+        self._last_round_usage = None
         url = f"{self.base_url}/chat/completions"
         payload = {
             "model": self.model,
@@ -118,6 +119,7 @@ class OpenAICompatibleProvider(BaseProvider):
                     usage = data.get("usage")
                     if usage:
                         self._last_usage = Usage.from_openai(usage)
+                        self._last_round_usage = self._last_usage
                     choices = data.get("choices", [])
                     if choices:
                         delta = choices[0].get("delta", {})
@@ -139,6 +141,7 @@ class OpenAICompatibleProvider(BaseProvider):
     ) -> tuple[str, list[dict]]:
         """OpenAI-compatible tool calling via the shared loop."""
         self._last_usage = None
+        self._last_round_usage = None
         return openai_ask_with_tools(
             client=self.client,
             url=f"{self.base_url}/chat/completions",
@@ -152,7 +155,8 @@ class OpenAICompatibleProvider(BaseProvider):
             max_rounds=max_rounds,
             on_tool_event=on_tool_event,
             on_usage=lambda usage: setattr(self, "_last_usage", usage),
-                hook_runner=self.hook_runner,
+            on_round_usage=lambda usage: setattr(self, "_last_round_usage", usage),
+            hook_runner=self.hook_runner,
             context_window=window_for(
                 "", self.model, self.config.context_window,
             ),

@@ -590,3 +590,31 @@ class TestHookGating:
 
         assert result == "done"
         assert executed == ["ping"]
+
+
+class TestRoundUsageAnchor:
+    """last_usage accumulates spend across rounds; last_round_usage is the
+    final round only -- the context anchor must never be the multi-round sum."""
+
+    def test_two_round_loop_splits_spend_from_anchor(self):
+        from cascade.providers.openai_provider import OpenAIProvider
+
+        def echo(message: str) -> str:
+            """Echo a message back."""
+            return message
+
+        tools = {"echo": callable_to_tool_def("echo", echo, "Echo tool")}
+        prov = OpenAIProvider(_make_config())
+
+        round1 = _tool_call_response("echo", {"message": "ping"}, "call_1")
+        round1.json.return_value["usage"] = {"prompt_tokens": 100, "completion_tokens": 10}
+        round2 = _text_response("done")
+        round2.json.return_value["usage"] = {"prompt_tokens": 150, "completion_tokens": 5}
+
+        with patch.object(prov.client, "post", side_effect=[round1, round2]):
+            result, _log = prov.ask_with_tools(_msgs("echo ping"), tools)
+
+        assert result == "done"
+        assert prov.last_usage == Usage(input=250, output=15)
+        assert prov.last_round_usage == Usage(input=150, output=5)
+        assert prov.last_round_usage.total < prov.last_usage.total
