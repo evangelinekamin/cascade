@@ -566,13 +566,13 @@ class OpenAIProvider(BaseProvider):
             return
         if self._use_oauth_cli and not self._use_cli_proxy:
             if not self._codex_bin:
-                yield "Error: Codex OAuth token detected, but codex CLI is not in PATH."
-            else:
-                yield (
-                    "Error: Codex OAuth token requires the default OpenAI base URL "
-                    "(https://api.openai.com/v1)."
+                raise RuntimeError(
+                    "Codex OAuth token detected, but codex CLI is not in PATH."
                 )
-            return
+            raise RuntimeError(
+                "Codex OAuth token requires the default OpenAI base URL "
+                "(https://api.openai.com/v1)."
+            )
 
         try:
             url = f"{self.base_url}/chat/completions"
@@ -621,8 +621,10 @@ class OpenAIProvider(BaseProvider):
                                 yield content
                     except json.JSONDecodeError:
                         continue
-        except Exception as e:
-            yield f"Error: {str(e)}"
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(str(exc)) from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     def ask_with_tools(
         self,
@@ -650,6 +652,7 @@ class OpenAIProvider(BaseProvider):
             max_rounds=max_rounds,
             on_tool_event=on_tool_event,
             on_usage=lambda usage: setattr(self, "_last_usage", usage),
+            hook_runner=self.hook_runner,
             context_window=window_for(
                 "openai", self.config.model, self.config.context_window,
             ),

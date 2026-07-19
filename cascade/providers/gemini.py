@@ -164,8 +164,10 @@ class GeminiProvider(BaseProvider):
                                     self._last_usage = parsed
                         except json.JSONDecodeError:
                             continue
-        except Exception as e:
-            yield f"Error: {str(e)}"
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(str(exc)) from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     def ask_with_tools(
         self,
@@ -181,7 +183,7 @@ class GeminiProvider(BaseProvider):
 
         from ..tools.executor import ToolExecutor
 
-        executor = ToolExecutor(tools)
+        executor = ToolExecutor(tools, hook_runner=self.hook_runner)
 
         # Build Gemini function declarations
         function_declarations = []
@@ -215,8 +217,10 @@ class GeminiProvider(BaseProvider):
                 response = self.client.post(url, json=payload, params=params, headers=headers)
                 response.raise_for_status()
                 data = response.json()
-            except Exception as e:
-                return f"Error: {e}", tool_log
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(str(exc)) from exc
+            except httpx.RequestError as exc:
+                raise RuntimeError(str(exc)) from exc
             self.raise_if_cancelled()
 
             # Parse response parts

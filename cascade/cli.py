@@ -49,6 +49,7 @@ class CascadeCore:
         self.project = ProjectContext()
         self.prompt_pipeline = self._build_prompt_pipeline()
         self.hook_runner = self._build_hook_runner()
+        self._wire_provider_hooks()
         self.tool_registry = self._build_tool_registry()
         self.context_builder = ContextBuilder()
         self.last_response_meta: Optional[ProviderResponse] = None
@@ -82,6 +83,15 @@ class CascadeCore:
                     self.providers[provider_name] = provider_class(config)
                 except Exception as e:
                     console.print(f"Failed to initialize {provider_name}: {e}", style="dim red")
+        self._wire_provider_hooks()
+
+    def _wire_provider_hooks(self) -> None:
+        """Attach the hook runner to every provider's tool loop."""
+        runner = getattr(self, "hook_runner", None)
+        if runner is None:
+            return
+        for provider in self.providers.values():
+            provider.hook_runner = runner
 
     def _build_prompt_pipeline(self) -> PromptPipeline:
         """Assemble the system prompt pipeline from config and project context."""

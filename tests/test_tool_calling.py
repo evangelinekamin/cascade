@@ -504,3 +504,89 @@ class TestOpenRouterToolCalling:
         second_payload = mock_post.call_args_list[1].kwargs["json"]
         assert first_payload["model"] == "qwen/qwen3.5-9b"
         assert second_payload["model"] == "minimax/minimax-m2.5"
+
+
+class TestHookGating:
+    """TOOL_CALL hooks must actually gate tool execution inside provider loops.
+
+    Regression guard: every live ToolExecutor used to be constructed
+    without a hook_runner, so hooks could never block a real tool call.
+    """
+
+    class _BlockingRunner:
+        """Minimal HookRunner stand-in blocking every TOOL_CALL."""
+
+        def __init__(self):
+            self.tool_call_events = 0
+
+        def emit(self, event, ctx=None):
+            from types import SimpleNamespace
+
+            from cascade.hooks import HookEvent
+
+            if event == HookEvent.TOOL_CALL:
+                self.tool_call_events += 1
+                return SimpleNamespace(
+                    block=True, reason="denied by test", transformed_value=None,
+                )
+            return None
+
+    def test_blocking_hook_prevents_tool_execution_in_openai_loop(self):
+        from cascade.providers.openai_provider import OpenAIProvider
+
+        executed = []
+
+        def echo(message: str) -> str:
+            """Echo a message back."""
+            executed.append(message)
+            return message
+
+        tools = {"echo": callable_to_tool_def("echo", echo, "Echo tool")}
+        prov = OpenAIProvider(_make_config())
+        runner = self._BlockingRunner()
+        prov.hook_runner = runner
+
+        responses = [
+            _tool_call_response("echo", {"message": "ping"}, "call_1"),
+            _text_response("done"),
+        ]
+        with patch.object(prov.client, "post", side_effect=responses) as mock_post:
+            result, log = prov.ask_with_tools(_msgs("echo ping"), tools)
+
+            # The blocked result is what the model sees in round 2
+            second_payload = mock_post.call_args_list[1].kwargs.get("json") \
+                or mock_post.call_args_list[1][1].get("json")
+            tool_messages = [
+                m for m in second_payload["messages"] if m.get("role") == "tool"
+            ]
+            assert len(tool_messages) == 1
+            assert "blocked by hook" in tool_messages[0]["content"]
+            assert "denied by test" in tool_messages[0]["content"]
+
+        assert result == "done"
+        assert executed == []
+        assert runner.tool_call_events == 1
+
+    def test_provider_without_hook_runner_still_executes_tools(self):
+        from cascade.providers.openai_provider import OpenAIProvider
+
+        executed = []
+
+        def echo(message: str) -> str:
+            """Echo a message back."""
+            executed.append(message)
+            return message
+
+        tools = {"echo": callable_to_tool_def("echo", echo, "Echo tool")}
+        prov = OpenAIProvider(_make_config())
+        assert prov.hook_runner is None
+
+        responses = [
+            _tool_call_response("echo", {"message": "ping"}, "call_1"),
+            _text_response("done"),
+        ]
+        with patch.object(prov.client, "post", side_effect=responses):
+            result, _log = prov.ask_with_tools(_msgs("echo ping"), tools)
+
+        assert result == "done"
+        assert executed == ["ping"]

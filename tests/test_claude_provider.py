@@ -58,15 +58,19 @@ def test_stream_cli_parses_deltas_and_usage():
     assert provider.last_usage == Usage(input=11, output=3)
 
 
-def test_oauth_token_without_claude_binary_returns_clear_error():
-    """OAuth token without claude CLI should not fall back to raw API."""
+def test_oauth_token_without_claude_binary_raises_clear_error():
+    """OAuth token without claude CLI raises instead of yielding error text.
+
+    Yielded error strings get recorded as successful assistant messages;
+    a raise surfaces through the FAILED-run path.
+    """
     with patch("cascade.providers.claude.shutil.which", return_value=None):
         provider = ClaudeProvider(
             ProviderConfig(api_key="sk-ant-oat01-test-token", model="claude-opus-4-6")
         )
 
-    chunks = list(provider.stream_single("hello"))
-    assert chunks == ["Error: Claude OAuth token detected, but claude CLI is not in PATH."]
+    with pytest.raises(RuntimeError, match="claude CLI is not in PATH"):
+        list(provider.stream_single("hello"))
 
 
 def test_stream_cli_raises_on_authentication_failure_payload():

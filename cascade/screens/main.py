@@ -16,7 +16,7 @@ from textual.app import ComposeResult
 from textual.widgets import Input, Static
 
 from ..episodes import generate_episode
-from ..providers.base import ProviderConfig, ToolEvent
+from ..providers.base import ToolEvent
 from ..providers.usage import Usage
 from ..widgets.header import WelcomeHeader, ProviderGhostTable
 from ..widgets.message import ChatHistory, MessageWidget, ThinkingIndicator

@@ -112,8 +112,9 @@ class ClaudeProvider(BaseProvider):
             yield from self._filter_activity(self._stream_via_cli(messages, system))
             return
         if self._use_oauth_cli and not self._claude_bin:
-            yield "Error: Claude OAuth token detected, but claude CLI is not in PATH."
-            return
+            raise RuntimeError(
+                "Claude OAuth token detected, but claude CLI is not in PATH."
+            )
 
         try:
             url = f"{self.base_url}/messages"
@@ -157,8 +158,10 @@ class ClaudeProvider(BaseProvider):
                                 self._last_usage = Usage.from_anthropic(usage)
                         except json.JSONDecodeError:
                             continue
-        except Exception as e:
-            yield f"Error: {str(e)}"
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(str(exc)) from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(str(exc)) from exc
 
     def ask_with_tools(
         self,
@@ -174,7 +177,7 @@ class ClaudeProvider(BaseProvider):
 
         from ..tools.executor import ToolExecutor
 
-        executor = ToolExecutor(tools)
+        executor = ToolExecutor(tools, hook_runner=self.hook_runner)
         tool_defs = [
             {
                 "name": td.name,
@@ -209,8 +212,10 @@ class ClaudeProvider(BaseProvider):
                 response = self.client.post(url, json=payload, headers=self._headers())
                 response.raise_for_status()
                 data = response.json()
-            except Exception as e:
-                return f"Error: {e}", tool_log
+            except httpx.HTTPStatusError as exc:
+                raise RuntimeError(str(exc)) from exc
+            except httpx.RequestError as exc:
+                raise RuntimeError(str(exc)) from exc
             self.raise_if_cancelled()
 
             # Capture token usage (accumulated across tool rounds)

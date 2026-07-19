@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from .usage import Usage
 
 if TYPE_CHECKING:
+    from ..hooks import HookRunner
     from ..tools.schema import ToolDef
 
 
@@ -65,6 +66,10 @@ class BaseProvider(ABC):
         self.config = config
         self.name = self.__class__.__name__
         self._last_usage: Optional[Usage] = None
+        # Wired by CascadeCore after construction so TOOL_CALL/TOOL_RESULT
+        # hooks (and the permission gate that rides them) fire inside every
+        # provider tool loop. None disables hook gating.
+        self.hook_runner: Optional["HookRunner"] = None
         self._last_activity: Optional[str] = None
         self._last_activity_key: Optional[str] = None
         self._emit_activity: bool = False

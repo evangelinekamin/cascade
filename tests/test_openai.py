@@ -3,6 +3,7 @@
 import os
 from contextlib import contextmanager
 from pathlib import Path
+import pytest
 from unittest.mock import patch
 
 from cascade.providers.base import ProviderConfig
@@ -115,15 +116,15 @@ def test_stream_cli_parses_agent_message_and_usage():
     assert provider.last_usage == Usage(input=9, output=2)
 
 
-def test_oauth_token_without_codex_binary_returns_clear_error():
-    """OAuth token without codex CLI should not fall back to raw API."""
+def test_oauth_token_without_codex_binary_raises_clear_error():
+    """OAuth token without codex CLI raises instead of yielding error text."""
     with patch("cascade.providers.openai_provider.shutil.which", return_value=None):
         provider = OpenAIProvider(
             ProviderConfig(api_key="eyJ.a.b", model="gpt-5.3-codex")
         )
 
-    chunks = list(provider.stream_single("hello"))
-    assert chunks == ["Error: Codex OAuth token detected, but codex CLI is not in PATH."]
+    with pytest.raises(RuntimeError, match="codex CLI is not in PATH"):
+        list(provider.stream_single("hello"))
 
 
 def test_cli_proxy_uses_focused_workspace_for_non_agentic_file_audit(tmp_path):
