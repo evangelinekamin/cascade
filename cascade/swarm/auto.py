@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -135,13 +136,34 @@ _FAST_EDIT_RE = re.compile(
 )
 
 
+def _is_git_worktree() -> bool:
+    """Whether the launch directory sits inside a git work tree.
+
+    Every non-chat workflow builds in a git worktree, so orchestration is only
+    meaningful inside a repository. Outside one, prompts must fall back to
+    ordinary chat rather than die on a raw ``fatal: not a git repository``.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
 def should_auto_orchestrate(app, mode: str) -> bool:
     """Return whether ordinary prompts in *mode* should be model-routed."""
     try:
         config = app.config.get_orchestration_config()
     except Exception:
         return False
-    return bool(config.get("enabled")) and mode in config.get("modes", ())
+    if not (bool(config.get("enabled")) and mode in config.get("modes", ())):
+        return False
+    # All routed workflows build in a git worktree; outside a repository there is
+    # nothing to orchestrate, so let the prompt fall through to ordinary chat.
+    return _is_git_worktree()
 
 
 def _lane_provider(app, provider_name: str, model: str, preferences: dict):

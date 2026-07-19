@@ -82,12 +82,24 @@ def _app():
     ), original
 
 
-def test_auto_routing_is_limited_to_configured_modes():
+def test_auto_routing_is_limited_to_configured_modes(monkeypatch):
+    monkeypatch.setattr(auto, "_is_git_worktree", lambda: True)
     app, _original = _app()
     assert auto.should_auto_orchestrate(app, "build") is True
     assert auto.should_auto_orchestrate(app, "design") is True
     app.config.orchestration["modes"] = ["build"]
     assert auto.should_auto_orchestrate(app, "design") is False
+
+
+def test_auto_routing_requires_a_git_worktree(monkeypatch):
+    app, _original = _app()
+    # Inside a repository an enabled, configured mode orchestrates.
+    monkeypatch.setattr(auto, "_is_git_worktree", lambda: True)
+    assert auto.should_auto_orchestrate(app, "build") is True
+    # Outside one it falls back to ordinary chat, so a prompt in a non-git
+    # directory never reaches the worktree manager and its raw git error.
+    monkeypatch.setattr(auto, "_is_git_worktree", lambda: False)
+    assert auto.should_auto_orchestrate(app, "build") is False
 
 
 def test_selector_uses_gpt_oss_on_cerebras_without_mutating_chat_provider():
