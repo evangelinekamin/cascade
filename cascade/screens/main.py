@@ -61,7 +61,7 @@ class MainScreen(Screen):
         ("shift+tab", "cycle_mode", "Cycle Mode"),
         ("ctrl+c", "exit_app", "Exit"),
         ("ctrl+d", "exit_app", "Exit"),
-        ("escape", "blur_input", "Focus Chat"),
+        ("escape", "escape", "Interrupt / Focus Chat"),
         ("pageup", "scroll_up", "Scroll Up"),
         ("pagedown", "scroll_down", "Scroll Down"),
         ("home", "scroll_home", "Scroll Top"),
@@ -1477,6 +1477,14 @@ class MainScreen(Screen):
             messages_received=self.app.state.response_count,
             tokens=dict(self.app.state.provider_tokens),
         ))
+
+    def action_escape(self) -> None:
+        """Esc interrupts a running generation (like Claude Code); if nothing
+        is running, it falls back to moving focus to the chat scroll."""
+        if self._active_run is not None:
+            self._interrupt_active_run()
+            return
+        self.action_blur_input()
 
     def action_blur_input(self) -> None:
         try:
