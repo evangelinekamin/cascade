@@ -157,6 +157,7 @@ class OpenAICompatibleProvider(BaseProvider):
             on_usage=lambda usage: setattr(self, "_last_usage", usage),
             on_round_usage=lambda usage: setattr(self, "_last_round_usage", usage),
             hook_runner=self.hook_runner,
+                permissions=self.permission_engine,
             context_window=window_for(
                 "", self.model, self.config.context_window,
             ),

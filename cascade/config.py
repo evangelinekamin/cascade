@@ -125,11 +125,10 @@ class ConfigManager:
                 # summary -> carry compact handoff summary + provider-local turns
                 # full    -> carry recent full transcript across providers
                 "cross_model_memory": "summary",
-                # Re-compact summary every N assistant turns in summary mode.
+                # Tier-2 structured summary at compaction (fast-tier model call).
                 "compaction_summary": True,
-                "compaction_summary": True,
-            "summary_turn_interval": 6,
-                # Preferred provider to generate summaries (or "auto").
+                # One-shot CLI: refresh the heuristic handoff every N turns.
+                "summary_turn_interval": 6,
                 # Hard cap for compact summary text included in prompts.
                 "summary_max_chars": 1800,
             },
@@ -359,6 +358,7 @@ class ConfigManager:
         """Get memory behavior configuration."""
         defaults: Dict[str, Any] = {
             "cross_model_memory": "summary",
+            "compaction_summary": True,
             "summary_turn_interval": 6,
             "summary_max_chars": 1800,
         }
@@ -390,6 +390,29 @@ class ConfigManager:
     def get_hooks_config(self) -> list:
         """Get hooks configuration (list of hook definitions)."""
         return self.data.get("hooks", [])
+
+    def get_permissions_config(self) -> Dict[str, Any]:
+        """Permission engine configuration: posture + rule lists.
+
+        Project-level .cascade/permissions.yaml (same shape) overlays this
+        in CascadeCore; lists concatenate, project posture wins.
+        """
+        defaults: Dict[str, Any] = {
+            "posture": "auto",
+            "allow": [],
+            "deny": [],
+            "ask": [],
+        }
+        config = self.data.get("permissions", {})
+        merged = {**defaults, **(config or {})}
+        posture = str(merged.get("posture", "auto")).lower()
+        if posture not in ("auto", "safe", "readonly"):
+            posture = "auto"
+        merged["posture"] = posture
+        for key in ("allow", "deny", "ask"):
+            value = merged.get(key)
+            merged[key] = [str(v) for v in value] if isinstance(value, list) else []
+        return merged
 
     def get_tools_config(self) -> Dict[str, bool]:
         """Get tools enable/disable configuration."""

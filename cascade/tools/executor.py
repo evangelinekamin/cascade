@@ -29,9 +29,13 @@ class ToolExecutor:
         self,
         tools: dict[str, ToolDef],
         hook_runner: Optional[HookRunner] = None,
+        permissions=None,
     ):
         self._tools = dict(tools)
         self._hook_runner = hook_runner
+        # PermissionEngine (tools/permissions.py). Evaluated BEFORE hooks:
+        # deny/sacred verdicts must not be bypassable by hook transforms.
+        self._permissions = permissions
 
     @property
     def tool_names(self) -> list[str]:
@@ -58,6 +62,15 @@ class ToolExecutor:
         """
         if tool_name not in self._tools:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+        if self._permissions is not None:
+            verdict = self._permissions.resolve(
+                self._tools.get(tool_name), tool_name, arguments,
+            )
+            if verdict.decision != "allow":
+                return json.dumps({
+                    "error": f"Tool '{tool_name}' not permitted: {verdict.reason}",
+                })
 
         # Fire tool_call hook (can block or transform arguments)
         if self._hook_runner:

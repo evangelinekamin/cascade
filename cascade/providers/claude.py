@@ -71,12 +71,24 @@ class ClaudeProvider(BaseProvider):
 
         prompt = self._condense_for_cli(messages)
         workdir = self.get_working_directory()
+        # Non-interactive `claude -p` cannot prompt for approvals, so the
+        # posture maps onto its permission modes: auto keeps bypass (the
+        # subprocess runs its own tools; cascade-side gates cannot reach
+        # them), safe limits it to edits, readonly plans only.
+        posture = getattr(
+            getattr(self, "permission_engine", None), "posture", "auto",
+        )
+        proxy_mode = {
+            "auto": "bypassPermissions",
+            "safe": "acceptEdits",
+            "readonly": "plan",
+        }.get(posture, "bypassPermissions")
         cmd = [
             self._claude_bin, "-p", prompt,
             "--output-format", "stream-json",
             "--include-partial-messages", "--verbose",
             "--add-dir", workdir,
-            "--permission-mode", "bypassPermissions",
+            "--permission-mode", proxy_mode,
         ]
         if self.config.model:
             cmd.extend(["--model", self.config.model])
@@ -183,7 +195,11 @@ class ClaudeProvider(BaseProvider):
 
         from ..tools.executor import ToolExecutor
 
-        executor = ToolExecutor(tools, hook_runner=self.hook_runner)
+        executor = ToolExecutor(
+            tools,
+            hook_runner=self.hook_runner,
+            permissions=self.permission_engine,
+        )
         tool_defs = [
             {
                 "name": td.name,

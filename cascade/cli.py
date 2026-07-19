@@ -1,6 +1,7 @@
 """Cascade CLI - Beautiful multi-model AI assistant."""
 
 import click
+import os
 import sys
 from typing import Optional
 
@@ -49,6 +50,7 @@ class CascadeCore:
         self.project = ProjectContext()
         self.prompt_pipeline = self._build_prompt_pipeline()
         self.hook_runner = self._build_hook_runner()
+        self.permission_engine = self._build_permission_engine()
         self._wire_provider_hooks()
         self.tool_registry = self._build_tool_registry()
         self.context_builder = ContextBuilder()
@@ -85,13 +87,41 @@ class CascadeCore:
                     console.print(f"Failed to initialize {provider_name}: {e}", style="dim red")
         self._wire_provider_hooks()
 
+    def _build_permission_engine(self):
+        """Build the shared permission gate from config + project overlay.
+
+        Lists concatenate (project rules extend user rules); a project
+        posture, when present, wins. .cascade/permissions.yaml finally has
+        a consumer.
+        """
+        from .tools.permissions import PermissionEngine
+
+        cfg = self.config.get_permissions_config()
+        project = self.project.permissions if isinstance(self.project.permissions, dict) else {}
+        posture = str(project.get("posture") or cfg["posture"])
+
+        def _merged(key: str) -> tuple:
+            extra = project.get(key)
+            extra = [str(v) for v in extra] if isinstance(extra, list) else []
+            return tuple(cfg[key] + extra)
+
+        return PermissionEngine(
+            posture=posture,
+            allow=_merged("allow"),
+            deny=_merged("deny"),
+            ask=_merged("ask"),
+            workspace_root=os.getcwd(),
+        )
+
     def _wire_provider_hooks(self) -> None:
-        """Attach the hook runner to every provider's tool loop."""
+        """Attach the hook runner + permission gate to every provider."""
         runner = getattr(self, "hook_runner", None)
-        if runner is None:
-            return
+        engine = getattr(self, "permission_engine", None)
         for provider in self.providers.values():
-            provider.hook_runner = runner
+            if runner is not None:
+                provider.hook_runner = runner
+            if engine is not None:
+                provider.permission_engine = engine
 
     def _build_prompt_pipeline(self) -> PromptPipeline:
         """Assemble the system prompt pipeline from config and project context."""

@@ -68,9 +68,11 @@ class BaseProvider(ABC):
         self._last_usage: Optional[Usage] = None
         self._last_round_usage: Optional[Usage] = None
         # Wired by CascadeCore after construction so TOOL_CALL/TOOL_RESULT
-        # hooks (and the permission gate that rides them) fire inside every
-        # provider tool loop. None disables hook gating.
+        # hooks fire inside every provider tool loop. None disables hooks.
         self.hook_runner: Optional["HookRunner"] = None
+        # The shared PermissionEngine, wired alongside hook_runner. Every
+        # tool loop passes it into its ToolExecutor; None disables gating.
+        self.permission_engine = None
         self._last_activity: Optional[str] = None
         self._last_activity_key: Optional[str] = None
         self._emit_activity: bool = False

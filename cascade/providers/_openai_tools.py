@@ -206,6 +206,7 @@ def openai_ask_with_tools(
     on_usage: Optional[Callable[[Usage], None]] = None,
     on_round_usage: Optional[Callable[[Usage], None]] = None,
     hook_runner=None,
+    permissions=None,
     context_window: int = 128000,
     provider_preferences: Optional[dict] = None,
     check_cancelled: Optional[Callable[[], None]] = None,
@@ -234,7 +235,7 @@ def openai_ask_with_tools(
     """
     from ..tools.executor import ToolExecutor
 
-    executor = ToolExecutor(tools, hook_runner=hook_runner)
+    executor = ToolExecutor(tools, hook_runner=hook_runner, permissions=permissions)
 
     # Build OpenAI tool definitions
     tool_defs = [

@@ -264,6 +264,9 @@ class MainScreen(Screen):
             cfg = cli_app.config.get_memory_config()
             self._memory_policy = str(cfg.get("cross_model_memory", "summary"))
             self._compaction_summary_enabled = bool(cfg.get("compaction_summary", True))
+            engine = getattr(cli_app, "permission_engine", None)
+            if engine is not None:
+                engine.ask_handler = self._ask_permission
         recovered = int(getattr(self.app, "recovered_run_count", 0) or 0)
         if recovered:
             noun = "run" if recovered == 1 else "runs"
@@ -1033,6 +1036,43 @@ class MainScreen(Screen):
         else:
             self._summary_failures = 0
         return summary
+
+    def _ask_permission(self, tool_name: str, arguments: dict, verdict) -> str:
+        """Resolve an "ask" verdict by prompting the user.
+
+        Called from a worker thread inside the tool loop; blocks that
+        worker until the modal resolves (timeout denies). Never call on
+        the UI thread -- the guard below turns that into a deny rather
+        than a deadlock.
+        """
+        import threading
+
+        from .permission import PermissionScreen
+
+        result: dict = {}
+        done = threading.Event()
+
+        def _show() -> None:
+            def _resolved(answer) -> None:
+                result["answer"] = answer or "deny"
+                done.set()
+
+            try:
+                self.app.push_screen(
+                    PermissionScreen(tool_name, arguments, verdict.reason),
+                    _resolved,
+                )
+            except Exception:
+                result["answer"] = "deny"
+                done.set()
+
+        try:
+            self.app.call_from_thread(_show)
+        except Exception:
+            return "deny"
+        if not done.wait(timeout=120.0):
+            return "deny"
+        return result.get("answer", "deny")
 
     def _post_compaction_note(self, text: str) -> None:
         """Mount a dim one-line separator noting a compaction event."""

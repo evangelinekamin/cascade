@@ -179,8 +179,9 @@ def _lane_provider(app, provider_name: str, model: str, preferences: dict):
             provider_preferences=dict(preferences),
         )
         clone = type(original)(config)
-        # Clones must keep the tool-call hook gate the original was wired with.
+        # Clones must keep the hook + permission gates they were wired with.
         clone.hook_runner = getattr(original, "hook_runner", None)
+        clone.permission_engine = getattr(original, "permission_engine", None)
         return clone
     except Exception:
         return None

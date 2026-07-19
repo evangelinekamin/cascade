@@ -83,9 +83,22 @@ class GeminiProvider(BaseProvider):
             if condensed:
                 full_prompt = f"System instructions:\n{condensed}\n\n{full_prompt}"
 
+        # Non-interactive gemini CLI previously ran with NO approval flag,
+        # leaving its tools in default-deny limbo. Map the posture: auto
+        # gets yolo (tools actually work), safe auto-approves edits only,
+        # readonly stays at the prompting default (tools effectively off).
+        posture = getattr(
+            getattr(self, "permission_engine", None), "posture", "auto",
+        )
+        approval = {
+            "auto": "yolo",
+            "safe": "auto_edit",
+            "readonly": "default",
+        }.get(posture, "yolo")
         cmd = [
             self._gemini_bin, "-p", full_prompt,
             "--output-format", "stream-json",
+            "--approval-mode", approval,
             "--include-directories", workdir,
         ]
         if self.config.model:
@@ -188,7 +201,11 @@ class GeminiProvider(BaseProvider):
 
         from ..tools.executor import ToolExecutor
 
-        executor = ToolExecutor(tools, hook_runner=self.hook_runner)
+        executor = ToolExecutor(
+            tools,
+            hook_runner=self.hook_runner,
+            permissions=self.permission_engine,
+        )
 
         # Build Gemini function declarations
         function_declarations = []

@@ -54,6 +54,7 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("config", "/config reload", "Reload config from disk"),
     CommandDef("clear", "/clear", "Clear chat history from screen"),
     CommandDef("compact", "/compact", "Compact conversation memory now"),
+    CommandDef("permissions", "/permissions [posture <p>]", "Permission posture + audit trail"),
     CommandDef("history", "/history [limit]", "List recent chat sessions"),
     CommandDef("resume", "/resume <id>", "Resume a previous session"),
     CommandDef("export", "/export [id]", "Export session messages to a file"),
@@ -141,6 +142,7 @@ class CommandHandler:
             "config": self._cmd_config,
             "clear": self._cmd_clear,
             "compact": self._cmd_compact,
+            "permissions": self._cmd_permissions,
             "history": self._cmd_history,
             "resume": self._cmd_resume,
             "export": self._cmd_export,
@@ -1293,6 +1295,41 @@ class CommandHandler:
         except Exception:
             pass
         self.app.notify("Chat cleared (history preserved)")
+
+    def _cmd_permissions(self, args: list[str]) -> None:
+        """Show the permission posture and audit trail, or switch posture.
+
+        Usage: /permissions [posture auto|safe|readonly]
+        """
+        cli_app = getattr(self.app, "cli_app", None)
+        engine = getattr(cli_app, "permission_engine", None) if cli_app else None
+        if engine is None:
+            self._post_system("Permission engine not available.")
+            return
+
+        if len(args) >= 2 and args[0].lower() == "posture":
+            new_posture = args[1].lower()
+            if new_posture not in ("auto", "safe", "readonly"):
+                self._post_system("Posture must be auto, safe, or readonly.")
+                return
+            engine.posture = new_posture
+            self._post_system(f"Permission posture: {new_posture}")
+            return
+
+        lines = [
+            f"Permission posture: {engine.posture}",
+            f"Denials: {engine.total_denials} total"
+            f" · {engine.consecutive_denials} consecutive",
+        ]
+        if engine.audit:
+            lines.append("")
+            lines.append("Recent decisions:")
+            for tool_name, hint, decision, rule in engine.audit[-15:]:
+                arg = f" {hint}" if hint else ""
+                lines.append(f"  [{decision}] {tool_name}{arg}  ({rule})")
+        else:
+            lines.append("No tool calls gated yet this session.")
+        self._post_system("\n".join(lines))
 
     def _cmd_compact(self, args: list[str]) -> None:
         """Compact older turns into episodes; optional focus steers the summary.
