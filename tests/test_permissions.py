@@ -631,3 +631,28 @@ class TestEscalationStopsLoop:
             text, log = prov.ask_with_tools(_msgs("go"), tools, max_rounds=6)
         assert "stopped" in text  # PermissionAbort surfaced
         assert len(log) < 6  # did not run all rounds
+
+
+class TestCatastrophicTransparent:
+    """Transparent-but-catastrophic commands (persistence, irreversible
+    destruction) still ask; device sinks and benign forms do not."""
+
+    def _eng(self):
+        from pathlib import Path
+        return PermissionEngine(posture="auto", workspace_root=str(Path.cwd()))
+
+    def test_persistence_and_destruction_ask(self):
+        eng = self._eng()
+        for cmd in ("crontab -e", "systemctl enable evil.service", "shred -u x",
+                    "truncate -s 0 db.sqlite", "mv important /dev/null",
+                    "git config --global core.pager evil", "at now"):
+            v = eng.evaluate(_tool("run_command"), "run_command", {"command": cmd})
+            assert v.decision == "ask", cmd
+            assert v.rule == "never-auto", cmd
+
+    def test_benign_similar_commands_allow(self):
+        eng = self._eng()
+        for cmd in ("git config user.name x", "mv a.py b.py", "systemctl status x",
+                    "echo hi > /dev/null", "pytest > /dev/null 2>&1", "cmd 2>/dev/null"):
+            v = eng.evaluate(_tool("run_command"), "run_command", {"command": cmd})
+            assert v.decision == "allow", f"{cmd} -> {v.rule}"

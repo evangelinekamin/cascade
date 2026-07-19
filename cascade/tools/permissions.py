@@ -8,11 +8,27 @@ posture, rule, or mode can silently touch credentials, cascade's own
 config, or run structurally dangerous shell.
 
 Postures:
-- "auto"     (default): reads, workspace writes, and safe-shaped shell
-  auto-approve; sacred paths and dangerous shell ask; everything is
-  recorded in the audit trail so autonomy stays inspectable.
+- "auto"     (default): reads, workspace writes, and TRANSPARENT shell
+  auto-approve; sacred paths, catastrophic shell, and opaque shell ask;
+  everything is recorded in the audit trail so autonomy stays inspectable.
 - "safe":    reads auto-approve; every mutation asks.
 - "readonly": reads auto-approve; every mutation denies.
+
+Threat model and residual risk (be honest -- default-auto trades some
+safety for throughput): the floors reliably catch (a) a curated
+catastrophic-command list, (b) sacred-path access by any tool, (c) shell
+whose intent is not textually transparent (inline code, expansion-built
+command words), and (d) writes outside the workspace. A shell blocklist
+can NEVER be complete against an adversary -- shell is Turing-complete --
+so the opaque-shell rule is the real structural defense: cascade refuses
+to auto-approve what it cannot understand rather than pretending to
+enumerate every dangerous form. What still auto-approves under "auto":
+transparent, in-workspace, non-catastrophic commands, some of which
+could be mildly destructive (a plain `mv`/`truncate` of a project file).
+That is the accepted cost of a default-auto posture; switch to "safe" to
+gate every mutation. CLI-proxy providers run their own tools in a
+subprocess cascade cannot gate -- the floors apply to the direct-API
+providers (Eve's post-08/05 daily drivers), not proxy tool calls.
 
 Rule grammar (config/permissions.yaml allow/deny/ask lists):
 - "tool_name"             — whole tool
@@ -107,6 +123,20 @@ _NEVER_AUTO_SHELL = (
     (re.compile(r"(?<![\w-])git\b[^;|&\n]*\b(?:reset\s+--hard|clean\s+-[a-z]*f|filter-branch)\b"),
      "git history/tree destruction"),
     (re.compile(r"(?<![\w-])eval(?![\w-])"), "eval"),
+    # Persistence / boot-time footholds.
+    (re.compile(r"(?<![\w-])crontab(?![\w-])"), "crontab (persistence)"),
+    (re.compile(r"(?<![\w-])(?:systemctl|launchctl)\s+(?:enable|load)\b"),
+     "service persistence"),
+    (re.compile(r"(?<![\w-])at\s+(?:now|-f|\d)"), "at job (persistence)"),
+    # Irreversible file destruction that isn't rm.
+    (re.compile(r"(?<![\w-])(?:shred|srm)(?![\w-])"), "secure-delete"),
+    (re.compile(r"(?<![\w-])truncate\s+-s\s*0"), "truncate to zero"),
+    (re.compile(r"(?<![\w-])mv\b[^;|&\n]*\s/dev/null(?:\s|$)"),
+     "move into /dev/null (data loss)"),
+    # Global git config changes affect every repo (e.g. hijacking the editor
+    # or a hook path).
+    (re.compile(r"(?<![\w-])git\b[^;|&\n]*\bconfig\b[^;|&\n]*--global"),
+     "global git config change"),
 )
 
 # Redirect / write operators whose targets must land in the workspace.
@@ -259,6 +289,10 @@ def _shell_segments(command: str) -> list[str]:
     return [seg.strip() for seg in _SHELL_SPLIT.split(command) if seg.strip()]
 
 
+# Standard sinks that are always fine to "write" to.
+_DEVICE_SINKS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"})
+
+
 def _redirect_targets(command: str) -> list[str]:
     """Filesystem paths a shell command writes to (redirect, tee, dd, cp/mv)."""
     targets = [t for t in _REDIRECT_TARGET.findall(command)]
@@ -270,7 +304,8 @@ def _redirect_targets(command: str) -> list[str]:
             dest = toks[-1]
             if not dest.startswith("-"):
                 targets.append(dest)
-    return [t.strip().strip("'\"") for t in targets if t and t.strip()]
+    cleaned = [t.strip().strip("'\"") for t in targets if t and t.strip()]
+    return [t for t in cleaned if t not in _DEVICE_SINKS]
 
 
 def _opaque_shell_reason(command: str) -> Optional[str]:
