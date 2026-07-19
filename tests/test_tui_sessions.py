@@ -223,11 +223,13 @@ def test_main_screen_exit_emits_on_exit_once():
     screen = MainScreen()
     screen._active_provider = "claude"
     screen._mode = "design"
+    screen.set_timer = lambda *a, **k: None  # no event loop in this unit test
 
     token = active_app.set(app)
     try:
-        screen.action_exit_app()
-        screen.action_exit_app()
+        screen.action_exit_app()  # first press only arms; must not exit
+        assert app.push_screen.call_count == 0
+        screen.action_exit_app()  # second press exits
     finally:
         active_app.reset(token)
 

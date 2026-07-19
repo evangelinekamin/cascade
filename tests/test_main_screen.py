@@ -67,3 +67,63 @@ def test_terminal_run_dispatch_releases_only_the_matching_active_run():
 
     assert seen == ["done"]
     assert screen._active_run is None
+
+
+# -- Ctrl+C interrupt / clear-input / confirm-exit state machine --------------
+
+def _exit_test_screen():
+    """A MainScreen with the DOM/timer touchpoints stubbed for Ctrl+C tests."""
+    from types import SimpleNamespace
+
+    screen = MainScreen()
+    screen._interrupt_active_run = lambda: False
+    flashes: list = []
+    exited: list = []
+    screen.flash_status = lambda msg, *a: flashes.append(msg)
+    screen.set_timer = lambda *a, **k: SimpleNamespace(stop=lambda: None)
+    screen._perform_exit = lambda: exited.append(True)
+    return screen, flashes, exited
+
+
+def test_ctrl_c_clears_filled_input_before_arming_exit():
+    from types import SimpleNamespace
+
+    screen, flashes, exited = _exit_test_screen()
+    inp = SimpleNamespace(value="draft text", _pending_paste=None)
+    screen._input_widget = lambda: inp
+
+    screen.action_exit_app()
+
+    assert inp.value == ""
+    assert screen._exit_armed is False
+    assert exited == []
+    assert flashes == []
+
+
+def test_ctrl_c_twice_on_empty_input_arms_then_exits():
+    from types import SimpleNamespace
+
+    screen, flashes, exited = _exit_test_screen()
+    screen._input_widget = lambda: SimpleNamespace(value="", _pending_paste=None)
+
+    screen.action_exit_app()
+    assert screen._exit_armed is True
+    assert exited == []
+    assert flashes and "exit" in flashes[-1]
+
+    screen.action_exit_app()
+    assert exited == [True]
+    assert screen._exit_armed is False
+
+
+def test_ctrl_c_interrupts_active_run_without_arming_exit():
+    from types import SimpleNamespace
+
+    screen, _flashes, exited = _exit_test_screen()
+    screen._interrupt_active_run = lambda: True
+    screen._input_widget = lambda: SimpleNamespace(value="", _pending_paste=None)
+
+    screen.action_exit_app()
+
+    assert screen._exit_armed is False
+    assert exited == []

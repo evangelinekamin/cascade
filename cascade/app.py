@@ -209,12 +209,46 @@ class CascadeTUI(App):
             screen.action_cycle_mode()
 
     def action_exit_app(self) -> None:
-        """Delegate to the current screen or exit directly."""
+        """Delegate Ctrl+C to the current screen, or exit directly.
+
+        The screen owns the interrupt semantics (interrupt a run, clear a filled
+        input, then require a second press to exit); a screen without them exits.
+        """
         screen = self.screen
         if hasattr(screen, "action_exit_app"):
             screen.action_exit_app()
         else:
             self.exit()
+
+    def on_text_selected(self, event) -> None:
+        """Auto-copy a drag-selection on mouse release, like Claude Code.
+
+        The highlight is left in place so the user can see what was copied; it
+        clears on the next click (Textual's default). Confirmation is a quiet
+        bottom-right note, not a popup.
+        """
+        try:
+            text = self.screen.get_selected_text()
+        except Exception:
+            text = None
+        if not text:
+            return
+        self.copy_to_clipboard(text)
+        self._flash_status(self._copied_message(len(text)))
+
+    def _flash_status(self, message: str) -> None:
+        """Show a brief, unobtrusive note in the screen's bottom-right corner."""
+        flash = getattr(self.screen, "flash_status", None)
+        if callable(flash):
+            try:
+                flash(message)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _copied_message(n: int) -> str:
+        """Human-readable clipboard confirmation for *n* copied characters."""
+        return f"Copied {n:,} character{'' if n == 1 else 's'} to clipboard"
 
     # ------------------------------------------------------------------
     # History persistence

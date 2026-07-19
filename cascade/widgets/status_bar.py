@@ -75,6 +75,8 @@ class StatusBar(Static):
         self._dirty = False
         self._provider_tokens: dict[str, int] = provider_tokens or {}
         self._override_text: str = ""
+        self._flash: str = ""
+        self._flash_timer = None
 
         if not branch:
             b, d = _git_info()
@@ -94,15 +96,19 @@ class StatusBar(Static):
             suffix = "*" if self._dirty else ""
             t.append(f" . {self._branch}{suffix}", style=f"dim {PALETTE.text_dim}")
 
-        # Build right side: only surface a provider once it has actually been
-        # used, so a fresh session isn't a row of "\u25cf 0 \u25cf 0 \u25cf 0".
+        # Build right side. A transient flash (copy confirmation, exit hint)
+        # takes the corner briefly; otherwise surface a provider's dot only once
+        # it has been used, so a fresh session isn't a row of "\u25cf 0 \u25cf 0".
         right = Text()
-        for name, ptheme in PROVIDERS.items():
-            count = self._provider_tokens.get(name, 0)
-            if count <= 0:
-                continue
-            right.append(" \u25cf", style=ptheme.accent)
-            right.append(f" {_fmt(count)}", style=f"dim {PALETTE.text_dim}")
+        if self._flash:
+            right.append(self._flash, style=PALETTE.text_dim)
+        else:
+            for name, ptheme in PROVIDERS.items():
+                count = self._provider_tokens.get(name, 0)
+                if count <= 0:
+                    continue
+                right.append(" \u25cf", style=ptheme.accent)
+                right.append(f" {_fmt(count)}", style=f"dim {PALETTE.text_dim}")
 
         # Pad between left and right
         width = self.size.width if self.size.width > 0 else 80
@@ -120,4 +126,17 @@ class StatusBar(Static):
     def set_override(self, text: str) -> None:
         """Replace entire status bar with a single message."""
         self._override_text = text
+        self.refresh()
+
+    def flash(self, message: str, timeout: float = 1.5) -> None:
+        """Briefly show a right-aligned note, then revert to the token counts."""
+        self._flash = message
+        if self._flash_timer is not None:
+            self._flash_timer.stop()
+        self._flash_timer = self.set_timer(timeout, self._clear_flash)
+        self.refresh()
+
+    def _clear_flash(self) -> None:
+        self._flash = ""
+        self._flash_timer = None
         self.refresh()

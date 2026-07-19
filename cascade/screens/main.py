@@ -51,6 +51,10 @@ class MainScreen(Screen):
     # can read a few files before answering, but well under /solve's 15 -- chat is
     # not a verified build, and big edit-test-commit tasks belong in /solve.
     _CHAT_TOOL_MAX_ROUNDS = 10
+    # Ctrl+C on an empty input arms exit; a second press within this window
+    # confirms it, so a stray Ctrl+C never quits mid-session.
+    _EXIT_HINT = "press ctrl+c again to exit"
+    _EXIT_WINDOW = 3.0
 
     BINDINGS = [
         ("shift+tab", "cycle_mode", "Cycle Mode"),
@@ -92,6 +96,8 @@ class MainScreen(Screen):
         self._activity_provider = None
         self._last_seen_activity = None
         self._active_run: RunContext | None = None
+        self._exit_armed = False
+        self._exit_timer = None
         self._chords = self._build_chord_manager()
 
     @staticmethod
@@ -129,25 +135,37 @@ class MainScreen(Screen):
 
     def action_kill_workers(self) -> None:
         """Cancel the active run and reject all of its later callbacks."""
-        run = self._active_run
-        if run is not None:
-            reason = "cancelled by user"
-            run.cancel(reason)
-            run.finish(RunOutcome.CANCELLED, error=reason)
-            # Clearing this identity is what makes callbacks already queued by the
-            # old worker stale. A subsequent prompt gets a new run id immediately.
-            self._active_run = None
+        if self._interrupt_active_run():
+            return
         try:
             self.workers.cancel_all()
         except Exception:
             pass
         self._reset_cancelled_ui()
+        self._post_system_message("No active run to cancel.")
+
+    def _interrupt_active_run(self) -> bool:
+        """Cancel the active run if any; return whether one was interrupted.
+
+        Clearing the run identity is what makes callbacks already queued by the
+        old worker stale. A subsequent prompt gets a new run id immediately.
+        """
+        run = self._active_run
         if run is None:
-            self._post_system_message("No active run to cancel.")
-        else:
-            self._post_system_message(
-                f"Cancelled run {run.id[:8]}. Provider work will stop at its next checkpoint."
-            )
+            return False
+        reason = "cancelled by user"
+        run.cancel(reason)
+        run.finish(RunOutcome.CANCELLED, error=reason)
+        self._active_run = None
+        try:
+            self.workers.cancel_all()
+        except Exception:
+            pass
+        self._reset_cancelled_ui()
+        self._post_system_message(
+            f"Cancelled run {run.id[:8]}. Provider work will stop at its next checkpoint."
+        )
+        return True
 
     def _reset_cancelled_ui(self) -> None:
         """Return the input/UI to idle without recording an assistant response."""
@@ -1362,6 +1380,59 @@ class MainScreen(Screen):
     # ------------------------------------------------------------------
 
     def action_exit_app(self) -> None:
+        """Ctrl+C: interrupt a run, else clear a filled input, else confirm-exit.
+
+        Mirrors Claude Code -- a first press interrupts an in-flight generation
+        or clears typed input; only a second press on an empty input exits, so a
+        stray Ctrl+C (or a terminal folding Ctrl+Shift+C into it) never quits.
+        """
+        if self._interrupt_active_run():
+            self._disarm_exit()
+            return
+
+        inp = self._input_widget()
+        if inp is not None and (inp.value or getattr(inp, "_pending_paste", None)):
+            inp.value = ""
+            inp._pending_paste = None
+            self._disarm_exit()
+            return
+
+        if not self._exit_armed:
+            self._exit_armed = True
+            self.flash_status(self._EXIT_HINT, self._EXIT_WINDOW)
+            try:
+                self._exit_timer = self.set_timer(self._EXIT_WINDOW, self._disarm_exit)
+            except Exception:
+                # No running loop (or scheduling failed): keep the arm, just
+                # without an auto-expiry. The exit handler must never crash.
+                self._exit_timer = None
+            return
+
+        self._disarm_exit()
+        self._perform_exit()
+
+    def _input_widget(self):
+        """The prompt Input widget, or None if it is not mounted."""
+        try:
+            return self.query_one("#main_input", Input)
+        except Exception:
+            return None
+
+    def _disarm_exit(self) -> None:
+        """Cancel a pending second-press-to-exit."""
+        self._exit_armed = False
+        if self._exit_timer is not None:
+            self._exit_timer.stop()
+            self._exit_timer = None
+
+    def flash_status(self, message: str, timeout: float = 1.5) -> None:
+        """Show a brief, unobtrusive note in the bottom-right status corner."""
+        try:
+            self.query_one(StatusBar).flash(message, timeout)
+        except Exception:
+            pass
+
+    def _perform_exit(self) -> None:
         from .exit import ExitScreen
 
         active_run = self._active_run
