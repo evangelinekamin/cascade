@@ -22,6 +22,11 @@ class CascadeTUI(App):
 
     CSS_PATH = "cascade.tcss"
 
+    # Cascade has its own slash-command palette (input_frame autocomplete);
+    # Textual's stock ctrl+p palette would leak unbranded commands (theme
+    # switching, etc.) into the calm-MAGI design.
+    ENABLE_COMMAND_PALETTE = False
+
     BINDINGS = [
         Binding("shift+tab", "cycle_mode", "Cycle Mode", show=False),
         Binding("ctrl+c", "exit_app", "Exit", show=False, priority=True),
