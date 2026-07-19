@@ -20,11 +20,28 @@ if TYPE_CHECKING:
     from .providers.base import BaseProvider, Message
 
 
+def _injectable_episodes(
+    episodes: list[Episode],
+    target_provider: str,
+) -> list[Episode]:
+    """Episodes worth injecting for this provider.
+
+    "live" episodes mirror turns that are still present as raw messages,
+    so injecting them for the same provider would send the content twice.
+    They are injected only cross-provider (the raw window drops other
+    providers' turns). Non-live episodes (compaction, orchestration) are
+    the sole carrier of their content and always inject.
+    """
+    return [
+        ep for ep in episodes
+        if ep.source != "live" or ep.provider != target_provider
+    ]
+
+
 def state_messages_to_provider(
     messages: list["ChatMessage"],
     target_provider: str,
     policy: str = "summary",
-    cross_model_summary: str = "",
     episodes: list[Episode] | None = None,
     max_messages: int = 40,
     max_chars: int = 80_000,
@@ -33,11 +50,12 @@ def state_messages_to_provider(
 
     Handles cross-model context injection based on policy:
     - "off": Only include messages from target_provider (and user messages)
-    - "summary": Include cross-model summary + recent same-provider turns
+    - "summary": Recent same-provider turns; other providers via episodes
     - "full": Include all recent messages regardless of provider
 
-    When episodes are provided, they're injected as structured context
-    before the raw messages, replacing the need for lossy summarization.
+    Episodes are injected as structured context before the raw messages,
+    filtered by provenance so live same-provider turns are never sent
+    twice (see _injectable_episodes).
     """
     result: list[dict] = []
     visible_messages = [
@@ -45,9 +63,9 @@ def state_messages_to_provider(
         if not msg.metadata.get("compacted")
     ]
 
-    # Inject episode context first (if available)
-    if episodes:
-        episode_context = episodes_to_context(episodes, max_chars=max_chars // 4)
+    injectable = _injectable_episodes(episodes or [], target_provider)
+    if injectable:
+        episode_context = episodes_to_context(injectable, max_chars=max_chars // 4)
         if episode_context:
             result.append({
                 "role": "user",
@@ -66,16 +84,6 @@ def state_messages_to_provider(
                 result.append({"role": "assistant", "content": msg.content})
 
     elif policy == "summary":
-        if cross_model_summary and not episodes:
-            # Only inject old-style summary if no episodes available
-            result.append({
-                "role": "user",
-                "content": f"[Context from previous model interactions]\n{cross_model_summary}",
-            })
-            result.append({
-                "role": "assistant",
-                "content": "Understood, I have the context from the previous interactions.",
-            })
         for msg in visible_messages[-max_messages:]:
             if msg.role == "you":
                 result.append({"role": "user", "content": msg.content})

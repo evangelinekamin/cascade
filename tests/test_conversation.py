@@ -33,20 +33,57 @@ def test_off_policy_filters_to_target_provider():
     assert roles.count("assistant") == 1
 
 
-def test_summary_policy_injects_cross_model_summary():
+def test_live_same_provider_episodes_are_not_injected():
+    """Live episodes mirror raw messages -- injecting them would double context."""
+    from cascade.episodes import generate_episode
+
     messages = _msgs(
-        ("you", "Hello"),
-        ("claude", "Hi!"),
+        ("you", "Fix the auth bug"),
+        ("claude", "Fixed token validation."),
     )
+    episodes = [generate_episode("Fix the auth bug", "Fixed token validation.", "claude")]
     result = state_messages_to_provider(
-        messages, "claude", policy="summary",
-        cross_model_summary="Previous context here.",
+        messages, "claude", policy="summary", episodes=episodes,
     )
-    assert result[0]["content"].startswith("[Context from previous model interactions]")
-    assert "Previous context here." in result[0]["content"]
-    assert result[1]["role"] == "assistant"
-    assert result[2]["role"] == "user"
-    assert result[2]["content"] == "Hello"
+    contents = " ".join(m["content"] for m in result)
+    assert "[Prior session context]" not in contents
+    assert contents.count("Fixed token validation.") == 1
+
+
+def test_live_other_provider_episodes_are_injected():
+    """Cross-provider handoff: the raw window drops other providers' turns."""
+    from cascade.episodes import generate_episode
+
+    messages = _msgs(
+        ("you", "Plan the refactor"),
+        ("claude", "Plan: split the module."),
+        ("you", "Implement it"),
+    )
+    episodes = [generate_episode("Plan the refactor", "Plan: split the module.", "claude")]
+    result = state_messages_to_provider(
+        messages, "openai", policy="summary", episodes=episodes,
+    )
+    contents = " ".join(m["content"] for m in result)
+    assert "[Prior session context]" in contents
+    assert "split the module" in contents
+    # The raw claude message itself is not sent to openai under "summary"
+    assert not any(m["content"] == "Plan: split the module." for m in result)
+
+
+def test_compaction_episodes_always_injected():
+    """Compaction episodes are the sole carrier of compacted-away turns."""
+    from cascade.episodes import generate_episode
+
+    messages = _msgs(("you", "Continue"))
+    episodes = [
+        generate_episode("Old task", "Old outcome.", "claude", source="compaction"),
+    ]
+    result = state_messages_to_provider(
+        messages, "claude", policy="summary", episodes=episodes,
+    )
+    contents = " ".join(m["content"] for m in result)
+    assert "[Prior session context]" in contents
+    assert "Old task" in contents
 
 
 def test_summary_policy_without_summary():

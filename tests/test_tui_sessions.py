@@ -153,9 +153,6 @@ def test_resume_resets_state_preserves_roles_and_emits_hook(tmp_path):
     header = MagicMock()
     screen = MagicMock()
     screen._header_visible = True
-    screen._cross_model_summary = "stale summary"
-    screen._turns_since_summary = 9
-    screen._summary_compaction_running = True
     screen.query_one.side_effect = lambda selector: {
         ChatHistory: chat,
         StatusBar: status,
@@ -189,9 +186,6 @@ def test_resume_resets_state_preserves_roles_and_emits_hook(tmp_path):
     assert app.state.total_tokens == 32
     assert app.state.provider_tokens["claude"] == 12
     assert app.state.provider_tokens["gemini"] == 20
-    assert screen._cross_model_summary == ""
-    assert screen._turns_since_summary == 0
-    assert screen._summary_compaction_running is False
     chat.remove_children.assert_called_once()
     status.update_tokens.assert_called_once_with(app.state.provider_tokens)
     assert input_frame.active_provider == "claude"

@@ -38,6 +38,11 @@ class Episode:
     artifacts: tuple[str, ...]
     tokens_consumed: int
     raw_turn_count: int
+    # Provenance: "live" episodes mirror turns still present as raw
+    # messages (injected only cross-provider); "compaction" episodes are
+    # the sole carrier of compacted-away turns; "orchestration" episodes
+    # carry lane results that never enter the raw message stream.
+    source: str = "live"
 
 
 # File extensions that indicate artifact references
@@ -169,6 +174,7 @@ def generate_episode(
     tokens: int = 0,
     tool_log: list[dict] | None = None,
     turn_count: int = 1,
+    source: str = "live",
 ) -> Episode:
     """Generate an episode from a completed interaction.
 
@@ -196,6 +202,7 @@ def generate_episode(
         artifacts=_extract_artifacts(combined_text),
         tokens_consumed=tokens,
         raw_turn_count=turn_count,
+        source=source,
     )
 
 
@@ -290,6 +297,7 @@ def compact_to_episodes(
                 provider=provider,
                 tokens=tokens,
                 turn_count=turn_count,
+                source="compaction",
             )
             episodes.append(episode)
         else:
@@ -300,6 +308,7 @@ def compact_to_episodes(
                 provider=msg.role,
                 tokens=msg.tokens,
                 turn_count=1,
+                source="compaction",
             )
             episodes.append(episode)
             i += 1

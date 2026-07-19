@@ -260,11 +260,14 @@ class TestCompactToEpisodes:
 class TestConversationWithEpisodes:
     """Tests for episode integration in conversation.py."""
 
-    def test_state_messages_with_episodes(self):
+    def test_state_messages_with_compaction_episodes(self):
         from cascade.conversation import state_messages_to_provider
 
         episodes = [
-            generate_episode("Fix auth", "Fixed token validation.", "claude"),
+            generate_episode(
+                "Fix auth", "Fixed token validation.", "claude",
+                source="compaction",
+            ),
         ]
         messages = [
             ChatMessage(role="you", content="Now update tests"),
@@ -279,7 +282,7 @@ class TestConversationWithEpisodes:
         assert any("Fix auth" in m["content"] for m in result)
         assert any("Now update tests" in m["content"] for m in result)
 
-    def test_episodes_preferred_over_summary(self):
+    def test_live_episode_for_same_provider_is_filtered(self):
         from cascade.conversation import state_messages_to_provider
 
         episodes = [
@@ -290,15 +293,13 @@ class TestConversationWithEpisodes:
         ]
         result = state_messages_to_provider(
             messages, "claude", policy="summary",
-            cross_model_summary="Old summary",
             episodes=episodes,
         )
         contents = " ".join(m["content"] for m in result)
-        # Episodes should be present, old summary should NOT
-        assert "Episode" in contents
-        assert "Old summary" not in contents
+        # A live episode mirrors raw turns of the same provider: not injected
+        assert "Episode" not in contents
 
-    def test_no_episodes_falls_back_to_summary(self):
+    def test_no_episodes_sends_raw_messages_only(self):
         from cascade.conversation import state_messages_to_provider
 
         messages = [
@@ -306,8 +307,6 @@ class TestConversationWithEpisodes:
         ]
         result = state_messages_to_provider(
             messages, "claude", policy="summary",
-            cross_model_summary="Cross model context",
             episodes=None,
         )
-        contents = " ".join(m["content"] for m in result)
-        assert "Cross model context" in contents
+        assert result == [{"role": "user", "content": "Hello"}]

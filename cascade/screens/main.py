@@ -83,12 +83,6 @@ class MainScreen(Screen):
         self._active_provider = active_provider
         self._mode = mode
         self._memory_policy = "summary"
-        self._summary_turn_interval = 6
-        self._summary_provider_pref = "auto"
-        self._summary_max_chars = 1800
-        self._cross_model_summary = ""
-        self._turns_since_summary = 0
-        self._summary_compaction_running = False
         self._header_visible = True
         self._cmd_handler: CommandHandler | None = None
         self._thinking: ThinkingIndicator | None = None
@@ -267,9 +261,6 @@ class MainScreen(Screen):
         if cli_app is not None:
             cfg = cli_app.config.get_memory_config()
             self._memory_policy = str(cfg.get("cross_model_memory", "summary"))
-            self._summary_turn_interval = int(cfg.get("summary_turn_interval", 6))
-            self._summary_provider_pref = str(cfg.get("summary_provider", "auto"))
-            self._summary_max_chars = int(cfg.get("summary_max_chars", 1800))
         recovered = int(getattr(self.app, "recovered_run_count", 0) or 0)
         if recovered:
             noun = "run" if recovered == 1 else "runs"
@@ -495,7 +486,6 @@ class MainScreen(Screen):
             messages=chat_messages,
             target_provider=provider_name,
             policy=self._memory_policy,
-            cross_model_summary=self._cross_model_summary,
             episodes=episode_list if episode_list else None,
         )
 
@@ -521,8 +511,7 @@ class MainScreen(Screen):
                     messages=remaining,
                     target_provider=provider_name,
                     policy=self._memory_policy,
-                    cross_model_summary=self._cross_model_summary,
-                    episodes=all_episodes,
+                            episodes=all_episodes,
                 )
             except Exception as ep_err:
                 import logging
@@ -930,205 +919,6 @@ class MainScreen(Screen):
             live_run.finish(RunOutcome.FAILED, error=str(e))
             self._emit_for_run(run, self._on_stream_error, str(e), terminal=True)
 
-    def _format_history_blocks(
-        self,
-        messages: list,
-        max_messages: int,
-        max_chars: int,
-    ) -> str:
-        selected = messages[-max_messages:]
-        blocks = []
-        total = 0
-        for msg in selected:
-            if msg.role == "system":
-                continue
-            if msg.role == "you":
-                role = "User"
-            elif msg.role in self._providers:
-                role = f"Assistant ({msg.role})"
-            else:
-                role = "Assistant"
-            content = msg.content.strip()
-            if not content:
-                continue
-            if len(content) > 700:
-                content = content[:700] + "..."
-            block = f"{role}: {content}"
-            block_len = len(block) + 2
-            if total + block_len > max_chars:
-                continue
-            blocks.append(block)
-            total += block_len
-        return "\n\n".join(blocks)
-
-    def _build_history_context(self, current_prompt: str, provider_name: str) -> str:
-        """Build prompt context from prior turns according to memory policy."""
-        if self._memory_policy == "off":
-            return ""
-
-        messages = list(self.app.state.messages)
-        if messages and messages[-1].role == "you" and messages[-1].content == current_prompt:
-            messages = messages[:-1]
-        if not messages:
-            return ""
-
-        if self._memory_policy == "full":
-            blocks = self._format_history_blocks(messages, max_messages=12, max_chars=6000)
-            if not blocks:
-                return ""
-            return "Conversation history (recent turns):\n\n" + blocks
-
-        # summary mode
-        local_messages = [m for m in messages if m.role in ("you", provider_name)]
-        local_blocks = self._format_history_blocks(local_messages, max_messages=8, max_chars=3200)
-
-        parts = []
-        if self._cross_model_summary:
-            parts.append("Cross-model handoff summary:\n\n" + self._cross_model_summary)
-        if local_blocks:
-            parts.append("Current-provider recent turns:\n\n" + local_blocks)
-        merged = "\n\n".join(parts).strip()
-        if not merged:
-            return ""
-        return merged
-
-    def _summary_transcript(self) -> str:
-        """Create a compact transcript payload for summary generation."""
-        messages = [m for m in self.app.state.messages if m.role != "system"]
-        blocks = self._format_history_blocks(messages, max_messages=24, max_chars=7000)
-        return blocks
-
-    def _fallback_summary(self) -> str:
-        """Heuristic summary when model-based compaction is unavailable."""
-        transcript = self._summary_transcript()
-        if not transcript:
-            return ""
-        lines = transcript.splitlines()
-        objective = ""
-        decisions = []
-        files = []
-        for ln in lines:
-            if ln.startswith("User:") and not objective:
-                objective = ln.replace("User:", "", 1).strip()
-            if "Assistant" in ln and len(decisions) < 2:
-                decisions.append(ln.split(":", 1)[-1].strip())
-            for token in ln.split():
-                clean = token.strip("`.,:;()[]{}\"'")
-                if "/" in clean or clean.endswith((".py", ".md", ".yaml", ".yml", ".json", ".ts", ".tsx", ".js")):
-                    if clean not in files:
-                        files.append(clean)
-                if len(files) >= 6:
-                    break
-        out = [
-            f"- Objective: {objective or 'Continue current task.'}",
-            f"- Recent decisions: {' | '.join(decisions) if decisions else 'None yet.'}",
-            f"- Files/areas: {', '.join(files) if files else 'N/A'}",
-            "- Open TODOs: Continue from latest unresolved request.",
-        ]
-        return "\n".join(out)[:self._summary_max_chars]
-
-    def _summary_provider_candidates(self) -> list[str]:
-        pref = self._summary_provider_pref.lower()
-        if pref != "auto":
-            return [pref]
-        ordered = ["claude", "gemini", "openai", "openrouter", self._active_provider]
-        out = []
-        for name in ordered:
-            if name in self._providers and name not in out:
-                out.append(name)
-        return out
-
-    def _generate_cross_model_summary(self) -> str:
-        """Generate/refresh handoff summary using a fast provider when possible."""
-        cli_app = getattr(self.app, "cli_app", None)
-        if cli_app is None:
-            return self._fallback_summary()
-
-        transcript = self._summary_transcript()
-        if not transcript:
-            return ""
-
-        system = (
-            "You produce compact engineering handoff summaries for model switching.\n"
-            "Keep it factual, terse, and implementation-focused."
-        )
-        prompt = (
-            "Update this cross-model summary for the ongoing coding session.\n"
-            "Keep under 1800 characters.\n\n"
-            "Format:\n"
-            "- Objective\n"
-            "- Design constraints\n"
-            "- Decisions made\n"
-            "- Files/areas touched\n"
-            "- Open TODOs\n"
-            "- Risks/questions\n\n"
-            f"Previous summary:\n{self._cross_model_summary or '(none)'}\n\n"
-            f"Recent transcript:\n{transcript}"
-        )
-
-        for provider_name in self._summary_provider_candidates():
-            try:
-                base_cfg = cli_app.config.get_provider_config(provider_name)
-                provider_obj = cli_app.providers.get(provider_name)
-                if base_cfg is None or provider_obj is None:
-                    continue
-                summary_model = cli_app.config.get_model_for(provider_name, self._mode, fast=True)
-                if not isinstance(summary_model, str) or not summary_model:
-                    summary_model = base_cfg.model
-                provider_cls = type(provider_obj)
-                summary_provider = provider_cls(
-                    ProviderConfig(
-                        api_key=base_cfg.api_key,
-                        model=summary_model,
-                        base_url=base_cfg.base_url,
-                        temperature=0.2,
-                        max_tokens=900,
-                    )
-                )
-                summary = summary_provider.ask_single(prompt, system=system).strip()
-                if hasattr(summary_provider, "client"):
-                    try:
-                        summary_provider.client.close()
-                    except Exception:
-                        pass
-                if summary:
-                    return summary[:self._summary_max_chars]
-            except Exception:
-                continue
-        return self._fallback_summary()
-
-    def _on_summary_ready(self, summary: str) -> None:
-        self._summary_compaction_running = False
-        if summary:
-            self._cross_model_summary = summary[:self._summary_max_chars]
-        self._turns_since_summary = 0
-
-    def _on_summary_error(self, _msg: str) -> None:
-        self._summary_compaction_running = False
-
-    def _trigger_summary_compaction(self, reason: str, force: bool = False) -> None:
-        if self._memory_policy != "summary":
-            return
-        if self._summary_compaction_running:
-            return
-        if not force and self._turns_since_summary < self._summary_turn_interval:
-            return
-        if not self.app.state.messages:
-            return
-
-        self._summary_compaction_running = True
-        if self._thinking:
-            self._thinking.set_label(f"compacting memory ({reason})...")
-
-        def _worker() -> None:
-            try:
-                summary = self._generate_cross_model_summary()
-                self.app.call_from_thread(self._on_summary_ready, summary)
-            except Exception as e:
-                self.app.call_from_thread(self._on_summary_error, str(e))
-
-        self.run_worker(_worker, thread=True, exclusive=False)
-
     def _on_stream_chunk(self, chunk: str) -> None:
         """Called from worker thread via app.call_from_thread."""
         if hasattr(self, "_stream_msg"):
@@ -1210,8 +1000,6 @@ class MainScreen(Screen):
         except Exception:
             pass
 
-        self._turns_since_summary += 1
-        self._trigger_summary_compaction(reason="periodic", force=False)
 
     def _on_stream_done(
         self, provider: str, full_text: str, input_tokens: int, output_tokens: int,
@@ -1256,8 +1044,6 @@ class MainScreen(Screen):
         except Exception:
             pass
 
-        self._turns_since_summary += 1
-        self._trigger_summary_compaction(reason="periodic", force=False)
 
     def _on_stream_error(self, error_msg: str) -> None:
         """Called when streaming fails."""
@@ -1371,10 +1157,6 @@ class MainScreen(Screen):
             except Exception:
                 pass  # branching failure is non-fatal
 
-            self._trigger_summary_compaction(
-                reason=f"switch {previous_provider}->{self._active_provider}",
-                force=True,
-            )
 
     # ------------------------------------------------------------------
     # Exit

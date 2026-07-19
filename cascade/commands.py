@@ -1227,13 +1227,23 @@ class CommandHandler:
         self.app.notify("Chat cleared (history preserved)")
 
     def _cmd_compact(self, args: list[str]) -> None:
-        """Force a cross-model memory compaction now."""
-        screen = self.app.screen
-        if hasattr(screen, "_trigger_summary_compaction"):
-            screen._trigger_summary_compaction(reason="manual", force=True)
-            self.app.notify("Memory compaction started")
-        else:
-            self.app.notify("Compaction not available on this screen")
+        """Compact older turns into episode records, freeing raw context."""
+        from .conversation import compact_messages_with_episodes
+
+        state = self.app.state
+        active = [m for m in state.messages if not m.metadata.get("compacted")]
+        episodes, remaining = compact_messages_with_episodes(
+            state.messages, keep_recent=6,
+        )
+        compacted_count = max(len(active) - len(remaining), 0)
+        if compacted_count <= 0 or not episodes:
+            self.app.notify("Nothing to compact (6 or fewer active messages)")
+            return
+        state.apply_episode_compaction(compacted_count, episodes)
+        self.app.notify(
+            f"Compacted {compacted_count} messages into {len(episodes)} episodes"
+            f" (kept last {len(remaining)})"
+        )
 
     # ------------------------------------------------------------------
     # History / Resume / Export
@@ -1349,12 +1359,6 @@ class CommandHandler:
 
             if hasattr(self.app.screen, "_header_visible"):
                 self.app.screen._header_visible = False
-            if hasattr(self.app.screen, "_cross_model_summary"):
-                self.app.screen._cross_model_summary = ""
-            if hasattr(self.app.screen, "_turns_since_summary"):
-                self.app.screen._turns_since_summary = 0
-            if hasattr(self.app.screen, "_summary_compaction_running"):
-                self.app.screen._summary_compaction_running = False
             self.app.screen.query_one(WelcomeHeader).display = False
             self.app.screen.query_one(StatusBar).update_tokens(self.app.state.provider_tokens)
             frame = self.app.screen.query_one(InputFrame)
@@ -1896,6 +1900,7 @@ class CommandHandler:
                         assistant_content=result.winner_response,
                         provider="compete",
                         tokens=result.total_tokens,
+                        source="orchestration",
                     )
                     _call_ui(self.app.state.add_episode, episode)
 
@@ -2016,6 +2021,7 @@ class CommandHandler:
                         assistant_content=result.winner_response,
                         provider="compete-code",
                         tokens=result.total_tokens,
+                        source="orchestration",
                     )
                     _call_ui(self.app.state.add_episode, episode)
 
