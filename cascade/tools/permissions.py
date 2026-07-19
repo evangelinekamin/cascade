@@ -101,8 +101,18 @@ _NEVER_AUTO_SHELL = (
     (re.compile(r"(?<![\w-])sudo(?![\w-])"), "sudo"),
     (re.compile(r"(?<![\w-])doas(?![\w-])"), "doas"),
     (re.compile(rf"\|\s*(?:{_INTERPRETERS})\b"), "pipe into an interpreter"),
-    (re.compile(rf"(?<![\w-])(?:curl|wget|fetch)(?![\w-]).*(?:{_INTERPRETERS})\b", re.S),
-     "remote fetch feeding an interpreter"),
+    # A remote fetch (any common downloader) anywhere in the command plus an
+    # interpreter OR code-consuming build tool anywhere = download-then-run
+    # RCE. Broadened past curl|sh because git clone && make, scp && sh, and
+    # curl -o x.awk && awk -f x.awk are the same threat with more transparency.
+    (re.compile(
+        rf"(?<![\w-])(?:curl|wget|fetch|scp|sftp|rsync|ftp|git\s+clone|git\s+pull)(?![\w-])"
+        rf".*(?:{_INTERPRETERS}|(?<![\w-])(?:make|awk\s+-f|sed\s+-f|gcc|cc|clang|npx?|pip3?\s+install)(?![\w-]))",
+        re.S,
+    ), "remote fetch then run/build (download-then-execute)"),
+    # Recursive/catastrophic deletion that isn't a bare `rm` path.
+    (re.compile(r"(?<![\w-])find\b[^;|&\n]*\s-(?:delete|exec\b)"), "find -delete/-exec"),
+    (re.compile(r"(?<![\w-])xargs\b[^;|&\n]*\s(?:rm|shred|unlink|dd|mv)\b"), "xargs destructive"),
     (re.compile(rf"(?<![\w-])(?:{_INTERPRETERS}|source|\.)\s+(?:-\S+\s+)*(?:/tmp/|/var/tmp/|/dev/shm/)"),
      "interpreter running a temp-dir script"),
     (re.compile(r"/dev/tcp/"), "reverse shell (/dev/tcp)"),
@@ -140,7 +150,14 @@ _NEVER_AUTO_SHELL = (
 )
 
 # Redirect / write operators whose targets must land in the workspace.
-_REDIRECT_TARGET = re.compile(r"(?:>>?|(?<![\w-])tee(?![\w-])\s+(?:-\S+\s+)*)\s*([^\s;|&>]+)")
+# Handles an optional leading fd digit and the `>|` noclobber-override form.
+_REDIRECT_TARGET = re.compile(
+    r"(?:\d*>>?\|?|&>\|?|(?<![\w-])tee(?![\w-])\s+(?:-\S+\s+)*)\s*([^\s;|&>]+)"
+)
+
+# `-t DIR` (cp/mv/install) puts the destination directory in a flag, not the
+# last positional argument.
+_DASH_T_TARGET = re.compile(r"(?<![\w-])-t\s+([^\s;|&]+)")
 
 # dd of=PATH write destination.
 _DD_TARGET = re.compile(r"(?<![\w-])dd\b[^;|&\n]*\sof=([^\s;|&]+)")
@@ -180,8 +197,9 @@ PREAPPROVED_FETCH_DOMAINS = (
 )
 
 # Compound-command separators (newline included: models emit multi-line
-# scripts, and a newline separates statements like ;).
-_SHELL_SPLIT = re.compile(r"(?<!\|)\|(?!\|)|\|\||&&|;|\n")
+# scripts, and a newline separates statements like ;). A `|` that is part
+# of a `>|` / `N>|` noclobber-override redirect is NOT a pipe.
+_SHELL_SPLIT = re.compile(r"(?<![|>&\d])\|(?!\|)|\|\||&&|;|\n")
 
 _RULE_RE = re.compile(r"^\s*([A-Za-z_][\w-]*)\s*(?:\((.*)\))?\s*$")
 
@@ -297,13 +315,17 @@ def _redirect_targets(command: str) -> list[str]:
     """Filesystem paths a shell command writes to (redirect, tee, dd, cp/mv)."""
     targets = [t for t in _REDIRECT_TARGET.findall(command)]
     targets += _DD_TARGET.findall(command)
-    # cp/mv/install write to their final argument.
+    # cp/mv/install write to their final argument, or to a `-t DIR` flag.
     for seg in _shell_segments(command):
         toks = _shell_tokens(seg)
         if toks and toks[0] in ("cp", "mv", "install") and len(toks) >= 2:
-            dest = toks[-1]
-            if not dest.startswith("-"):
-                targets.append(dest)
+            dash_t = _DASH_T_TARGET.findall(seg)
+            if dash_t:
+                targets.extend(dash_t)
+            else:
+                dest = toks[-1]
+                if not dest.startswith("-"):
+                    targets.append(dest)
     cleaned = [t.strip().strip("'\"") for t in targets if t and t.strip()]
     return [t for t in cleaned if t not in _DEVICE_SINKS]
 
@@ -320,6 +342,17 @@ def _opaque_shell_reason(command: str) -> Optional[str]:
     """
     if _INLINE_CODE.search(command):
         return "inline interpreter code"
+    # Assemble-then-use: a command that assigns a shell variable and later
+    # expands it hides its real target/effect from the lexical sacred and
+    # workspace checks (`p=$HOME/.ssh; cat $p/id_rsa`, `d=/etc; cp x $d/`).
+    # Bare $HOME/$PWD usage without a preceding assignment is NOT flagged.
+    assigned = set(re.findall(r"(?:^|[;&|\n]|\bexport\s+)\s*(\w+)=", command))
+    if assigned:
+        for var in assigned:
+            if re.search(rf"\$\{{?{re.escape(var)}\b", command):
+                # Only if the expansion is used as/inside an argument, not
+                # just re-assigned. Cheap check: it appears after its assign.
+                return "variable assembled then expanded"
     for seg in _shell_segments(command):
         stripped = re.sub(r"^(?:\w+=\S*\s+)*", "", seg.strip())
         if not stripped:
@@ -472,9 +505,10 @@ class PermissionEngine:
                 return Verdict("deny", "readonly posture blocks network egress", "posture")
             return Verdict("ask", f"fetch from {host or 'unknown host'}", "network")
 
+        # -- shell floors (below deny/sacred, ABOVE ask/grant/allow rules) --
+        # These are non-bypassable: an allow rule or session grant must not
+        # re-enable catastrophic or opaque shell.
         if is_shell:
-            # Whole command first (pipe-spanning patterns like curl|sh are
-            # invisible after splitting), then every compound segment.
             for candidate in [primary, *_shell_segments(primary)]:
                 if danger := _dangerous_shell(candidate):
                     return Verdict(
@@ -484,6 +518,18 @@ class PermissionEngine:
                     return Verdict(
                         "ask", "recursive rm on '.'/'..'/glob", "never-auto",
                     )
+            # Opaque and out-of-workspace shell writes are floors too, so a
+            # loose allow rule / "always" grant cannot re-open inline-code RCE
+            # or an out-of-workspace write. (Only meaningful under auto; safe/
+            # readonly ask/deny all shell mutations at the posture branch.)
+            if self._posture == "auto":
+                if reason := _opaque_shell_reason(primary):
+                    return Verdict("ask", f"opaque shell ({reason})", "opaque-shell")
+                for target in _redirect_targets(primary):
+                    if not self._in_workspace(target):
+                        return Verdict(
+                            "ask", f"shell write outside workspace ({target})", "workspace",
+                        )
 
         for rule in self._ask:
             if rule.matches(tool_name, primary):
@@ -510,24 +556,12 @@ class PermissionEngine:
                 return Verdict("ask", "safe posture asks for mutations", "posture")
             return Verdict("allow", "safe posture allows reads", "posture")
 
-        # posture == "auto": auto-approve, but only what is transparent and
-        # workspace-contained.
+        # posture == "auto": file writes must stay in the workspace (shell was
+        # already floored above).
         if is_write and not is_shell:
             path = arguments.get("path") or arguments.get("file_path") or ""
             if isinstance(path, str) and path and not self._in_workspace(path):
                 return Verdict("ask", f"write outside workspace ({path})", "workspace")
-        if is_shell:
-            # A command whose effect is not visible in its text (inline
-            # interpreter code, a command word built from an expansion)
-            # can never be auto-approved -- the lexical floor cannot see
-            # through it. It asks instead.
-            if reason := _opaque_shell_reason(primary):
-                return Verdict("ask", f"opaque shell ({reason})", "opaque-shell")
-            for target in _redirect_targets(primary):
-                if not self._in_workspace(target):
-                    return Verdict(
-                        "ask", f"shell write outside workspace ({target})", "workspace",
-                    )
         return Verdict("allow", "auto posture", "posture")
 
     @staticmethod
