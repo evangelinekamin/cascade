@@ -509,6 +509,13 @@ class MainScreen(Screen):
                         new_episodes,
                     )
                     _call(self.app.state.prune_live_episodes, kept_exchanges)
+                    _call(self.app.state.mark_compaction)
+                    _call(
+                        self._post_compaction_note,
+                        f"compacted {compacted_count} turns into "
+                        f"{len(new_episodes)} episodes",
+                    )
+                    _call(self._refresh_context_display)
                     # Mirror the state change locally: this worker builds the
                     # payload from its own snapshot, not by re-reading state.
                     episode_list = prune_live_episodes(
@@ -758,6 +765,7 @@ class MainScreen(Screen):
                 ),
             )
 
+            _call(self.app.state.set_context_anchor, prov.last_round_usage)
             live_run.finish(RunOutcome.SUCCEEDED)
             self._emit_for_run(
                 run,
@@ -898,6 +906,7 @@ class MainScreen(Screen):
                 ),
             )
 
+            _call(self.app.state.set_context_anchor, prov.last_round_usage)
             live_run.finish(RunOutcome.SUCCEEDED)
             self._emit_for_run(
                 run,
@@ -923,6 +932,58 @@ class MainScreen(Screen):
             live_run.add_cost(usage.cost or 0.0)
             live_run.finish(RunOutcome.FAILED, error=str(e))
             self._emit_for_run(run, self._on_stream_error, str(e), terminal=True)
+
+    def _post_compaction_note(self, text: str) -> None:
+        """Mount a dim one-line separator noting a compaction event."""
+        try:
+            chat = self.query_one(ChatHistory)
+            note = Static(
+                Text(f"─── {text} ───", style=f"dim {PALETTE.text_dim}"),
+                classes="bookmark",
+            )
+            chat.mount(note)
+            chat.scroll_end(animate=False)
+        except Exception:
+            pass
+
+    def _refresh_context_display(self) -> None:
+        """Push current context occupancy into the status bar and input frame.
+
+        One accounting source: budget thresholds + the state anchor (the
+        last round's real usage). Anchor None renders as "ctx ?".
+        """
+        from ..context.budget import compact_threshold, warn_threshold, window_for
+
+        state = self.app.state
+        provider_name = state.active_provider
+        cli_app = getattr(self.app, "cli_app", None)
+        prov = cli_app.providers.get(provider_name) if cli_app else None
+        model = (prov.config.model if prov else "") or ""
+        configured = prov.config.context_window if prov else None
+        window = window_for(provider_name, model, configured)
+        threshold = compact_threshold(window)
+        warn = warn_threshold(window)
+        anchor = state.context_anchor
+
+        try:
+            bar = self.query_one(StatusBar)
+            frame = self.query_one(InputFrame)
+        except Exception:
+            return
+
+        if anchor is None:
+            bar.update_context(None, threshold, warn, state.compaction_count)
+            frame.context_label = "ctx ?" if state.compaction_count else ""
+            return
+
+        tokens = anchor.total
+        pct = min(tokens * 100 // threshold, 999) if threshold > 0 else 0
+        bar.update_context(tokens, threshold, warn, state.compaction_count)
+        if tokens >= 1000:
+            tok_str = f"{tokens / 1000:.1f}k"
+        else:
+            tok_str = str(tokens)
+        frame.context_label = f"ctx {tok_str} · {pct}%"
 
     def _on_stream_chunk(self, chunk: str) -> None:
         """Called from worker thread via app.call_from_thread."""
@@ -999,11 +1060,7 @@ class MainScreen(Screen):
         except Exception:
             pass
 
-        # Update input frame token count
-        try:
-            self.query_one(InputFrame).token_count = self.app.state.total_tokens
-        except Exception:
-            pass
+        self._refresh_context_display()
 
 
     def _on_stream_done(
@@ -1043,11 +1100,7 @@ class MainScreen(Screen):
         except Exception:
             pass
 
-        # Update input frame token count
-        try:
-            self.query_one(InputFrame).token_count = self.app.state.total_tokens
-        except Exception:
-            pass
+        self._refresh_context_display()
 
 
     def _on_stream_error(self, error_msg: str) -> None:

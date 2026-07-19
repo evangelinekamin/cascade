@@ -1041,6 +1041,64 @@ class CommandHandler:
         url = self._upload_server.start()
         self._post_system(f"Upload server started at {url}")
 
+    def _context_occupancy_lines(self, cli_app) -> list[str]:
+        """Window-occupancy breakdown, reconciled to the budget authority."""
+        from .context.budget import compact_threshold, warn_threshold, window_for
+
+        state = self.app.state
+        provider_name = state.active_provider
+        from .providers.usage import Usage
+
+        prov = cli_app.providers.get(provider_name) if cli_app else None
+        model = prov.config.model if prov else ""
+        model = model if isinstance(model, str) else ""
+        configured = prov.config.context_window if prov else None
+        configured = configured if isinstance(configured, int) else None
+        window = window_for(provider_name, model, configured)
+        threshold = compact_threshold(window)
+        # Coerce state fields: tests (and partial apps) mock state wholesale.
+        anchor = state.context_anchor
+        anchor = anchor if isinstance(anchor, Usage) else None
+        compactions = state.compaction_count
+        compactions = compactions if isinstance(compactions, int) else 0
+        episodes = state.episodes if isinstance(state.episodes, list) else []
+        summary = state.compaction_summary
+        summary = summary if isinstance(summary, str) else ""
+
+        lines = [f"Context window ({provider_name} · {model or 'unknown model'}):"]
+        if anchor is None:
+            lines.append("  occupancy: unknown (no response yet"
+                         + (" since compaction" if compactions else "")
+                         + ")")
+        else:
+            pct = min(anchor.total * 100 // threshold, 999) if threshold else 0
+            lines.append(
+                f"  occupancy: {anchor.total:,} tok ({pct}% of the"
+                f" {threshold:,}-tok compaction threshold)"
+            )
+            lines.append(
+                f"    last round: in {anchor.input:,}"
+                f" · cache read {anchor.cache_read:,}"
+                f" · cache write {anchor.cache_write:,}"
+                f" · out {anchor.output:,}"
+            )
+        lines.append(
+            f"  window: {window:,} tok"
+            f" · warn at {warn_threshold(window):,}"
+            f" · compact at {threshold:,}"
+        )
+        live = sum(1 for ep in episodes if ep.source == "live")
+        lines.append(
+            f"  compactions: {compactions}"
+            f" · episodes: {len(episodes)}"
+            f" ({live} live · {len(episodes) - live} carried)"
+        )
+        if summary:
+            lines.append(
+                f"  summary: {len(summary):,} chars carried forward"
+            )
+        return lines
+
     def _cmd_context(self, args: list[str]) -> None:
         cli_app = getattr(self.app, "cli_app", None)
         if cli_app is None:
@@ -1055,13 +1113,17 @@ class CommandHandler:
             self._post_system("Context cleared.")
             return
 
-        # /context -- show sources
+        occupancy = self._context_occupancy_lines(cli_app)
+
+        # /context -- show occupancy + uploaded sources
         sources = ctx.list_sources()
         if not sources:
-            self._post_system("No uploaded context sources.")
+            self._post_system(
+                "\n".join(occupancy) + "\n\nNo uploaded context sources."
+            )
             return
 
-        lines = [f"Context sources ({ctx.source_count}, ~{ctx.token_estimate} tokens):"]
+        lines = occupancy + ["", f"Context sources ({ctx.source_count}, ~{ctx.token_estimate} tokens):"]
         for s in sources:
             lines.append(f"  [{s['type']}] {s['label']} ({s['size']} chars)")
         self._post_system("\n".join(lines))

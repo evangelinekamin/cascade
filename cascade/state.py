@@ -9,6 +9,7 @@ import time
 
 from .history.wordid import generate_word_id
 from .episodes import Episode
+from .providers.usage import Usage
 
 from textual.message import Message
 
@@ -104,6 +105,12 @@ class CascadeState:
         self.cwd: str = "."
         self.branch: str = "main"
         self.episodes: List[Episode] = []
+        # Context accounting: the last round's real Usage (the anchor) and
+        # how often this session has compacted. anchor None = unknown (fresh
+        # session or just compacted) -- the indicator shows "?".
+        self.context_anchor: Optional[Usage] = None
+        self.compaction_count: int = 0
+        self.compaction_summary: str = ""
         self.is_thinking: bool = False
         self.current_thought: str = ""
         self.fast_mode: bool = False
@@ -147,6 +154,9 @@ class CascadeState:
         for key in current_keys:
             self.provider_tokens.setdefault(key, 0)
         self.episodes = []
+        self.context_anchor = None
+        self.compaction_count = 0
+        self.compaction_summary = ""
         self.is_thinking = False
         self.current_thought = ""
 
@@ -173,6 +183,18 @@ class CascadeState:
         self.is_thinking = thinking
         self.current_thought = thought
         self._post(ThinkingChanged(provider, thinking, thought))
+
+    def set_context_anchor(self, anchor: Optional[Usage]) -> None:
+        """Record the last round's real usage -- the context-occupancy anchor."""
+        self.context_anchor = anchor
+
+    def mark_compaction(self) -> None:
+        """Compaction happened: occupancy is unknown until the next response."""
+        self.compaction_count += 1
+        self.context_anchor = None
+
+    def set_compaction_summary(self, summary: str) -> None:
+        self.compaction_summary = summary
 
     def add_episode(self, episode: Episode) -> None:
         """Record a completed episode for context compaction."""

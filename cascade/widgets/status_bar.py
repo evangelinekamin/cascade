@@ -74,6 +74,9 @@ class StatusBar(Static):
         self._branch = branch
         self._dirty = False
         self._provider_tokens: dict[str, int] = provider_tokens or {}
+        # Context occupancy: (tokens or None, compact threshold, warn
+        # threshold, compaction count). None until the first real response.
+        self._ctx: tuple[int | None, int, int, int] | None = None
         self._override_text: str = ""
         self._flash: str = ""
         self._flash_timer = None
@@ -103,6 +106,22 @@ class StatusBar(Static):
         if self._flash:
             right.append(self._flash, style=PALETTE.text_dim)
         else:
+            if self._ctx is not None:
+                tokens, threshold, warn, compactions = self._ctx
+                if tokens is None:
+                    right.append("ctx ?", style=f"dim {PALETTE.text_dim}")
+                else:
+                    pct = min(tokens * 100 // threshold, 999) if threshold > 0 else 0
+                    if tokens >= threshold:
+                        style = PALETTE.error
+                    elif tokens >= warn:
+                        style = PALETTE.amber
+                    else:
+                        style = f"dim {PALETTE.text_dim}"
+                    right.append(f"ctx {pct}%", style=style)
+                if compactions:
+                    right.append(f" \u27f3{compactions}", style=f"dim {PALETTE.text_dim}")
+                right.append("  ")
             for name, ptheme in PROVIDERS.items():
                 count = self._provider_tokens.get(name, 0)
                 if count <= 0:
@@ -121,6 +140,17 @@ class StatusBar(Static):
     def update_tokens(self, provider_tokens: dict[str, int]) -> None:
         """Update token counts and refresh."""
         self._provider_tokens = dict(provider_tokens)
+        self.refresh()
+
+    def update_context(
+        self,
+        tokens: int | None,
+        threshold: int,
+        warn: int,
+        compactions: int,
+    ) -> None:
+        """Update the context-occupancy display (None tokens = unknown)."""
+        self._ctx = (tokens, threshold, warn, compactions)
         self.refresh()
 
     def set_override(self, text: str) -> None:

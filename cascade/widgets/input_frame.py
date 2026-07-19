@@ -99,28 +99,31 @@ class InputFrame(Widget):
 
     active_provider: reactive[str] = reactive("gemini")
     mode: reactive[str] = reactive("design")
-    token_count: reactive[int] = reactive(0)
+    # Context-occupancy label for the border subtitle (e.g. "ctx 12.4k · 7%").
+    # Empty hides the subtitle. This is window fill, NOT cumulative spend --
+    # the session total lives on the exit screen.
+    context_label: reactive[str] = reactive("")
 
     def __init__(
         self,
         active_provider: str = "gemini",
         mode: str = "design",
-        token_count: int = 0,
+        context_label: str = "",
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.active_provider = active_provider
         self.mode = mode
-        self.token_count = token_count
+        self.context_label = context_label
 
     def compose(self) -> ComposeResult:
         yield AutocompleteDropdown(id="autocomplete")
-        yield FramedInput(self.active_provider, self.token_count)
+        yield FramedInput(self.active_provider, self.context_label)
         yield ModeIndicator(self.mode)
 
     def watch_active_provider(self, value: str) -> None:
         try:
-            self.query_one(FramedInput).set_provider(value, self.token_count)
+            self.query_one(FramedInput).set_provider(value)
         except Exception:
             pass
 
@@ -130,9 +133,9 @@ class InputFrame(Widget):
         except Exception:
             pass
 
-    def watch_token_count(self, value: int) -> None:
+    def watch_context_label(self, value: str) -> None:
         try:
-            self.query_one(FramedInput).set_provider(self.active_provider, value)
+            self.query_one(FramedInput).set_context_label(value)
         except Exception:
             pass
 
@@ -197,10 +200,10 @@ class FramedInput(Widget):
     }
     """
 
-    def __init__(self, provider: str, token_count: int, **kwargs) -> None:
+    def __init__(self, provider: str, context_label: str = "", **kwargs) -> None:
         super().__init__(**kwargs)
         self._provider = provider
-        self._token_count = token_count
+        self._context_label = context_label
 
     def compose(self) -> ComposeResult:
         yield Label("\u276f", id="prompt_char", classes="prompt-char")
@@ -209,9 +212,12 @@ class FramedInput(Widget):
     def on_mount(self) -> None:
         self._apply_accent()
 
-    def set_provider(self, provider: str, token_count: int) -> None:
+    def set_provider(self, provider: str) -> None:
         self._provider = provider
-        self._token_count = token_count
+        self._apply_accent()
+
+    def set_context_label(self, label: str) -> None:
+        self._context_label = label
         self._apply_accent()
 
     def _apply_accent(self) -> None:
@@ -220,11 +226,12 @@ class FramedInput(Widget):
 
         self.border_title = Text(f" {self._provider} ", style=f"bold {accent}")
 
-        if self._token_count >= 1000:
-            tok_str = f"~{self._token_count / 1000:.1f}k tokens"
+        if self._context_label:
+            self.border_subtitle = Text(
+                f" {self._context_label} ", style=f"dim {PALETTE.text_dim}",
+            )
         else:
-            tok_str = f"~{self._token_count} tokens"
-        self.border_subtitle = Text(f" {tok_str} ", style=f"dim {PALETTE.text_dim}")
+            self.border_subtitle = None
 
         try:
             prompt = self.query_one("#prompt_char")
