@@ -194,32 +194,45 @@ class ChatHistory(VerticalScroll):
         event.prevent_default()
 
     async def trim_overflow(self) -> None:
-        """Remove oldest widgets when exceeding the pool cap."""
-        children = list(self.children)
-        # Only trim MessageWidget instances (not ThinkingIndicator, StreamMessage)
-        msg_widgets = [c for c in children if isinstance(c, MessageWidget)]
-        excess = len(msg_widgets) - self._max_widgets
+        """Remove oldest content widgets when exceeding the pool cap.
+
+        Counts ALL content rows -- messages, tool calls, diff/write blocks,
+        compaction/bookmark notes -- not just MessageWidget, so an agentic
+        session full of tool widgets cannot grow the mounted-widget count
+        without bound. The overflow indicator and any live widget (thinking
+        indicator, actively-streaming message) are always the newest child,
+        so trimming oldest-first never removes them.
+        """
+        skip = {"ThinkingIndicator", "_ProseBody", "AutocompleteDropdown"}
+        content = [
+            c for c in self.children
+            if c is not self._overflow_indicator
+            and type(c).__name__ not in skip
+        ]
+        excess = len(content) - self._max_widgets
         if excess <= 0:
             return
 
-        for widget in msg_widgets[:excess]:
-            role = getattr(widget, "_role", "")
-            content = getattr(widget, "_content", "")
-            self._overflow.append((role, content))
+        for widget in content[:excess]:
+            # Only MessageWidget carries recoverable role/content; other rows
+            # (tool output, diffs) are transient and dropped.
+            if isinstance(widget, MessageWidget):
+                self._overflow.append(
+                    (getattr(widget, "_role", ""), getattr(widget, "_content", "")),
+                )
             await widget.remove()
 
-        # Show/update overflow indicator
+        # Show/update the overflow indicator only when messages were trimmed
+        # (tool-row trimming alone leaves nothing recoverable to announce).
         count = len(self._overflow)
+        if count == 0:
+            return
+        label = Text(f"  {count} earlier messages  ", style=f"dim {PALETTE.text_muted}")
         if self._overflow_indicator is None:
-            self._overflow_indicator = Static(
-                Text(f"  {count} earlier messages  ", style=f"dim {PALETTE.text_muted}"),
-                classes="overflow-indicator",
-            )
+            self._overflow_indicator = Static(label, classes="overflow-indicator")
             await self.mount(self._overflow_indicator, before=0)
         else:
-            self._overflow_indicator.update(
-                Text(f"  {count} earlier messages  ", style=f"dim {PALETTE.text_muted}")
-            )
+            self._overflow_indicator.update(label)
 
     @property
     def overflow_messages(self) -> list[tuple[str, str]]:

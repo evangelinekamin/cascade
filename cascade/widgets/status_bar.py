@@ -89,16 +89,23 @@ class StatusBar(Static):
 
     def on_mount(self) -> None:
         # The branch/dirty state was a one-time snapshot, so it went stale
-        # after any commit or checkout mid-session. Refresh it on a slow
-        # interval (cheap git calls, off the hot path).
-        self._git_timer = self.set_interval(4.0, self._refresh_git)
+        # after any commit or checkout mid-session. Refresh on a slow
+        # interval, but run the git subprocesses in a THREAD -- doing them
+        # on the UI thread every few seconds visibly freezes the TUI.
+        self._git_timer = self.set_interval(5.0, self._schedule_git_refresh)
 
-    def _refresh_git(self) -> None:
+    def _schedule_git_refresh(self) -> None:
+        self.run_worker(self._refresh_git_worker, thread=True, exclusive=True, group="git")
+
+    def _refresh_git_worker(self) -> None:
         branch, dirty = _git_info()
         if (branch, dirty) != (self._branch, self._dirty):
-            self._branch = branch
-            self._dirty = dirty
-            self.refresh()
+            self.app.call_from_thread(self._apply_git, branch, dirty)
+
+    def _apply_git(self, branch: str, dirty: bool) -> None:
+        self._branch = branch
+        self._dirty = dirty
+        self.refresh()
 
     def render(self) -> Text:
         t = Text()

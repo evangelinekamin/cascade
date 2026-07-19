@@ -10,6 +10,11 @@ from textual.widgets import Static
 
 from ..theme import PALETTE
 
+# A file write/edit should be visually distinct, not bury the conversation.
+# Show a head window and a "N more lines" footer -- the full content is on
+# disk (the tool wrote it) and in the tool result.
+_MAX_BODY_LINES = 14
+
 
 class DiffBlock(Static):
     """Inline diff viewer for file changes."""
@@ -41,8 +46,24 @@ class DiffBlock(Static):
 
         subtitle = Text(f" {self._lines_changed} lines changed ", style=f"dim {PALETTE.text_dim}")
 
+        # Fold to a window centered on the changed hunks so a large edit does
+        # not dump the whole file; changed lines are what the reader wants.
+        shown = self._diff_lines
+        hidden = 0
+        if len(shown) > _MAX_BODY_LINES:
+            changed_idx = [i for i, (_, op, _) in enumerate(shown) if op in ("+", "-")]
+            if changed_idx:
+                lo = max(0, changed_idx[0] - 2)
+                hi = min(len(shown), changed_idx[-1] + 3)
+                if hi - lo > _MAX_BODY_LINES:
+                    hi = lo + _MAX_BODY_LINES
+            else:
+                lo, hi = 0, _MAX_BODY_LINES
+            hidden = len(shown) - (hi - lo)
+            shown = shown[lo:hi]
+
         content = Text()
-        for ln, op, line in self._diff_lines:
+        for ln, op, line in shown:
             if op == "-":
                 content.append(f"{ln:>3}- ", style=f"bold {PALETTE.diff_del}")
                 content.append(f"{line}\n", style=f"strikethrough {PALETTE.diff_del}")
@@ -52,6 +73,8 @@ class DiffBlock(Static):
             else:
                 content.append(f"{ln:>3}  ", style=f"dim {PALETTE.text_dim}")
                 content.append(f"{line}\n", style=PALETTE.text_primary)
+        if hidden > 0:
+            content.append(f"     … {hidden} more lines", style=f"dim {PALETTE.text_dim}")
 
         return Panel(
             content,
@@ -90,10 +113,20 @@ class WriteBlock(Static):
         title.append(" > write ", style=f"bold {PALETTE.amber}")
         title.append(self._file_path, style=PALETTE.text_primary)
 
-        subtitle = Text(" new file ", style=f"dim {PALETTE.text_dim}")
+        lines = self._code.split("\n")
+        total = len(lines)
+        if total > _MAX_BODY_LINES:
+            code = "\n".join(lines[:_MAX_BODY_LINES])
+            subtitle = Text(
+                f" {total} lines · showing {_MAX_BODY_LINES} ",
+                style=f"dim {PALETTE.text_dim}",
+            )
+        else:
+            code = self._code
+            subtitle = Text(f" {total} lines ", style=f"dim {PALETTE.text_dim}")
 
         syntax = Syntax(
-            self._code,
+            code,
             self._language,
             theme="monokai",
             line_numbers=True,

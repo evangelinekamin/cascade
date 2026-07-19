@@ -1195,14 +1195,22 @@ class MainScreen(Screen):
         self.app.state.set_thinking(provider, False)
         self._set_input_locked(False)
 
-        # Feed full response into the StreamMessage
-        if hasattr(self, "_stream_msg"):
-            self._stream_msg.feed(full_text)
-            self._stream_msg.finish()
+        # The stream widget was pre-mounted ABOVE the tool-call rows, but the
+        # final answer belongs AFTER them (you read the tools, then the
+        # conclusion). Drop the empty pre-mounted widget and render the answer
+        # fresh at the bottom so reading order is tools -> answer.
+        stream = getattr(self, "_stream_msg", None)
+        if stream is not None:
+            try:
+                stream.remove()
+            except Exception:
+                pass
             self._stream_msg = None
-
         try:
-            self._scroll_chat_end(self.query_one(ChatHistory))
+            chat = self.query_one(ChatHistory)
+            if full_text.strip():
+                chat.mount(MessageWidget(provider, full_text))
+            self._scroll_chat_end(chat)
         except Exception:
             pass
 
