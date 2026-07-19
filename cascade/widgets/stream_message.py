@@ -12,7 +12,7 @@ from textual.widget import Widget
 from textual.app import ComposeResult
 from textual.widgets import Static
 
-from .message import render_content, GutterLabel, GutterSeparator
+from .message import render_content, render_md_line, GutterLabel, GutterSeparator
 from .code_block import CodeBlock
 
 
@@ -56,6 +56,9 @@ class StreamMessage(Widget):
         self._code_buf = ""
         self._code_lang = ""
         self._prose_lines: list[str] = []
+        # How many completed prose lines have been handed to the widget and
+        # frozen; only lines past this and the partial re-render per batch.
+        self._flushed_lines = 0
         self._prose_widget: _ProseBody | None = None
         self._body_column: Vertical | None = None
 
@@ -131,13 +134,23 @@ class StreamMessage(Widget):
                 self._line_buf = ""
 
     def _refresh_prose(self, include_partial: bool = False) -> None:
-        """Update the prose widget with accumulated lines."""
-        if self._prose_widget:
-            lines = list(self._prose_lines)
-            if include_partial and self._line_buf:
-                lines.append(self._line_buf)
-            self._prose_widget.set_content("\n".join(lines))
-            self._refresh_layout()
+        """Push freshly-completed lines to the widget, plus the live partial.
+
+        Completed lines are rendered ONCE and frozen by the widget; only the
+        trailing partial re-renders per batch. This keeps long streams O(n)
+        overall instead of the O(n^2) of re-rendering the whole segment on
+        every 30ms batch.
+        """
+        if not self._prose_widget:
+            return
+        # Hand over any prose lines completed since the last refresh.
+        if len(self._prose_lines) > self._flushed_lines:
+            new_lines = self._prose_lines[self._flushed_lines:]
+            self._prose_widget.append_lines(new_lines)
+            self._flushed_lines = len(self._prose_lines)
+        partial = self._line_buf if include_partial else ""
+        self._prose_widget.set_partial(partial)
+        self._refresh_layout()
 
     def _emit_code_block(self, code: str, language: str) -> None:
         """Mount a CodeBlock widget for completed fenced code."""
@@ -151,6 +164,7 @@ class StreamMessage(Widget):
             pass
         # Start a new prose widget after the code block
         self._prose_lines = []
+        self._flushed_lines = 0
         self._prose_widget = _ProseBody("")
         try:
             target = self._body_column or self
@@ -166,7 +180,13 @@ class StreamMessage(Widget):
 
 
 class _ProseBody(Static):
-    """A Static widget that re-renders its content when updated."""
+    """Prose widget that freezes completed lines and re-renders only the tail.
+
+    ``append_lines`` renders each completed line exactly once into a frozen
+    Text buffer; ``set_partial`` swaps the trailing in-progress line. render()
+    is then frozen + partial, so a growing stream costs one line-render per
+    completed line rather than re-parsing the whole segment every batch.
+    """
 
     DEFAULT_CSS = """
     _ProseBody {
@@ -175,15 +195,37 @@ class _ProseBody(Static):
     }
     """
 
-    def __init__(self, content: str, **kwargs) -> None:
+    def __init__(self, content: str = "", **kwargs) -> None:
         super().__init__(**kwargs)
-        self._content = content
+        self._frozen = Text()
+        self._partial = ""
+        self._frozen_line_count = 0
+        if content:
+            self.append_lines(content.split("\n"))
 
-    def set_content(self, content: str) -> None:
-        self._content = content
+    def append_lines(self, lines: list[str]) -> None:
+        """Render and freeze newly-completed lines (each rendered once)."""
+        for line in lines:
+            if self._frozen_line_count > 0:
+                self._frozen.append("\n")
+            self._frozen.append_text(render_md_line(line))
+            self._frozen_line_count += 1
+        self.refresh(layout=True)
+
+    def set_partial(self, partial: str) -> None:
+        """Set the trailing in-progress line (the only part that re-renders)."""
+        if partial == self._partial:
+            return
+        self._partial = partial
         self.refresh(layout=True)
 
     def render(self) -> Text:
-        if not self._content:
+        if self._frozen_line_count == 0 and not self._partial:
             return Text("")
-        return render_content(self._content)
+        if not self._partial:
+            return self._frozen.copy()
+        out = self._frozen.copy()
+        if self._frozen_line_count > 0:
+            out.append("\n")
+        out.append_text(render_md_line(self._partial))
+        return out

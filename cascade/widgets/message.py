@@ -46,6 +46,11 @@ _LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 _HEADER = re.compile(r"^(#{1,6})\s+(.*)")
 
 
+def render_md_line(line: str) -> Text:
+    """Public: render a single markdown line (used by the stream renderer)."""
+    return _render_md_line(line)
+
+
 def _render_md_line(line: str) -> Text:
     """Convert a single markdown line to styled Rich Text."""
     # Headers
