@@ -252,7 +252,7 @@ def test_main_screen_queues_new_prompt_while_thinking():
     finally:
         active_app.reset(token)
 
-    assert screen._queued_prompt == "hello"
+    assert list(screen._queued_prompts) == ["hello"]
     event.text_area.record.assert_called_once_with("hello")
     event.text_area.load_text.assert_called_once_with("")
     screen._cmd_handler.handle.assert_not_called()
@@ -276,7 +276,7 @@ def test_main_screen_runs_exit_command_even_while_thinking():
         active_app.reset(token)
 
     screen._cmd_handler.handle.assert_called_once_with("/exit")
-    assert screen._queued_prompt is None
+    assert len(screen._queued_prompts) == 0
 
 
 def test_main_screen_mouse_scroll_routes_to_chat():

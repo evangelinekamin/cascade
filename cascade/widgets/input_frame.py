@@ -93,8 +93,38 @@ class ChatTextArea(TextArea):
         except Exception:
             return 0
 
+    def _autocomplete(self):
+        """The visible autocomplete dropdown, if one is open."""
+        try:
+            dd = self.screen.query_one(AutocompleteDropdown)
+            return dd if dd.visible else None
+        except Exception:
+            return None
+
     async def _on_key(self, event: events.Key) -> None:
         key = event.key
+
+        # When the slash-command autocomplete is open, arrows/tab/escape drive
+        # it -- handled HERE (the composer receives keys first, so relying on
+        # the InputFrame ancestor lost the race to history recall).
+        dropdown = self._autocomplete()
+        if dropdown is not None and key in ("up", "down", "tab", "escape"):
+            if key == "down":
+                dropdown.move_selection(1)
+            elif key == "up":
+                dropdown.move_selection(-1)
+            elif key == "tab":
+                selected = dropdown.selected_command
+                if selected:
+                    self.load_text(f"/{selected} ")
+                    self.move_cursor(self.document.end)
+                dropdown.hide()
+            else:  # escape
+                dropdown.hide()
+            event.stop()
+            event.prevent_default()
+            return
+
         # Enter submits (shift+enter / ctrl+j newline handled by BINDINGS).
         if key == "enter":
             event.stop()
@@ -202,37 +232,9 @@ class InputFrame(Widget):
         else:
             dropdown.hide()
 
-    def on_key(self, event) -> None:
-        """Route arrows/tab to the autocomplete dropdown when it is visible.
-
-        Handled here (before the composer's own key handler) so dropdown
-        navigation wins over history/line movement only while the dropdown
-        is open -- otherwise the composer keeps full control of Up/Down.
-        """
-        dropdown = self.query_one(AutocompleteDropdown)
-        if not dropdown.visible:
-            return
-
-        if event.key == "down":
-            dropdown.move_selection(1)
-        elif event.key == "up":
-            dropdown.move_selection(-1)
-        elif event.key == "tab":
-            selected = dropdown.selected_command
-            if selected:
-                try:
-                    inp = self.query_one("#main_input", ChatTextArea)
-                    inp.load_text(f"/{selected} ")
-                    inp.move_cursor(inp.document.end)
-                except Exception:
-                    pass
-                dropdown.hide()
-        elif event.key == "escape":
-            dropdown.hide()
-        else:
-            return
-        event.prevent_default()
-        event.stop()
+    # Autocomplete arrow/tab/escape navigation is handled by ChatTextArea
+    # itself (it receives keys first as the focused widget), so no ancestor
+    # on_key is needed here.
 
 
 class FramedInput(Widget):

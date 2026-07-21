@@ -10,6 +10,7 @@ import time
 from collections import OrderedDict
 from hashlib import md5
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual import events
 from textual.containers import VerticalScroll
@@ -208,19 +209,23 @@ def _render_table(rows: list[str]) -> Text:
     def _cell(cells: list[str], idx: int) -> str:
         return cells[idx] if idx < len(cells) else ""
 
+    # Column widths use terminal DISPLAY width of the rendered cell (after
+    # inline formatting strips markdown syntax), so CJK/wide glyphs and
+    # markdown-styled cells still line up. Capped so one long cell can't
+    # blow out the table.
     widths = []
     for c in range(ncol):
-        w = len(_cell(header, c))
+        w = cell_len(_inline_format(_cell(header, c)).plain)
         for r in body:
-            w = max(w, len(_cell(r, c)))
-        widths.append(min(w, 40))  # cap absurdly wide columns
+            w = max(w, cell_len(_inline_format(_cell(r, c)).plain))
+        widths.append(min(w, 40))
 
     out = Text()
     # Header
     for c in range(ncol):
         if c:
             out.append("  ")
-        out.append(_cell(header, c).ljust(widths[c]), style=f"bold {PALETTE.text_bright}")
+        out.append_text(_pad_inline(_cell(header, c), widths[c], bold=True))
     out.append("\n")
     # Rule
     out.append("  ".join("─" * widths[c] for c in range(ncol)), style=f"dim {PALETTE.text_dim}")
@@ -234,10 +239,12 @@ def _render_table(rows: list[str]) -> Text:
     return out
 
 
-def _pad_inline(cell: str, width: int) -> Text:
-    """Inline-format a cell and right-pad the plain text to *width*."""
+def _pad_inline(cell: str, width: int, bold: bool = False) -> Text:
+    """Inline-format a cell and right-pad to *width* display columns."""
     t = _inline_format(cell)
-    pad = width - len(t.plain)
+    if bold:
+        t.stylize(f"bold {PALETTE.text_bright}")
+    pad = width - cell_len(t.plain)
     if pad > 0:
         t.append(" " * pad)
     return t

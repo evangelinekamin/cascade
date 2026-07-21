@@ -6,6 +6,7 @@ Bridges to synchronous provider.stream() via run_worker(thread=True).
 
 import datetime
 import time
+from collections import deque
 from contextlib import nullcontext
 from typing import Iterator
 
@@ -95,9 +96,9 @@ class MainScreen(Screen):
         self._active_run: RunContext | None = None
         self._exit_armed = False
         self._exit_timer = None
-        # Type-ahead: a prompt submitted while a turn is running waits here
-        # and is dispatched when the turn completes.
-        self._queued_prompt: str | None = None
+        # Type-ahead: prompts submitted while work is running wait here (FIFO)
+        # and are dispatched, oldest first, when the work completes.
+        self._queued_prompts: "deque[str]" = deque()
         self._chords = self._build_chord_manager()
 
     @staticmethod
@@ -157,6 +158,9 @@ class MainScreen(Screen):
         run.cancel(reason)
         run.finish(RunOutcome.CANCELLED, error=reason)
         self._active_run = None
+        # Discard queued type-ahead prompts: cancelling means "stop", not
+        # "run the next thing I typed".
+        self._queued_prompts.clear()
         try:
             self.workers.cancel_all()
         except Exception:
@@ -286,28 +290,44 @@ class MainScreen(Screen):
     def on_chat_text_area_submitted(self, event) -> None:
         """The composer submitted a prompt (Enter)."""
         inp = event.text_area
-        prompt = event.value.strip()
+        # Always clear the composer on Enter, even for an empty/whitespace
+        # submit (otherwise the whitespace lingers).
+        raw = event.value
+        if hasattr(inp, "load_text"):
+            inp.load_text("")
+        prompt = raw.strip()
         if not prompt:
             return
 
-        # Record in input history for up-arrow recall, then clear the composer.
+        # Record in input history for up-arrow recall.
         if hasattr(inp, "record"):
             inp.record(prompt)
-        inp.load_text("")
 
-        if self.app.state.is_thinking:
-            # Type-ahead: a prompt submitted mid-generation is queued and
-            # dispatched when the current turn finishes (exit/quit run now).
+        if self._is_busy():
+            # Type-ahead: a prompt submitted while a turn OR a slash-command
+            # lane (/solve, ...) is running is queued and dispatched when the
+            # work finishes (exit/quit run immediately).
             if self._cmd_handler and self._cmd_handler.is_command(prompt):
                 cmd = prompt.lstrip("/").split(None, 1)[0].lower()
                 if cmd in {"exit", "quit"}:
                     self._cmd_handler.handle(prompt)
                     return
-            self._queued_prompt = prompt
-            self.app.notify("Queued — will run after the current response.")
+            self._queued_prompts.append(prompt)
+            depth = len(self._queued_prompts)
+            self.app.notify(
+                f"Queued ({depth} pending) — runs after the current work."
+                if depth > 1 else "Queued — runs after the current work."
+            )
             return
 
         self._dispatch_prompt(prompt)
+
+    def _is_busy(self) -> bool:
+        """True when a chat turn OR a slash-command lane is in flight."""
+        if self.app.state.is_thinking or self._active_run is not None:
+            return True
+        handler = self._cmd_handler
+        return bool(handler is not None and handler.is_busy())
 
     def _dispatch_prompt(self, prompt: str) -> None:
         """Handle one submitted prompt: slash command, hooks, then a turn."""
@@ -1214,7 +1234,14 @@ class MainScreen(Screen):
         try:
             chat = self.query_one(ChatHistory)
             if full_text.strip():
-                chat.mount(MessageWidget(provider, full_text))
+                # Render through a StreamMessage (feed + finish) so the answer
+                # gets the SAME fenced-code-block and table handling as the
+                # streaming path -- a plain MessageWidget renders raw ``` as
+                # text, losing code blocks.
+                answer = StreamMessage(provider)
+                chat.mount(answer)
+                answer.feed(full_text)
+                answer.finish()
             self._scroll_chat_end(chat)
         except Exception:
             pass
@@ -1556,17 +1583,17 @@ class MainScreen(Screen):
                 inp.focus()
         except Exception:
             pass
-        if not locked and self._queued_prompt:
+        if not locked and self._queued_prompts:
             # Defer: the terminal callback that unlocked us clears _active_run
             # only after it returns, so drain on the next cycle when idle.
             self.call_later(self._drain_prompt_queue)
 
     def _drain_prompt_queue(self) -> None:
-        """Dispatch a prompt that was queued while a turn was running."""
-        queued = self._queued_prompt
-        if queued and not self.app.state.is_thinking and self._active_run is None:
-            self._queued_prompt = None
-            self._dispatch_prompt(queued)
+        """Dispatch the oldest queued prompt when fully idle."""
+        if self._is_busy() or not self._queued_prompts:
+            return
+        prompt = self._queued_prompts.popleft()
+        self._dispatch_prompt(prompt)
 
     @staticmethod
     def _should_follow_chat(chat: ChatHistory, threshold: float = 2.0) -> bool:

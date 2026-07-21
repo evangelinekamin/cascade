@@ -158,27 +158,42 @@ class WorktreeManager:
 
     @staticmethod
     def apply_to_tree(root: str, patch: str) -> "tuple[bool, str]":
-        """Apply *patch* onto the working tree at *root* (for /apply).
+        """Apply *patch* onto the repo containing *root* (for /apply).
 
-        Plain ``git apply`` only: it is atomic, so on any conflict the tree
-        is left untouched and a clear message is returned rather than risk
-        leaving conflict markers in the user's real files. Returns
-        ``(applied, message)``.
+        The solve patch paths are repo-root-relative, so the apply MUST run
+        from the repo top-level -- run from a subdirectory, git apply
+        silently SKIPS paths outside it and still returns success, which
+        would discard the verified changes. We resolve the top-level, apply
+        there, and treat any 'Skipped' hunk as a failure so a partial/no-op
+        apply is never reported as success. Plain ``git apply`` is atomic:
+        on conflict the tree is left untouched. Returns ``(applied, msg)``.
         """
         if not patch.strip():
             return False, "nothing to apply"
         try:
-            WorktreeManager._git(
+            top = WorktreeManager._git(
+                ["rev-parse", "--show-toplevel"], cwd=root,
+            ).strip()
+        except Exception:
+            return False, "not inside a git repository"
+        if not top:
+            return False, "could not resolve the repository root"
+        try:
+            out = WorktreeManager._git(
                 ["apply", "--whitespace=nowarn", "-"],
-                cwd=root,
+                cwd=top,
                 input_text=patch,
             )
-            return True, "applied"
         except Exception as exc:
             return False, (
                 f"could not apply cleanly ({exc}); the working tree may have "
                 "changed since the solve. Review it manually."
             )
+        if "Skipped" in out:
+            # git apply skipped a path (rc 0) -- a partial/no-op apply. Report
+            # failure so the caller does not discard the patch as 'applied'.
+            return False, "some changes could not be applied; review manually"
+        return True, "applied"
 
     @staticmethod
     def _patched_paths(patch: str) -> tuple[str, ...]:

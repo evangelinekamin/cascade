@@ -6,6 +6,7 @@ Commands post state messages rather than manipulating widgets directly.
 import datetime
 import json
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -108,9 +109,39 @@ class CommandHandler:
         # The most recent passing /solve's re-appliable patch, landed by /apply.
         self._last_solve_patch: str = ""
         self._last_solve_changed: tuple[str, ...] = ()
+        # Count of long-running lane workers (/solve, /pipeline, ...) in flight,
+        # so the composer's type-ahead gate knows the session is busy and
+        # queues a chat prompt instead of cancelling the lane's worker.
+        self._active_lane_workers = 0
 
     def is_command(self, text: str) -> bool:
         return text.startswith("/")
+
+    def is_busy(self) -> bool:
+        """True while a long-running lane worker (/solve, ...) is in flight."""
+        return self._active_lane_workers > 0
+
+    @contextmanager
+    def _lane_worker(self):
+        """Mark a long-running lane worker active for the type-ahead gate."""
+        self._active_lane_workers += 1
+        try:
+            yield
+        finally:
+            self._active_lane_workers = max(0, self._active_lane_workers - 1)
+
+    def _launch_lane(self, worker, screen, *, exclusive: bool = True) -> None:
+        """Run *worker* on a thread, tracked so is_busy() reflects the lane.
+
+        A chat prompt submitted while a lane runs is then queued by the
+        composer's type-ahead gate instead of dispatching a chat turn whose
+        exclusive worker would cancel this lane.
+        """
+        def _tracked() -> None:
+            with self._lane_worker():
+                worker()
+
+        screen.run_worker(_tracked, thread=True, exclusive=exclusive)
 
     def handle(self, text: str) -> bool:
         """Handle the command. Returns True if it was a command."""
@@ -1910,7 +1941,7 @@ class CommandHandler:
                         pass
 
         screen = self.app.screen
-        screen.run_worker(_worker, thread=True, exclusive=True)
+        self._launch_lane(_worker, screen, exclusive=True)
 
     def _cmd_pipeline(self, args: list[str]) -> None:
         """Decompose a build into ordered steps, each run as a verified worker."""
@@ -1996,7 +2027,7 @@ class CommandHandler:
                 _call_ui(self._record_history_message, "system", f"Pipeline error: {e}")
 
         screen = self.app.screen
-        screen.run_worker(_worker, thread=True, exclusive=True)
+        self._launch_lane(_worker, screen, exclusive=True)
 
     def _cmd_fanout(self, args: list[str]) -> None:
         """Decompose into independent subtasks, build each verified, merge the result."""
@@ -2077,7 +2108,7 @@ class CommandHandler:
                 _call_ui(self._record_history_message, "system", f"Fanout error: {e}")
 
         screen = self.app.screen
-        screen.run_worker(_worker, thread=True, exclusive=True)
+        self._launch_lane(_worker, screen, exclusive=True)
 
     def _cmd_compete(self, args: list[str]) -> None:
         """Run the same task across providers and let a judge pick a winner."""
@@ -2183,7 +2214,7 @@ class CommandHandler:
                 _call_ui(self._record_history_message, "system", f"Competition error: {e}")
 
         screen = self.app.screen
-        screen.run_worker(_worker, thread=True, exclusive=False)
+        self._launch_lane(_worker, screen, exclusive=False)
 
     def _cmd_compete_code(self, args: list[str]) -> None:
         """Run the same coding task across providers in isolated git worktrees."""
@@ -2304,7 +2335,7 @@ class CommandHandler:
                 _call_ui(self._record_history_message, "system", f"Code competition error: {e}")
 
         screen = self.app.screen
-        screen.run_worker(_worker, thread=True, exclusive=False)
+        self._launch_lane(_worker, screen, exclusive=False)
 
     def _cmd_episodes(self, args: list[str]) -> None:
         """Show episode history."""
