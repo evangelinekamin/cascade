@@ -59,6 +59,7 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("resume", "/resume <id>", "Resume a previous session"),
     CommandDef("export", "/export [id]", "Export session messages to a file"),
     CommandDef("solve", "/solve <task>", "Code a task in an isolated worktree, verified by tests"),
+    CommandDef("apply", "/apply", "Land the last passing /solve's changes on your working tree"),
     CommandDef("pipeline", "/pipeline <objective>", "Decompose a build into ordered steps, each verified by tests"),
     CommandDef("fanout", "/fanout <objective>", "Split into independent subtasks, build each verified in its own worktree, then merge"),
     CommandDef("log", "/log", "Scroll the last /solve's full activity + verified diff"),
@@ -104,6 +105,9 @@ class CommandHandler:
         # Full activity + diff of the most recent /solve, shown by /log.
         self._last_solve_log: list[str] = []
         self._last_solve_title = ""
+        # The most recent passing /solve's re-appliable patch, landed by /apply.
+        self._last_solve_patch: str = ""
+        self._last_solve_changed: tuple[str, ...] = ()
 
     def is_command(self, text: str) -> bool:
         return text.startswith("/")
@@ -147,6 +151,7 @@ class CommandHandler:
             "resume": self._cmd_resume,
             "export": self._cmd_export,
             "solve": self._cmd_solve,
+            "apply": self._cmd_apply,
             "pipeline": self._cmd_pipeline,
             "fanout": self._cmd_fanout,
             "log": self._cmd_log,
@@ -1691,6 +1696,35 @@ class CommandHandler:
         except Exception as e:
             self._post_system(f"Could not open log viewer: {e}")
 
+    def _cmd_apply(self, args: list[str]) -> None:
+        """Land the most recent passing /solve's changes on the real working tree.
+
+        Uses a plain ``git apply`` (atomic: it changes nothing on conflict),
+        so a failed apply leaves the tree exactly as it was.
+        """
+        import os
+
+        from .swarm.worktree import WorktreeManager
+
+        if not self._last_solve_patch:
+            self._post_system(
+                "Nothing to apply. Run /solve first; /apply lands its verified "
+                "changes here once it passes."
+            )
+            return
+
+        applied, message = WorktreeManager.apply_to_tree(
+            os.getcwd(), self._last_solve_patch,
+        )
+        if applied:
+            files = ", ".join(self._last_solve_changed[:8]) or "changes"
+            self._post_system(f"Applied to your working tree: {files}")
+            # One-shot: clear so a second /apply doesn't double-apply.
+            self._last_solve_patch = ""
+            self._last_solve_changed = ()
+        else:
+            self._post_system(f"Apply failed: {message}")
+
     def _cmd_solve(self, args: list[str]) -> None:
         """Code a task in an isolated worktree, verified by tests (iterate to green)."""
         if not args:
@@ -1818,8 +1852,12 @@ class CommandHandler:
                     lines.append(result.diff_stat.strip())
                 elif result.changed_files:
                     lines.append("Files: " + ", ".join(result.changed_files[:8]))
-                if result.worktree_path:
-                    lines.append(f"Review + apply:  git -C {result.worktree_path} diff")
+                if result.passed and getattr(result, "patch", ""):
+                    self._last_solve_patch = result.patch
+                    self._last_solve_changed = tuple(result.changed_files)
+                    lines.append("Run /apply to land these changes on your working tree.")
+                elif result.worktree_path:
+                    lines.append(f"Review:  git -C {result.worktree_path} diff")
 
                 final = "\n".join(lines)
                 _call_ui(self._clear_progress_indicator, progress)

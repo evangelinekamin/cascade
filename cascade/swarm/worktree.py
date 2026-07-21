@@ -157,6 +157,30 @@ class WorktreeManager:
         return False
 
     @staticmethod
+    def apply_to_tree(root: str, patch: str) -> "tuple[bool, str]":
+        """Apply *patch* onto the working tree at *root* (for /apply).
+
+        Plain ``git apply`` only: it is atomic, so on any conflict the tree
+        is left untouched and a clear message is returned rather than risk
+        leaving conflict markers in the user's real files. Returns
+        ``(applied, message)``.
+        """
+        if not patch.strip():
+            return False, "nothing to apply"
+        try:
+            WorktreeManager._git(
+                ["apply", "--whitespace=nowarn", "-"],
+                cwd=root,
+                input_text=patch,
+            )
+            return True, "applied"
+        except Exception as exc:
+            return False, (
+                f"could not apply cleanly ({exc}); the working tree may have "
+                "changed since the solve. Review it manually."
+            )
+
+    @staticmethod
     def _patched_paths(patch: str) -> tuple[str, ...]:
         """Repo-relative paths a unified diff writes to (its ``+++ b/`` targets)."""
         paths = [

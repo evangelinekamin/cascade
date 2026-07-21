@@ -103,6 +103,9 @@ class SolveResult:
     cost: float = 0.0
     guardrail_fired: bool = False
     verification_kind: str = ""
+    # Full re-appliable binary patch (worktree vs its baseline). Unlike the
+    # clipped diff_excerpt, this is what /apply lands on the real tree.
+    patch: str = ""
     error: str = ""
 
 
@@ -978,6 +981,14 @@ def run_solve(
         if token is not None:
             token.checkpoint()
         snapshot = manager.capture_snapshot(path)
+        # Full patch for /apply -- captured only when there is something to
+        # apply, so a failed/noop solve carries no patch.
+        full_patch = ""
+        if snapshot.changed_files:
+            try:
+                full_patch = manager.diff_patch(path)
+            except Exception:
+                full_patch = ""
         passed = result.passed
         error = result.error
         if passed and not snapshot.changed_files and not allow_noop:
@@ -1021,6 +1032,7 @@ def run_solve(
             cost=cost_total[0],
             guardrail_fired=result.guardrail_fired,
             verification_kind=verification_kind,
+            patch=full_patch,
             error=error,
         )
     except RunCancelled as exc:
