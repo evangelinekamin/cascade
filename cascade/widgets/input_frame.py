@@ -108,12 +108,16 @@ class ChatTextArea(TextArea):
         # it -- handled HERE (the composer receives keys first, so relying on
         # the InputFrame ancestor lost the race to history recall).
         dropdown = self._autocomplete()
-        if dropdown is not None and key in ("up", "down", "tab", "escape"):
+        if dropdown is not None and key in ("up", "down", "tab", "enter", "escape"):
             if key == "down":
                 dropdown.move_selection(1)
             elif key == "up":
                 dropdown.move_selection(-1)
-            elif key == "tab":
+            elif key in ("tab", "enter"):
+                # Accept the highlighted completion rather than submitting a
+                # partial slash command. The dropdown is only open while the
+                # command is still partial/ambiguous (it auto-hides once the
+                # full command is typed), so Enter-accepts is unambiguous here.
                 selected = dropdown.selected_command
                 if selected:
                     self.load_text(f"/{selected} ")
