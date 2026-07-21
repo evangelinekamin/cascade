@@ -493,6 +493,14 @@ class PermissionEngine:
             for rule in self._ask:
                 if rule.matches(tool_name, primary):
                     return Verdict("ask", f"ask rule {rule.tool}", "ask-rule")
+            # web_search contacts a single fixed search endpoint, not a
+            # user-controlled host: the only thing leaving the machine is the
+            # query text. Strictly safer than web_fetch's arbitrary-host GET --
+            # auto-approve unless the posture forbids all egress.
+            if tool_name == "web_search":
+                if self.posture == "readonly":
+                    return Verdict("deny", "readonly posture blocks network egress", "posture")
+                return Verdict("allow", "web search (fixed endpoint)", "web-search")
             host = _url_host(primary)
             if self._grant_key(tool_name, host) in self._session_grants:
                 return Verdict("allow", "host granted this session", "session-grant")
