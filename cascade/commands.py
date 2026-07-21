@@ -130,6 +130,26 @@ class CommandHandler:
         finally:
             self._active_lane_workers = max(0, self._active_lane_workers - 1)
 
+    def _make_run_context(self, objective: str, workflow: str, provider: str):
+        """A ledgered RunContext for a slash lane, or None if unavailable.
+
+        Gives /pipeline and /fanout the same crash-recovery trace as the
+        chat lane. The command worker owns the terminal finish().
+        """
+        try:
+            from .swarm.lifecycle import RunContext
+
+            session = getattr(self.app, "_db_session", None)
+            return RunContext(
+                objective=objective,
+                workflow=workflow,
+                provider=provider or "",
+                session_id=session["id"] if session else "",
+                ledger=getattr(self.app, "run_ledger", None),
+            )
+        except Exception:
+            return None
+
     def _launch_lane(self, worker, screen, *, exclusive: bool = True) -> None:
         """Run *worker* on a thread, tracked so is_busy() reflects the lane.
 
@@ -1976,13 +1996,20 @@ class CommandHandler:
             else:
                 _call_ui(self._set_progress_indicator_label, progress, label)
 
+        run_ctx = self._make_run_context(objective, "pipeline", provider)
+
         def _worker() -> None:
+            from .swarm.outcome import RunOutcome
+
+            outcome = RunOutcome.FAILED
             try:
                 from .swarm.pipeline import run_pipeline
 
                 result = run_pipeline(
-                    cli_app, objective, provider_name=provider, on_progress=_on_progress
+                    cli_app, objective, provider_name=provider,
+                    on_progress=_on_progress, run_context=run_ctx,
                 )
+                outcome = result.outcome
 
                 passed_steps = sum(1 for s in result.steps if s.passed)
                 outcome = result.outcome.value.upper()
@@ -2025,6 +2052,12 @@ class CommandHandler:
                 _call_ui(self._clear_progress_indicator, progress)
                 _call_ui(self._post_system, f"Pipeline error: {e}")
                 _call_ui(self._record_history_message, "system", f"Pipeline error: {e}")
+            finally:
+                if run_ctx is not None:
+                    try:
+                        run_ctx.finish(outcome)
+                    except Exception:
+                        pass
 
         screen = self.app.screen
         self._launch_lane(_worker, screen, exclusive=True)
@@ -2061,13 +2094,20 @@ class CommandHandler:
             else:
                 _call_ui(self._set_progress_indicator_label, progress, label)
 
+        run_ctx = self._make_run_context(objective, "fanout", provider)
+
         def _worker() -> None:
+            from .swarm.outcome import RunOutcome
+
+            run_outcome = RunOutcome.FAILED
             try:
                 from .swarm.fanout import run_fanout
 
                 result = run_fanout(
-                    cli_app, objective, provider_name=provider, on_progress=_on_progress
+                    cli_app, objective, provider_name=provider,
+                    on_progress=_on_progress, run_context=run_ctx,
                 )
+                run_outcome = result.outcome
 
                 merged = sum(1 for s in result.subs if s.integrated)
                 outcome = result.outcome.value.upper()
@@ -2106,6 +2146,12 @@ class CommandHandler:
                 _call_ui(self._clear_progress_indicator, progress)
                 _call_ui(self._post_system, f"Fanout error: {e}")
                 _call_ui(self._record_history_message, "system", f"Fanout error: {e}")
+            finally:
+                if run_ctx is not None:
+                    try:
+                        run_ctx.finish(run_outcome)
+                    except Exception:
+                        pass
 
         screen = self.app.screen
         self._launch_lane(_worker, screen, exclusive=True)
