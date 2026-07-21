@@ -253,7 +253,14 @@ class _ProseBody(Static):
         self.refresh(layout=True)
 
     def set_partial(self, partial: str) -> None:
-        """Set the trailing in-progress line (the only part that re-renders)."""
+        """Set the trailing in-progress line (the only part that re-renders).
+
+        Must reflow (``layout=True``): a growing partial soft-wraps to more
+        rows, and an auto-height widget only re-measures its content when its
+        OWN layout is invalidated -- an ancestor ``refresh(layout=True)`` reuses
+        the child's cached height, so a repaint here would leave a long
+        unbroken streamed line clipped until its newline arrives.
+        """
         if partial == self._partial:
             return
         self._partial = partial
