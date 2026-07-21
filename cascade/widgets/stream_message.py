@@ -90,6 +90,13 @@ class StreamMessage(Widget):
     def finish(self) -> None:
         """Flush any remaining buffered content."""
         if self._state == _StreamState.CODE_BLOCK:
+            # A last line with no trailing newline is still code content
+            # (an unterminated block) -- unless it is the closing fence, which
+            # must be dropped rather than leaking into the code or prose.
+            tail = self._line_buf
+            self._line_buf = ""
+            if tail.strip() != "```" and tail:
+                self._code_buf += tail
             if self._code_buf:
                 self._emit_code_block(self._code_buf.rstrip("\n"), self._code_lang)
             self._code_buf = ""
@@ -116,7 +123,11 @@ class StreamMessage(Widget):
                 line = self._line_buf.rstrip("\n")
                 stripped = line.strip()
                 if stripped.startswith("```"):
-                    # Opening fence -- switch to code block mode
+                    # Opening fence -- flush any prose completed in this same
+                    # batch BEFORE switching state (feed() only refreshes prose
+                    # while in PROSE, and _emit_code_block clears _prose_lines,
+                    # so unflushed prose would otherwise be lost), then switch.
+                    self._refresh_prose()
                     self._code_lang = stripped[3:].strip()
                     self._state = _StreamState.CODE_BLOCK
                     self._code_buf = ""
