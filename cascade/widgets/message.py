@@ -13,6 +13,7 @@ from hashlib import md5
 from rich.cells import cell_len
 from rich.text import Text
 from textual import events
+from textual.message import Message
 from textual.containers import VerticalScroll
 from textual.widget import Widget
 from textual.app import ComposeResult
@@ -263,13 +264,45 @@ def _render_blockquote(line: str) -> Text:
 # Widgets
 # ---------------------------------------------------------------------------
 
+class OverflowIndicator(Static):
+    """Clickable banner announcing trimmed messages held in overflow.
+
+    Clicking (or activating) it asks the enclosing ``ChatHistory`` to
+    re-mount a page of the most recently-trimmed messages, so a long
+    session's scroll-back history stays reachable in the live UI.
+    """
+
+    DEFAULT_CSS = """
+    OverflowIndicator {
+        width: 100%;
+        height: 1;
+        text-align: center;
+    }
+    OverflowIndicator:hover {
+        background: #161b22;
+    }
+    """
+
+    class RestoreRequested(Message):
+        """The user asked to reveal earlier (trimmed) messages."""
+
+    def on_click(self, event: events.Click) -> None:
+        event.stop()
+        self.post_message(self.RestoreRequested())
+
+
 class ChatHistory(VerticalScroll):
     """Scrollable container with virtual widget pooling.
 
     Caps mounted widgets at ``max_widgets``. When the limit is exceeded,
     the oldest widgets are unmounted and their data stored in
-    ``_overflow`` for later export or scroll-back re-mount.
+    ``_overflow``. A clickable banner then lets the user re-mount that
+    history a page at a time (``restore_page``) -- and it remains available
+    to ``/export``.
     """
+
+    # How many trimmed messages a single banner click brings back.
+    _RESTORE_PAGE = 50
 
     DEFAULT_CSS = """
     ChatHistory {
@@ -284,7 +317,7 @@ class ChatHistory(VerticalScroll):
         super().__init__(**kwargs)
         self._max_widgets = max_widgets
         self._overflow: list[tuple[str, str]] = []  # (role, content) pairs
-        self._overflow_indicator: Static | None = None
+        self._overflow_indicator: OverflowIndicator | None = None
 
     def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
         self.scroll_relative(y=-6, animate=False, force=True)
@@ -295,6 +328,13 @@ class ChatHistory(VerticalScroll):
         self.scroll_relative(y=6, animate=False, force=True)
         event.stop()
         event.prevent_default()
+
+    @staticmethod
+    def _overflow_label(count: int) -> Text:
+        return Text(
+            f"  ▲ {count} earlier messages · click to show  ",
+            style=f"dim {PALETTE.text_muted}",
+        )
 
     async def trim_overflow(self) -> None:
         """Remove oldest content widgets when exceeding the pool cap.
@@ -330,12 +370,52 @@ class ChatHistory(VerticalScroll):
         count = len(self._overflow)
         if count == 0:
             return
-        label = Text(f"  {count} earlier messages  ", style=f"dim {PALETTE.text_muted}")
         if self._overflow_indicator is None:
-            self._overflow_indicator = Static(label, classes="overflow-indicator")
+            self._overflow_indicator = OverflowIndicator(
+                self._overflow_label(count), classes="overflow-indicator",
+            )
             await self.mount(self._overflow_indicator, before=0)
         else:
-            self._overflow_indicator.update(label)
+            self._overflow_indicator.update(self._overflow_label(count))
+
+    async def on_overflow_indicator_restore_requested(
+        self, event: OverflowIndicator.RestoreRequested,
+    ) -> None:
+        event.stop()
+        await self.restore_page()
+
+    async def restore_page(self) -> None:
+        """Re-mount the newest page of trimmed messages below the banner.
+
+        Pages from the tail of ``_overflow`` (the messages just older than
+        what is currently shown) so the reconstructed window stays contiguous,
+        and mounts them in chronological order directly under the banner. The
+        oldest-first trim invariant is preserved: a later ``trim_overflow``
+        re-appends these top-most rows to ``_overflow`` in the same order.
+        """
+        if not self._overflow:
+            return
+        page = self._overflow[-self._RESTORE_PAGE:]
+        del self._overflow[-len(page):]
+
+        widgets = [MessageWidget(role, content) for role, content in page]
+        anchor = self._overflow_indicator
+        if anchor is not None:
+            await self.mount_all(widgets, after=anchor)
+        else:
+            await self.mount_all(widgets, before=0)
+
+        if self._overflow:
+            self._overflow_indicator.update(self._overflow_label(len(self._overflow)))
+        elif self._overflow_indicator is not None:
+            await self._overflow_indicator.remove()
+            self._overflow_indicator = None
+
+        # Keep the freshly revealed history in view rather than jumping.
+        if widgets:
+            self.call_after_refresh(
+                self.scroll_to_widget, widgets[0], top=True, animate=False,
+            )
 
     @property
     def overflow_messages(self) -> list[tuple[str, str]]:
