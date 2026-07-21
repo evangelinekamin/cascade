@@ -1,16 +1,18 @@
 """Floating bordered input with provider accent border.
 
-Rounded border in accent color, provider name as border-title,
-token count as border-subtitle. Interior: prompt char > + Input.
-Below: mode indicator with shift+tab hint.
-Autocomplete dropdown appears when typing slash commands.
+Rounded border in accent color, provider name as border-title, context
+occupancy as border-subtitle. Interior: prompt char > + a multiline
+composer. Below: mode indicator with shift+tab hint. Autocomplete
+dropdown appears when typing slash commands.
 """
 
 from rich.text import Text
 from textual import events
+from textual.binding import Binding
+from textual.message import Message
 from textual.widget import Widget
 from textual.app import ComposeResult
-from textual.widgets import Input, Static, Label
+from textual.widgets import Static, Label, TextArea
 from textual.reactive import reactive
 
 from ..theme import PALETTE, MODES, get_accent
@@ -18,19 +20,40 @@ from ..commands import get_matching_commands
 from .autocomplete import AutocompleteDropdown
 
 
-class ChatInput(Input):
-    """Input with multiline paste capture and prompt history (up/down arrow).
+class ChatTextArea(TextArea):
+    """Auto-growing multiline prompt composer.
 
-    Multiline paste: stores full text, shows ``[pasted N chars]``.
-    History: up/down arrows navigate previous submissions.
+    - Enter submits (posts ``ChatTextArea.Submitted``).
+    - shift+enter (modern terminals) or ctrl+j inserts a newline.
+    - Pasted text is inserted verbatim and stays fully editable -- no
+      opaque ``[pasted N chars]`` placeholder.
+    - Up/Down navigate prompt history only when the cursor is on the
+      first/last line; otherwise they move between lines as normal.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._pending_paste: str | None = None
+    class Submitted(Message):
+        """The user submitted the composed prompt."""
+
+        def __init__(self, widget: "ChatTextArea", value: str) -> None:
+            super().__init__()
+            self.text_area = widget
+            self.value = value
+
+    BINDINGS = [
+        Binding("shift+enter", "newline", "Newline", show=False),
+        Binding("ctrl+j", "newline", "Newline", show=False),
+    ]
+
+    def __init__(self, **kwargs) -> None:
+        kwargs.setdefault("soft_wrap", True)
+        kwargs.setdefault("show_line_numbers", False)
+        kwargs.setdefault("tab_behavior", "focus")  # Tab leaves for autocomplete
+        super().__init__(**kwargs)
         self._history: list[str] = []
         self._history_idx: int = -1
         self._draft: str = ""
+
+    # -- history --------------------------------------------------------
 
     def record(self, text: str) -> None:
         """Record a submitted prompt into history."""
@@ -39,54 +62,80 @@ class ChatInput(Input):
         self._history_idx = -1
         self._draft = ""
 
-    def _on_paste(self, event: events.Paste) -> None:
-        if not event.text:
-            event.stop()
-            return
-        if "\n" in event.text:
-            self._pending_paste = event.text.strip()
-            n = len(self._pending_paste)
-            self.value = f"[pasted {n} chars]"
-            self.cursor_position = len(self.value)
-        else:
-            self._pending_paste = None
-            # Set value directly to avoid double-insertion
-            pos = self.cursor_position
-            self.value = self.value[:pos] + event.text + self.value[pos:]
-            self.cursor_position = pos + len(event.text)
-        event.stop()
-        event.prevent_default()
+    # -- value compatibility (callers used the Input API) ---------------
+
+    @property
+    def value(self) -> str:
+        return self.text
+
+    @value.setter
+    def value(self, v: str) -> None:
+        self.load_text(v or "")
+
+    def clear_value(self) -> None:
+        self.load_text("")
+
+    # -- actions --------------------------------------------------------
+
+    def action_newline(self) -> None:
+        self.insert("\n")
+
+    def _submit(self) -> None:
+        self.post_message(self.Submitted(self, self.text))
+
+    def _cursor_row(self) -> int:
+        loc = self.cursor_location
+        return loc[0] if loc else 0
+
+    def _last_row(self) -> int:
+        try:
+            return self.document.line_count - 1
+        except Exception:
+            return 0
 
     async def _on_key(self, event: events.Key) -> None:
-        # Up/down arrow for prompt history navigation
-        if event.key == "up" and self._history:
+        key = event.key
+        # Enter submits (shift+enter / ctrl+j newline handled by BINDINGS).
+        if key == "enter":
+            event.stop()
+            event.prevent_default()
+            self._submit()
+            return
+
+        # History recall only at the first/last line, so multi-line editing
+        # still uses Up/Down to move between lines.
+        if key == "up" and self._history and self._cursor_row() == 0:
             if self._history_idx == -1:
-                self._draft = self.value
+                self._draft = self.text
                 self._history_idx = len(self._history) - 1
             elif self._history_idx > 0:
                 self._history_idx -= 1
             else:
+                event.stop()
+                event.prevent_default()
                 return
-            self.value = self._history[self._history_idx]
-            self.cursor_position = len(self.value)
+            self.load_text(self._history[self._history_idx])
+            self.move_cursor(self.document.end)
             event.stop()
             event.prevent_default()
-        elif event.key == "down" and self._history_idx >= 0:
+            return
+        if key == "down" and self._history_idx >= 0 and self._cursor_row() == self._last_row():
             if self._history_idx < len(self._history) - 1:
                 self._history_idx += 1
-                self.value = self._history[self._history_idx]
+                self.load_text(self._history[self._history_idx])
             else:
                 self._history_idx = -1
-                self.value = self._draft
-            self.cursor_position = len(self.value)
+                self.load_text(self._draft)
+            self.move_cursor(self.document.end)
             event.stop()
             event.prevent_default()
-        else:
-            await super()._on_key(event)
+            return
+
+        await super()._on_key(event)
 
 
 class InputFrame(Widget):
-    """The bottom input region: framed text area + mode indicator."""
+    """The bottom input region: framed composer + mode indicator."""
 
     DEFAULT_CSS = """
     InputFrame {
@@ -139,14 +188,13 @@ class InputFrame(Widget):
         except Exception:
             pass
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        """Update autocomplete suggestions as user types."""
-        value = event.value
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        """Update autocomplete suggestions as the user types a slash command."""
+        value = event.text_area.text
         dropdown = self.query_one(AutocompleteDropdown)
-
-        if value.startswith("/") and len(value) > 0:
-            prefix = value[1:]  # strip the /
-            matches = get_matching_commands(prefix)
+        # Only a single-line command line triggers autocomplete.
+        if value.startswith("/") and "\n" not in value:
+            matches = get_matching_commands(value[1:])
             if matches and value != f"/{matches[0].name}":
                 dropdown.show(matches)
             else:
@@ -155,48 +203,62 @@ class InputFrame(Widget):
             dropdown.hide()
 
     def on_key(self, event) -> None:
-        """Handle arrow keys and tab for autocomplete navigation."""
+        """Route arrows/tab to the autocomplete dropdown when it is visible.
+
+        Handled here (before the composer's own key handler) so dropdown
+        navigation wins over history/line movement only while the dropdown
+        is open -- otherwise the composer keeps full control of Up/Down.
+        """
         dropdown = self.query_one(AutocompleteDropdown)
         if not dropdown.visible:
             return
 
         if event.key == "down":
             dropdown.move_selection(1)
-            event.prevent_default()
-            event.stop()
         elif event.key == "up":
             dropdown.move_selection(-1)
-            event.prevent_default()
-            event.stop()
         elif event.key == "tab":
             selected = dropdown.selected_command
             if selected:
                 try:
-                    inp = self.query_one("#main_input", Input)
-                    inp.value = f"/{selected} "
-                    inp.cursor_position = len(inp.value)
+                    inp = self.query_one("#main_input", ChatTextArea)
+                    inp.load_text(f"/{selected} ")
+                    inp.move_cursor(inp.document.end)
                 except Exception:
                     pass
                 dropdown.hide()
-            event.prevent_default()
-            event.stop()
         elif event.key == "escape":
             dropdown.hide()
-            event.prevent_default()
-            event.stop()
+        else:
+            return
+        event.prevent_default()
+        event.stop()
 
 
 class FramedInput(Widget):
-    """The bordered container holding the prompt char and Input widget."""
+    """The bordered container holding the prompt char and the composer."""
 
     DEFAULT_CSS = """
     FramedInput {
-        height: 3;
+        height: auto;
+        min-height: 3;
         width: 100%;
         border: solid #b44dff;
         background: #0d1117;
         padding: 0 1;
         layout: horizontal;
+    }
+    FramedInput #main_input {
+        height: auto;
+        min-height: 1;
+        max-height: 12;
+        width: 1fr;
+        background: #0d1117;
+        border: none;
+        padding: 0;
+    }
+    FramedInput #main_input:focus {
+        border: none;
     }
     """
 
@@ -206,8 +268,8 @@ class FramedInput(Widget):
         self._context_label = context_label
 
     def compose(self) -> ComposeResult:
-        yield Label("\u276f", id="prompt_char", classes="prompt-char")
-        yield ChatInput(placeholder="", id="main_input", classes="main-input")
+        yield Label("❯", id="prompt_char", classes="prompt-char")
+        yield ChatTextArea(id="main_input", classes="main-input")
 
     def on_mount(self) -> None:
         self._apply_accent()
@@ -267,8 +329,8 @@ class ModeIndicator(Static):
         t = Text()
         # Frame the mode name in its own accent (the dashes were double-dimmed to
         # near-black); the bold name still stands out against the plain-weight rule.
-        t.append("\u2500\u2500\u2500 ", style=accent)
+        t.append("─── ", style=accent)
         t.append(self._mode, style=f"bold {accent}")
-        t.append(" \u2500\u2500\u2500 ", style=accent)
-        t.append("shift+tab", style=f"dim {PALETTE.text_dim}")
+        t.append(" ─── ", style=accent)
+        t.append("shift+enter for newline · shift+tab mode", style=f"dim {PALETTE.text_dim}")
         return t

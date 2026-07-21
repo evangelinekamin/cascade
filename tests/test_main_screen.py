@@ -89,12 +89,13 @@ def test_ctrl_c_clears_filled_input_before_arming_exit():
     from types import SimpleNamespace
 
     screen, flashes, exited = _exit_test_screen()
-    inp = SimpleNamespace(value="draft text", _pending_paste=None)
+    cleared = {"done": False}
+    inp = SimpleNamespace(text="draft text", load_text=lambda v: cleared.update(done=(v == "")))
     screen._input_widget = lambda: inp
 
     screen.action_exit_app()
 
-    assert inp.value == ""
+    assert cleared["done"] is True
     assert screen._exit_armed is False
     assert exited == []
     assert flashes == []
@@ -104,7 +105,7 @@ def test_ctrl_c_twice_on_empty_input_arms_then_exits():
     from types import SimpleNamespace
 
     screen, flashes, exited = _exit_test_screen()
-    screen._input_widget = lambda: SimpleNamespace(value="", _pending_paste=None)
+    screen._input_widget = lambda: SimpleNamespace(text="", load_text=lambda v: None)
 
     screen.action_exit_app()
     assert screen._exit_armed is True
@@ -121,7 +122,7 @@ def test_ctrl_c_interrupts_active_run_without_arming_exit():
 
     screen, _flashes, exited = _exit_test_screen()
     screen._interrupt_active_run = lambda: True
-    screen._input_widget = lambda: SimpleNamespace(value="", _pending_paste=None)
+    screen._input_widget = lambda: SimpleNamespace(text="", load_text=lambda v: None)
 
     screen.action_exit_app()
 

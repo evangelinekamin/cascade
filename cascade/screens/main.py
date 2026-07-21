@@ -13,14 +13,14 @@ from rich.text import Text
 from textual import events
 from textual.screen import Screen
 from textual.app import ComposeResult
-from textual.widgets import Input, Static
+from textual.widgets import Static
 
 from ..episodes import generate_episode
 from ..providers.base import ToolEvent
 from ..providers.usage import Usage
 from ..widgets.header import WelcomeHeader, ProviderGhostTable
 from ..widgets.message import ChatHistory, MessageWidget, ThinkingIndicator
-from ..widgets.input_frame import InputFrame
+from ..widgets.input_frame import InputFrame, ChatTextArea
 from ..widgets.status_bar import StatusBar
 from ..widgets.stream_message import StreamMessage
 from ..widgets.tool_call import ToolCallWidget, render_tool_widget
@@ -95,6 +95,9 @@ class MainScreen(Screen):
         self._active_run: RunContext | None = None
         self._exit_armed = False
         self._exit_timer = None
+        # Type-ahead: a prompt submitted while a turn is running waits here
+        # and is dispatched when the turn completes.
+        self._queued_prompt: str | None = None
         self._chords = self._build_chord_manager()
 
     @staticmethod
@@ -280,32 +283,34 @@ class MainScreen(Screen):
     # Input handling
     # ------------------------------------------------------------------
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        # Multiline paste: ChatInput stores the full text in _pending_paste
-        inp = event.input
-        if hasattr(inp, "_pending_paste") and inp._pending_paste is not None:
-            prompt = inp._pending_paste.strip()
-            inp._pending_paste = None
-        else:
-            prompt = event.value.strip()
+    def on_chat_text_area_submitted(self, event) -> None:
+        """The composer submitted a prompt (Enter)."""
+        inp = event.text_area
+        prompt = event.value.strip()
         if not prompt:
             return
 
+        # Record in input history for up-arrow recall, then clear the composer.
+        if hasattr(inp, "record"):
+            inp.record(prompt)
+        inp.load_text("")
+
         if self.app.state.is_thinking:
+            # Type-ahead: a prompt submitted mid-generation is queued and
+            # dispatched when the current turn finishes (exit/quit run now).
             if self._cmd_handler and self._cmd_handler.is_command(prompt):
                 cmd = prompt.lstrip("/").split(None, 1)[0].lower()
                 if cmd in {"exit", "quit"}:
                     self._cmd_handler.handle(prompt)
                     return
-            self.app.notify("Wait for the current response to finish.")
+            self._queued_prompt = prompt
+            self.app.notify("Queued — will run after the current response.")
             return
 
-        # Record in input history for up-arrow recall
-        if hasattr(inp, "record"):
-            inp.record(prompt)
+        self._dispatch_prompt(prompt)
 
-        # Clear input
-        event.input.value = ""
+    def _dispatch_prompt(self, prompt: str) -> None:
+        """Handle one submitted prompt: slash command, hooks, then a turn."""
 
         # Slash commands
         if self._cmd_handler and self._cmd_handler.is_command(prompt):
@@ -1398,9 +1403,8 @@ class MainScreen(Screen):
             return
 
         inp = self._input_widget()
-        if inp is not None and (inp.value or getattr(inp, "_pending_paste", None)):
-            inp.value = ""
-            inp._pending_paste = None
+        if inp is not None and inp.text.strip():
+            inp.load_text("")
             self._disarm_exit()
             return
 
@@ -1421,7 +1425,7 @@ class MainScreen(Screen):
     def _input_widget(self):
         """The prompt Input widget, or None if it is not mounted."""
         try:
-            return self.query_one("#main_input", Input)
+            return self.query_one("#main_input", ChatTextArea)
         except Exception:
             return None
 
@@ -1542,13 +1546,27 @@ class MainScreen(Screen):
             pass
 
     def _set_input_locked(self, locked: bool) -> None:
+        # Type-ahead: the composer stays editable during generation so the
+        # next prompt can be drafted/queued. On unlock (turn end) refocus it
+        # and drain any queued prompt.
         try:
-            inp = self.query_one("#main_input", Input)
-            inp.disabled = locked
+            inp = self.query_one("#main_input", ChatTextArea)
+            inp.disabled = False
             if not locked:
                 inp.focus()
         except Exception:
             pass
+        if not locked and self._queued_prompt:
+            # Defer: the terminal callback that unlocked us clears _active_run
+            # only after it returns, so drain on the next cycle when idle.
+            self.call_later(self._drain_prompt_queue)
+
+    def _drain_prompt_queue(self) -> None:
+        """Dispatch a prompt that was queued while a turn was running."""
+        queued = self._queued_prompt
+        if queued and not self.app.state.is_thinking and self._active_run is None:
+            self._queued_prompt = None
+            self._dispatch_prompt(queued)
 
     @staticmethod
     def _should_follow_chat(chat: ChatHistory, threshold: float = 2.0) -> bool:

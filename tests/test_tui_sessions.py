@@ -232,27 +232,51 @@ def test_main_screen_exit_emits_on_exit_once():
     app.push_screen.assert_called()
 
 
-def test_main_screen_rejects_new_prompt_while_thinking():
+def test_main_screen_queues_new_prompt_while_thinking():
+    """Type-ahead: a prompt submitted mid-generation is queued, not rejected."""
     app = MagicMock()
     app.state.is_thinking = True
     app.notify = MagicMock()
 
     screen = MainScreen()
     screen._cmd_handler = MagicMock()
+    screen._cmd_handler.is_command.return_value = False
 
     event = MagicMock()
     event.value = "hello"
-    event.input = MagicMock()
-    event.input._pending_paste = None
+    event.text_area = MagicMock()
 
     token = active_app.set(app)
     try:
-        screen.on_input_submitted(event)
+        screen.on_chat_text_area_submitted(event)
     finally:
         active_app.reset(token)
 
-    app.notify.assert_called_once_with("Wait for the current response to finish.")
+    assert screen._queued_prompt == "hello"
+    event.text_area.record.assert_called_once_with("hello")
+    event.text_area.load_text.assert_called_once_with("")
     screen._cmd_handler.handle.assert_not_called()
+
+
+def test_main_screen_runs_exit_command_even_while_thinking():
+    app = MagicMock()
+    app.state.is_thinking = True
+    screen = MainScreen()
+    screen._cmd_handler = MagicMock()
+    screen._cmd_handler.is_command.return_value = True
+
+    event = MagicMock()
+    event.value = "/exit"
+    event.text_area = MagicMock()
+
+    token = active_app.set(app)
+    try:
+        screen.on_chat_text_area_submitted(event)
+    finally:
+        active_app.reset(token)
+
+    screen._cmd_handler.handle.assert_called_once_with("/exit")
+    assert screen._queued_prompt is None
 
 
 def test_main_screen_mouse_scroll_routes_to_chat():
