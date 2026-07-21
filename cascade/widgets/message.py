@@ -42,8 +42,10 @@ def _cache_key(content: str) -> str:
 _INLINE_CODE = re.compile(r"`([^`]+)`")
 _BOLD = re.compile(r"\*\*(.+?)\*\*")
 _ITALIC = re.compile(r"(?<!\*)\*([^*]+)\*(?!\*)")
-_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _HEADER = re.compile(r"^(#{1,6})\s+(.*)")
+# A markdown table separator row: | --- | :--: | ---: |
+_TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
 
 
 def render_md_line(line: str) -> Text:
@@ -84,26 +86,26 @@ def _render_md_line(line: str) -> Text:
 def _inline_format(text: str) -> Text:
     """Apply inline code, bold, italic, link formatting."""
     result = Text()
-    spans: list[tuple[int, int, str, str]] = []
+    spans: list[tuple[int, int, str, str, str]] = []
     for m in _INLINE_CODE.finditer(text):
-        spans.append((m.start(), m.end(), "code", m.group(1)))
+        spans.append((m.start(), m.end(), "code", m.group(1), ""))
     for m in _BOLD.finditer(text):
-        spans.append((m.start(), m.end(), "bold", m.group(1)))
+        spans.append((m.start(), m.end(), "bold", m.group(1), ""))
     for m in _ITALIC.finditer(text):
-        spans.append((m.start(), m.end(), "italic", m.group(1)))
+        spans.append((m.start(), m.end(), "italic", m.group(1), ""))
     for m in _LINK.finditer(text):
-        spans.append((m.start(), m.end(), "link", m.group(1)))
+        spans.append((m.start(), m.end(), "link", m.group(1), m.group(2)))
 
     spans.sort(key=lambda s: s[0])
     filtered = []
     last_end = 0
-    for start, end, kind, content in spans:
+    for start, end, kind, content, extra in spans:
         if start >= last_end:
-            filtered.append((start, end, kind, content))
+            filtered.append((start, end, kind, content, extra))
             last_end = end
 
     pos = 0
-    for start, end, kind, content in filtered:
+    for start, end, kind, content, extra in filtered:
         if start > pos:
             result.append(text[pos:start], style=PALETTE.text_primary)
         if kind == "code":
@@ -113,7 +115,10 @@ def _inline_format(text: str) -> Text:
         elif kind == "italic":
             result.append(content, style=f"italic {PALETTE.text_primary}")
         elif kind == "link":
+            # Keep the URL visible -- a link with no target is decorative.
             result.append(content, style=f"underline {PALETTE.inline_code}")
+            if extra and extra != content:
+                result.append(f" ({extra})", style=f"dim {PALETTE.text_dim}")
         pos = end
 
     if pos < len(text):
@@ -141,12 +146,35 @@ def render_content(content: str) -> Text:
         _md_cache.move_to_end(key)
         return _md_cache[key].copy()
 
-    # Full parse
+    # Block-aware parse: tables and blockquotes span multiple lines and are
+    # rendered as blocks; everything else is line-by-line.
+    lines = content.split("\n")
     result = Text()
-    for i, line in enumerate(content.split("\n")):
-        if i > 0:
+    first = True
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Table: a `|` row immediately followed by a separator row.
+        if "|" in line and i + 1 < len(lines) and _TABLE_SEP.match(lines[i + 1]):
+            block = [line, lines[i + 1]]
+            j = i + 2
+            while j < len(lines) and "|" in lines[j] and lines[j].strip():
+                block.append(lines[j])
+                j += 1
+            if not first:
+                result.append("\n")
+            result.append_text(_render_table(block))
+            first = False
+            i = j
+            continue
+        if not first:
             result.append("\n")
-        result.append_text(_render_md_line(line))
+        if line.lstrip().startswith("> "):
+            result.append_text(_render_blockquote(line))
+        else:
+            result.append_text(_render_md_line(line))
+        first = False
+        i += 1
 
     # Store in cache with LRU eviction
     _md_cache[key] = result.copy()
@@ -154,6 +182,74 @@ def render_content(content: str) -> Text:
         _md_cache.popitem(last=False)
 
     return result
+
+
+def _split_table_row(row: str) -> list[str]:
+    """Split a `| a | b |` row into stripped cell strings."""
+    stripped = row.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [c.strip() for c in stripped.split("|")]
+
+
+def _render_table(rows: list[str]) -> Text:
+    """Render a markdown table as aligned columns (header bold + a rule).
+
+    Models emit tables constantly; without this they render as raw pipe
+    soup. Column widths are computed from the visible cell text so the
+    columns line up in a monospace terminal.
+    """
+    header = _split_table_row(rows[0])
+    body = [_split_table_row(r) for r in rows[2:]]  # rows[1] is the separator
+    ncol = max([len(header)] + [len(r) for r in body]) if body else len(header)
+
+    def _cell(cells: list[str], idx: int) -> str:
+        return cells[idx] if idx < len(cells) else ""
+
+    widths = []
+    for c in range(ncol):
+        w = len(_cell(header, c))
+        for r in body:
+            w = max(w, len(_cell(r, c)))
+        widths.append(min(w, 40))  # cap absurdly wide columns
+
+    out = Text()
+    # Header
+    for c in range(ncol):
+        if c:
+            out.append("  ")
+        out.append(_cell(header, c).ljust(widths[c]), style=f"bold {PALETTE.text_bright}")
+    out.append("\n")
+    # Rule
+    out.append("  ".join("─" * widths[c] for c in range(ncol)), style=f"dim {PALETTE.text_dim}")
+    # Body rows
+    for r in body:
+        out.append("\n")
+        for c in range(ncol):
+            if c:
+                out.append("  ")
+            out.append_text(_pad_inline(_cell(r, c), widths[c]))
+    return out
+
+
+def _pad_inline(cell: str, width: int) -> Text:
+    """Inline-format a cell and right-pad the plain text to *width*."""
+    t = _inline_format(cell)
+    pad = width - len(t.plain)
+    if pad > 0:
+        t.append(" " * pad)
+    return t
+
+
+def _render_blockquote(line: str) -> Text:
+    """Render a `> quoted` line with a dim vertical bar."""
+    content = line.lstrip()[2:]
+    t = Text()
+    t.append("│ ", style=f"dim {PALETTE.text_dim}")
+    t.append_text(_inline_format(content))
+    return t
 
 
 # ---------------------------------------------------------------------------

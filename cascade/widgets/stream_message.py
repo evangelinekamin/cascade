@@ -99,8 +99,15 @@ class StreamMessage(Widget):
             self._prose_lines.append(self._line_buf)
             self._line_buf = ""
             self._refresh_prose()
-        else:
-            self._refresh_layout()
+
+        # Re-render every prose segment block-aware so streamed markdown
+        # tables/blockquotes format properly now that the message is done.
+        try:
+            for body in self.query(_ProseBody):
+                body.finalize()
+        except Exception:
+            pass
+        self._refresh_layout()
 
     def _process_char(self, ch: str) -> None:
         if self._state == _StreamState.PROSE:
@@ -200,16 +207,38 @@ class _ProseBody(Static):
         self._frozen = Text()
         self._partial = ""
         self._frozen_line_count = 0
+        self._raw_lines: list[str] = []
+        self._finalized = False
         if content:
             self.append_lines(content.split("\n"))
 
     def append_lines(self, lines: list[str]) -> None:
         """Render and freeze newly-completed lines (each rendered once)."""
         for line in lines:
+            self._raw_lines.append(line)
             if self._frozen_line_count > 0:
                 self._frozen.append("\n")
             self._frozen.append_text(render_md_line(line))
             self._frozen_line_count += 1
+        self.refresh(layout=True)
+
+    def finalize(self) -> None:
+        """Re-render the whole segment block-aware (tables/blockquotes).
+
+        Streaming renders line-by-line for O(n) responsiveness; once the
+        message is complete we re-parse the accumulated prose so multi-line
+        constructs (markdown tables, blockquotes) format properly. Cost is
+        one pass, once, at finish -- not per batch.
+        """
+        if self._finalized or not self._raw_lines:
+            return
+        self._finalized = True
+        text = "\n".join(self._raw_lines)
+        if self._partial:
+            text = text + ("\n" if self._raw_lines else "") + self._partial
+            self._partial = ""
+        self._frozen = render_content(text)
+        self._frozen_line_count = len(self._raw_lines)
         self.refresh(layout=True)
 
     def set_partial(self, partial: str) -> None:
