@@ -40,6 +40,8 @@ web = [
     "starlette>=0.27.0",
     "uvicorn>=0.22.0",
     "python-multipart>=0.0.6",
+    # Improves web_fetch/web_search extraction; a stdlib fallback runs when absent.
+    "trafilatura>=1.8",
 ]
 dev = [
     "pytest>=7.0",
