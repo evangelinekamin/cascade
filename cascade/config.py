@@ -83,7 +83,7 @@ class ConfigManager:
                 "openai": {
                     "enabled": False,
                     "api_key": "${OPENAI_API_KEY}",
-                    "model": "gpt-5.3-codex",
+                    "model": "gpt-5.6-terra",
                     "temperature": 0.7,
                 },
                 "local": {
@@ -136,11 +136,13 @@ class ConfigManager:
             "tools": {
                 "reflection": True,
                 "file_ops": True,
-                # Opt-in shell tool for direct-API chat models (test/build).
-                # Off by default -- it runs real commands in the launch dir.
-                "exec": False,
-                # Opt-in local web fetch (permission-gated network egress).
-                "web": False,
+                # Shell + web for direct-API chat models. On by default now
+                # that the permission engine gates every call (auto posture:
+                # transparent commands auto-approve, the rest ask; web_search
+                # auto-approves, web_fetch asks per host). Set to false to
+                # disable a lane entirely regardless of posture.
+                "exec": True,
+                "web": True,
             },
             "workflows": {
                 "verify": {
@@ -205,7 +207,7 @@ class ConfigManager:
         default_models = {
             "gemini": "gemini-3.1-pro-preview",
             "claude": "claude-opus-4-8",
-            "openai": "gpt-5.3-codex",
+            "openai": "gpt-5.6-terra",
             "openrouter": "qwen/qwen3.5-9b",
         }
 
@@ -422,8 +424,10 @@ class ConfigManager:
         defaults = {
             "reflection": True,
             "file_ops": True,
-            "exec": False,
-            "web": False,
+            # On by default; the permission engine gates every call. An
+            # explicit tools.<name> in the user config still overrides.
+            "exec": True,
+            "web": True,
         }
         config = self.data.get("tools", {})
         return {**defaults, **config} if config else defaults

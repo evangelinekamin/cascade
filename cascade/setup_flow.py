@@ -22,7 +22,7 @@ _DEFAULT_MODELS = {
     "gemini": "gemini-3.1-pro-preview",
     "claude": "claude-opus-4-8",
     "openrouter": "qwen/qwen3.5-9b",
-    "openai": "gpt-5.3-codex",
+    "openai": "gpt-5.6-terra",
 }
 
 _DEFAULT_FALLBACK_MODELS = {

@@ -31,9 +31,12 @@ def test_exec_plugin_registered_with_run_command_tool():
     assert "run_command" in registry["exec"]().get_tools()
 
 
-def test_tools_config_defaults_exec_off():
+def test_tools_config_defaults_exec_on():
     with tempfile.TemporaryDirectory() as tmpdir:
         manager = ConfigManager(str(Path(tmpdir) / "config.yaml"))
-        assert manager.get_tools_config()["exec"] is False
-        # and the freshly written template carries the off default too
-        assert manager.data["tools"]["exec"] is False
+        # exec (and web) are on by default now that the permission engine
+        # gates every call; an explicit tools.<name> still overrides.
+        assert manager.get_tools_config()["exec"] is True
+        assert manager.get_tools_config()["web"] is True
+        # and the freshly written template carries the on default too
+        assert manager.data["tools"]["exec"] is True
