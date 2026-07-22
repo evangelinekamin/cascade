@@ -9,6 +9,7 @@ lossy LLM summarization with structured episode records that preserve
 key decisions, artifacts, and outcomes without burning model tokens.
 """
 
+import time
 from typing import TYPE_CHECKING
 
 from .context.budget import compact_threshold, current_tokens, window_for
@@ -18,6 +19,50 @@ from .episodes import Episode, compact_to_episodes, episodes_to_context
 # by compaction episodes, so exceeding this is itself a compaction trigger
 # (otherwise the clip in state_messages_to_provider silently drops them).
 RAW_MESSAGE_WINDOW = 40
+
+# A gap at or above this (seconds) is worth marking in the timeline so the
+# model can tell the user stepped away. Smaller consecutive gaps stay
+# unmarked to avoid cluttering rapid back-and-forth.
+TIMELINE_GAP_SECONDS = 600
+
+
+def _humanize_gap(seconds: float) -> str:
+    """'2h 15m later' / '3d later' -- coarse elapsed-time phrasing."""
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m later"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m later" if minutes else f"{hours}h later"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h later" if hours else f"{days}d later"
+
+
+def _timeline_marker(ts: float, prev_ts: float, force: bool) -> str:
+    """A bracketed time marker to prepend to a message, or '' for none.
+
+    Emitted on the first stamped message, on calendar-day changes, on gaps
+    >= TIMELINE_GAP_SECONDS, and whenever ``force`` (the latest turn, so the
+    model always knows the current time). Absolute timestamps make the
+    payload a temporal transcript; a relative hint is added for large gaps.
+    Markers depend only on immutable message timestamps, so the payload
+    prefix stays byte-stable across turns.
+    """
+    if ts <= 0:
+        return ""
+    if prev_ts <= 0:
+        return f"[{time.strftime('%Y-%m-%d %a %H:%M', time.localtime(ts))}]\n"
+    same_day = time.localtime(ts)[:3] == time.localtime(prev_ts)[:3]
+    gap = ts - prev_ts
+    big_gap = gap >= TIMELINE_GAP_SECONDS
+    if not same_day:
+        suffix = f", {_humanize_gap(gap)}" if big_gap else ""
+        return f"[{time.strftime('%Y-%m-%d %a %H:%M', time.localtime(ts))}{suffix}]\n"
+    if big_gap:
+        return f"[{time.strftime('%H:%M', time.localtime(ts))}, {_humanize_gap(gap)}]\n"
+    if force:
+        return f"[{time.strftime('%H:%M', time.localtime(ts))}]\n"
+    return ""
 
 if TYPE_CHECKING:
     from .providers.usage import Usage
@@ -64,6 +109,7 @@ def state_messages_to_provider(
     compaction_summary: str = "",
     max_messages: int = RAW_MESSAGE_WINDOW,
     max_chars: int = 80_000,
+    with_timeline: bool = False,
 ) -> list["Message"]:
     """Convert CascadeState messages to provider-ready message list.
 
@@ -75,6 +121,10 @@ def state_messages_to_provider(
     Episodes are injected as structured context before the raw messages,
     filtered by provenance so live same-provider turns are never sent
     twice (see _injectable_episodes).
+
+    With ``with_timeline``, messages carry bracketed time markers (from their
+    immutable creation timestamps) at points where time meaningfully jumps,
+    so the model has temporal awareness of the session.
     """
     result: list[dict] = []
     visible_messages = [
@@ -113,36 +163,36 @@ def state_messages_to_provider(
             "content": "Understood, I have the episode context from prior interactions.",
         })
 
-    if policy == "off":
-        for msg in visible_messages[-max_messages:]:
-            if msg.role == "you":
-                result.append({"role": "user", "content": msg.content})
-            elif msg.role == target_provider:
-                result.append({"role": "assistant", "content": msg.content})
-
-    elif policy == "summary":
-        for msg in visible_messages[-max_messages:]:
-            if msg.role == "you":
-                result.append({"role": "user", "content": msg.content})
-            elif msg.role == target_provider:
-                result.append({"role": "assistant", "content": msg.content})
-
-    elif policy == "full":
-        for msg in visible_messages[-max_messages:]:
-            if msg.role == "you":
-                result.append({"role": "user", "content": msg.content})
-            elif msg.role == target_provider:
-                result.append({"role": "assistant", "content": msg.content})
-            else:
-                # Message from a different provider -- include as context
-                result.append({
-                    "role": "user",
-                    "content": f"[Response from {msg.role}]\n{msg.content}",
-                })
-                result.append({
-                    "role": "assistant",
-                    "content": "Noted.",
-                })
+    # off and summary emit identically here (they differ only in which
+    # episodes inject, handled above); full additionally carries other
+    # providers' turns inline. One loop covers all three, plus the optional
+    # timeline markers keyed to the last EMITTED message's timestamp.
+    include_cross = policy == "full"
+    window = visible_messages[-max_messages:]
+    prev_ts = 0.0
+    for i, msg in enumerate(window):
+        marker = (
+            _timeline_marker(msg.timestamp, prev_ts, force=(i == len(window) - 1))
+            if with_timeline else ""
+        )
+        emitted = True
+        if msg.role == "you":
+            result.append({"role": "user", "content": marker + msg.content})
+        elif msg.role == target_provider:
+            result.append({"role": "assistant", "content": marker + msg.content})
+        elif include_cross:
+            result.append({
+                "role": "user",
+                "content": marker + f"[Response from {msg.role}]\n{msg.content}",
+            })
+            result.append({"role": "assistant", "content": "Noted."})
+        else:
+            emitted = False
+        # Gap is measured between messages the model actually sees, so a
+        # skipped cross-provider turn's elapsed time folds into the next
+        # visible gap rather than being double-counted.
+        if emitted and msg.timestamp > 0:
+            prev_ts = msg.timestamp
 
     # Enforce character budget by trimming oldest messages
     total_chars = sum(len(m["content"]) for m in result)

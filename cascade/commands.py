@@ -13,6 +13,20 @@ from pathlib import Path
 from .theme import MODES, PALETTE, PROVIDERS
 
 
+def _parse_iso_timestamp(value) -> "float | None":
+    """Epoch seconds for a stored ISO-8601 message timestamp, else None.
+
+    None lets add_message fall back to the current time (older rows or
+    unparseable values simply lose timeline fidelity, never crash).
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
 @dataclass(frozen=True)
 class CommandDef:
     """Definition of a slash command for autocomplete."""
@@ -1548,6 +1562,9 @@ class CommandHandler:
             token_count = int(msg.get("token_count", 0))
             self.app.state.add_message(
                 role, msg["content"], tokens=token_count,
+                # Preserve the original send time so the restored session's
+                # timeline is faithful instead of collapsed to the resume moment.
+                timestamp=_parse_iso_timestamp(msg.get("timestamp")),
             )
             if msg["role"] != "user" and token_count > 0 and role != "system":
                 self.app.state.provider_tokens[role] = (

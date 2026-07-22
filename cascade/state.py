@@ -30,6 +30,10 @@ class ChatMessage:
     tokens: int = 0
     msg_type: str = "text"  # text, code, write, edit, system
     metadata: Dict = field(default_factory=dict)
+    # Wall-clock creation time (epoch seconds). Immutable once set, so the
+    # provider-payload timeline is append-only and cache-friendly. 0.0 means
+    # "unknown" (never annotated).
+    timestamp: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -165,13 +169,17 @@ class CascadeState:
         self.current_thought = ""
 
     def add_message(self, role: str, content: str, tokens: int = 0,
-                    msg_type: str = "text", metadata: Optional[Dict] = None) -> ChatMessage:
+                    msg_type: str = "text", metadata: Optional[Dict] = None,
+                    timestamp: Optional[float] = None) -> ChatMessage:
         msg = ChatMessage(
             role=role,
             content=content,
             tokens=tokens,
             msg_type=msg_type,
             metadata=metadata or {},
+            # Live messages stamp now; resume passes the original DB time so a
+            # restored session's timeline is not collapsed to the resume moment.
+            timestamp=timestamp if timestamp is not None else time.time(),
         )
         self.messages.append(msg)
         self._post(NewMessage(msg))

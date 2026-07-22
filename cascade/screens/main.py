@@ -593,6 +593,7 @@ class MainScreen(Screen):
             policy=self._memory_policy,
             episodes=episode_list if episode_list else None,
             compaction_summary=summary_text,
+            with_timeline=True,
         )
 
         # Run BEFORE_ASK hooks (legacy)
