@@ -204,6 +204,7 @@ def openai_ask_with_tools(
     system: Optional[str] = None,
     max_rounds: int = 5,
     on_tool_event: ToolEventCallback = None,
+    on_pending_message: Optional[Callable[[], Optional[str]]] = None,
     on_usage: Optional[Callable[[Usage], None]] = None,
     on_round_usage: Optional[Callable[[Usage], None]] = None,
     hook_runner=None,
@@ -292,6 +293,14 @@ def openai_ask_with_tools(
 
     for round_num in range(max_rounds):
         _checkpoint()
+        # Land a prompt the user queued mid-turn at this round boundary
+        # (codex-style), so a follow-up steers the very next model call instead
+        # of waiting for the whole turn. A 'tool' message may precede it; a
+        # following 'user' message is valid in the chat format.
+        if on_pending_message is not None:
+            pending = on_pending_message()
+            if pending:
+                api_messages.append({"role": "user", "content": pending})
         # Bound the running context before every request: evict old, large tool
         # results so accumulated file reads cannot overflow the model's window.
         api_messages = _compact_messages_to_budget(

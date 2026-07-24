@@ -275,7 +275,13 @@ class ClaudeProvider(BaseProvider):
             if _accepts_sampling(self.config.model):
                 payload["temperature"] = self.config.temperature
             if system:
-                payload["system"] = system
+                # Cache the byte-stable system prompt so a long no-tool chat
+                # re-reads it at cache rates (mirrors ask_with_tools). Anthropic
+                # accepts system as a string or a content-block list.
+                payload["system"] = [
+                    {"type": "text", "text": system,
+                     "cache_control": {"type": "ephemeral"}},
+                ]
 
             with self.client.stream(
                 "POST", url, json=payload, headers=self._headers()
@@ -316,6 +322,9 @@ class ClaudeProvider(BaseProvider):
         system: Optional[str] = None,
         max_rounds: int = 5,
         on_tool_event: ToolEventCallback = None,
+        on_pending_message=None,  # accepted for interface parity; this loop
+        # uses dispatch-on-completion (a mid-loop user block would need to ride
+        # the tool_result user turn to keep tool_use/tool_result paired).
     ) -> tuple[str, list[dict]]:
         """Claude-native tool calling using tools array + tool_use/tool_result."""
         if self._use_cli_proxy:

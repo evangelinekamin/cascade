@@ -459,7 +459,9 @@ class MessageWidget(Widget):
         layout: horizontal;
     }
     MessageWidget.user-message {
-        background: #111820;
+        background: #1b2130;
+        border-left: thick #5a9cf0;
+        margin-top: 1;
     }
     """
 

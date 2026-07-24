@@ -314,11 +314,18 @@ class BaseProvider(ABC):
         system: Optional[str] = None,
         max_rounds: int = 5,
         on_tool_event: ToolEventCallback = None,
+        on_pending_message: "Optional[Callable[[], Optional[str]]]" = None,
     ) -> tuple[str, list[dict]]:
         """Ask with tool calling support.
 
         Subclasses implement provider-native tool calling. The default
         falls back to a plain ask() with no tool support.
+
+        ``on_pending_message`` is consulted at each round boundary; when it
+        returns text (a prompt the user queued mid-turn), the loop injects it
+        so a follow-up lands at the next tool-call boundary (codex-style)
+        instead of only after the turn. Providers that do not support it fall
+        back to dispatch-on-completion.
 
         Returns:
             Tuple of (final_text_response, tool_calls_log).

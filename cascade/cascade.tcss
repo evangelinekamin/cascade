@@ -119,9 +119,13 @@ ChatHistory {
     color: #6e7681;
 }
 
-/* User message background tint */
+/* User turns stand out in scrollback: a stronger tint, a blue left accent, and
+   a blank line above -- nothing is clipped, only emphasized. This app rule
+   wins over MessageWidget's DEFAULT_CSS, so the emphasis lives here. */
 .user-message {
-    background: #111820;
+    background: #1b2130;
+    border-left: thick #5a9cf0;
+    margin-top: 1;
 }
 
 /* ------------------------------------------------------------------ */

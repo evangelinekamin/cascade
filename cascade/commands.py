@@ -66,11 +66,17 @@ class CommandDef:
 
 @dataclass
 class ProgressHandle:
-    """Mounted command progress row plus its title-spinner source."""
+    """Command progress indicator plus its title-spinner source.
+
+    ``docked`` marks the shared bottom-anchored TurnIndicator, which is
+    start()/stop()ed rather than mounted/removed, so a long /solve spinner
+    stays pinned above the input instead of scrolling off the transcript.
+    """
 
     indicator: object | None
     title_source: str | None
     provider: str
+    docked: bool = False
 
 
 # Canonical list of available commands (used by autocomplete and /help)
@@ -293,6 +299,18 @@ class CommandHandler:
                 starter(title_source, provider, label)
             except Exception:
                 title_source = None
+        # Prefer the shared bottom-anchored TurnIndicator so the spinner does
+        # not scroll off during a long command; fall back to an inline row.
+        docked = self._docked_indicator()
+        if docked is not None:
+            try:
+                docked.start(provider, label)
+                return ProgressHandle(
+                    indicator=docked, title_source=title_source,
+                    provider=provider, docked=True,
+                )
+            except Exception:
+                pass
         try:
             from .widgets.message import ChatHistory, ThinkingIndicator
 
@@ -307,6 +325,13 @@ class CommandHandler:
             return ProgressHandle(indicator=indicator, title_source=title_source, provider=provider)
         except Exception:
             return ProgressHandle(indicator=None, title_source=title_source, provider=provider)
+
+    def _docked_indicator(self):
+        """The screen's persistent TurnIndicator, if one is mounted."""
+        indicator = getattr(getattr(self.app, "screen", None), "_thinking", None)
+        if indicator is not None and hasattr(indicator, "start") and hasattr(indicator, "stop"):
+            return indicator
+        return None
 
     def _set_progress_indicator_label(self, handle, label: str) -> None:
         """Safely update a long-running command spinner label."""
@@ -339,9 +364,16 @@ class CommandHandler:
             except Exception:
                 pass
         try:
+            indicator = getattr(handle, "indicator", None)
+            if getattr(handle, "docked", False):
+                # The docked TurnIndicator is persistent: collapse it, do not
+                # unmount it.
+                stop = getattr(indicator, "stop", None)
+                if callable(stop):
+                    stop()
+                return
             remover = getattr(handle, "remove", None)
             if not callable(remover):
-                indicator = getattr(handle, "indicator", None)
                 remover = getattr(indicator, "remove", None)
             if callable(remover):
                 remover()
@@ -883,28 +915,15 @@ class CommandHandler:
         _send_to_provider.
         """
         try:
-            from .widgets.message import ChatHistory, ThinkingIndicator
-
-            chat = self.app.screen.query_one(ChatHistory)
-            provider = getattr(getattr(self.app, "state", None), "active_provider", "gemini")
-
-            thinking = ThinkingIndicator(provider=provider, label=label)
-            chat.mount(thinking)
-            chat.scroll_end(animate=False)
-            title_source = f"worker:{label}:{datetime.datetime.now().timestamp()}"
-            starter = getattr(self.app, "start_title_activity", None)
-            if callable(starter):
-                try:
-                    starter(title_source, provider, label)
-                except Exception:
-                    title_source = None
+            handle = self._mount_progress_indicator(label)
+            title_source = handle.title_source
 
             def _worker():
                 try:
                     result = fn()
-                    self.app.call_from_thread(self._finish_worker, thinking, result, title_source)
+                    self.app.call_from_thread(self._finish_worker, handle, result, title_source)
                 except Exception as e:
-                    self.app.call_from_thread(self._finish_worker, thinking, f"Error: {e}", title_source)
+                    self.app.call_from_thread(self._finish_worker, handle, f"Error: {e}", title_source)
 
             self.app.screen.run_worker(_worker, thread=True, exclusive=False)
         except Exception:
@@ -915,18 +934,10 @@ class CommandHandler:
             except Exception as e:
                 self._post_system(f"Error: {e}")
 
-    def _finish_worker(self, thinking, result: str, title_source: str | None = None) -> None:
-        """Remove thinking indicator and post the result."""
-        stopper = getattr(self.app, "stop_title_activity", None)
-        if callable(stopper) and title_source:
-            try:
-                stopper(title_source)
-            except Exception:
-                pass
-        try:
-            thinking.remove()
-        except Exception:
-            pass
+    def _finish_worker(self, handle, result: str, title_source: str | None = None) -> None:
+        """Clear the progress indicator and post the result."""
+        del title_source  # _clear_progress_indicator owns the title-source teardown
+        self._clear_progress_indicator(handle)
         self._post_system(result)
 
     def _cmd_agent(self, args: list[str]) -> None:

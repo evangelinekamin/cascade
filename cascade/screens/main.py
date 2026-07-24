@@ -970,6 +970,7 @@ class MainScreen(Screen):
                     system=final_system,
                     max_rounds=self._CHAT_TOOL_MAX_ROUNDS,
                     on_tool_event=on_tool_event,
+                    on_pending_message=self._pull_queued_prompt,
                 )
             live_run.checkpoint()
 
@@ -1657,6 +1658,37 @@ class MainScreen(Screen):
         except Exception:
             return
         preview.refresh_queue(list(self._queued_prompts))
+
+    def _pull_queued_prompt(self) -> "str | None":
+        """Worker-thread pull for the tool loop.
+
+        Hands over the oldest queued prompt so a follow-up the user typed
+        mid-turn lands at the next tool-call boundary (codex-style) instead of
+        only after the whole turn. ``deque.popleft`` is atomic under the GIL;
+        the UI reflection is marshaled to the app thread. Only the OpenAI-family
+        loop consults this today; other providers fall back to the drain on
+        completion, so a queued prompt is never lost either way.
+        """
+        if not self._queued_prompts:
+            return None
+        try:
+            prompt = self._queued_prompts.popleft()
+        except IndexError:
+            return None
+        self.app.call_from_thread(self._reflect_injected_prompt, prompt)
+        return prompt
+
+    def _reflect_injected_prompt(self, prompt: str) -> None:
+        """App thread: record + show an injected prompt as a real user turn."""
+        self.app.state.add_message("you", prompt)
+        self.app.record_message("user", prompt)
+        try:
+            chat = self.query_one(ChatHistory)
+            chat.mount(MessageWidget("you", summarize_user_prompt(prompt)))
+            self._scroll_chat_end(chat, force=True)
+        except Exception:
+            pass
+        self._refresh_queue_preview()
 
     def on_queue_preview_retract_requested(
         self, event: QueuePreview.RetractRequested,

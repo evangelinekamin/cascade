@@ -316,6 +316,7 @@ class TestCompeteCommand:
         posted = []
         handler._post_system = lambda text: posted.append(text)
         progress = MagicMock()
+        progress.docked = False  # inline-fallback handle: cleared via remove()
         handler._mount_progress_indicator = MagicMock(return_value=progress)
 
         fake_result = CompetitionResult(
@@ -438,6 +439,7 @@ class TestCompeteCommand:
         posted = []
         handler._post_system = lambda text: posted.append(text)
         progress = MagicMock()
+        progress.docked = False  # inline-fallback handle: cleared via remove()
         handler._mount_progress_indicator = MagicMock(return_value=progress)
 
         fake_result = CompetitionResult(

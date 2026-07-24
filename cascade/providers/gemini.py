@@ -303,6 +303,7 @@ class GeminiProvider(BaseProvider):
         system: Optional[str] = None,
         max_rounds: int = 5,
         on_tool_event: ToolEventCallback = None,
+        on_pending_message=None,  # accepted for parity; dispatch-on-completion.
     ) -> tuple[str, list[dict]]:
         """Gemini-native tool calling using function_declarations."""
         if self._use_cli_proxy:
