@@ -101,6 +101,11 @@ class SolveResult:
     input_tokens: int = 0
     output_tokens: int = 0
     cost: float = 0.0
+    # Per-provider breakdown so an escalation's tokens/cost are attributed to
+    # the model that actually incurred them, not lumped under the base provider.
+    # (provider, input_tokens, output_tokens) and (provider, cost).
+    tokens_by_provider: tuple[tuple[str, int, int], ...] = ()
+    cost_by_provider: tuple[tuple[str, float], ...] = ()
     guardrail_fired: bool = False
     verification_kind: str = ""
     # Full re-appliable binary patch (worktree vs its baseline). Unlike the
@@ -758,6 +763,8 @@ def run_verified_task(
     """
     models_used: list[str] = []
     providers_used: list[str] = []
+    tokens_by_provider: dict[str, list[int]] = {}
+    cost_by_provider: dict[str, float] = {}
     state = {"iteration": 0}
 
     def _agent_for(iteration: int) -> "tuple[object, str, str]":
@@ -791,13 +798,18 @@ def run_verified_task(
             if cancel_token is not None:
                 agent_kwargs["cancel_token"] = cancel_token
             response = run_agent_in_worktree(agent, prompt, path, **agent_kwargs)
-            if on_tokens is not None:
-                usage = getattr(agent, "last_usage", None)
-                if isinstance(usage, Usage):
+            usage = getattr(agent, "last_usage", None)
+            if isinstance(usage, Usage):
+                bucket = tokens_by_provider.setdefault(label, [0, 0])
+                bucket[0] += usage.prompt_total
+                bucket[1] += usage.output
+                if on_tokens is not None:
                     on_tokens(usage.prompt_total, usage.output)
             cost = getattr(agent, "last_cost", None)
-            if on_cost is not None and isinstance(cost, (int, float)) and cost:
-                on_cost(float(cost))
+            if isinstance(cost, (int, float)) and cost:
+                cost_by_provider[label] = cost_by_provider.get(label, 0.0) + float(cost)
+                if on_cost is not None:
+                    on_cost(float(cost))
             return response
         finally:
             agent.config.model = original_model
@@ -832,7 +844,7 @@ def run_verified_task(
             worktree_path=worktree_path,
             error=gate_error,
         )
-        return aborted, [], []
+        return aborted, [], [], (), ()
 
     # Snapshot the scaffolded tests now -- after the gate proves them healthy and
     # before the worker touches anything -- so run_tests can restore them each
@@ -868,7 +880,11 @@ def run_verified_task(
                 on_progress("guardrail", "reverted needless edits to shared code; suite green")
             result = replace(result, passed=True, guardrail_fired=True)
 
-    return result, models_used, providers_used
+    tokens_breakdown = tuple(
+        (prov, ins, outs) for prov, (ins, outs) in tokens_by_provider.items()
+    )
+    cost_breakdown = tuple(cost_by_provider.items())
+    return result, models_used, providers_used, tokens_breakdown, cost_breakdown
 
 
 def _resolve_escalation(app, escalate_to) -> "tuple[Optional[object], str, Optional[str]]":
@@ -1031,7 +1047,7 @@ def run_solve(
             )
         if on_progress:
             on_progress("workspace", path)
-        result, models_used, providers_used = run_verified_task(
+        result, models_used, providers_used, tokens_by_provider, cost_by_provider = run_verified_task(
             provider,
             path,
             task,
@@ -1105,6 +1121,8 @@ def run_solve(
             input_tokens=token_totals[0],
             output_tokens=token_totals[1],
             cost=cost_total[0],
+            tokens_by_provider=tokens_by_provider,
+            cost_by_provider=cost_by_provider,
             guardrail_fired=result.guardrail_fired,
             verification_kind=verification_kind,
             patch=full_patch,

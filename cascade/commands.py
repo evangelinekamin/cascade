@@ -13,6 +13,35 @@ from pathlib import Path
 from .theme import MODES, PALETTE, PROVIDERS
 
 
+def _solve_token_lines(result) -> list[str]:
+    """Token/cost summary lines, attributed per provider on an escalation.
+
+    A /solve that escalates runs on two providers; lumping all tokens under
+    the base provider (and labeling the cost "OpenRouter") mis-attributed the
+    escalation model's usage -- e.g. millions of claude tokens shown as
+    deepseek. This breaks it out, and only shows a metered cost for providers
+    that actually reported one (a subscription-proxied model reports none).
+    """
+    by_prov = tuple(getattr(result, "tokens_by_provider", ()) or ())
+    costs = dict(getattr(result, "cost_by_provider", ()) or ())
+    lines: list[str] = []
+    if len(by_prov) > 1:
+        lines.append("Tokens by provider:")
+        for prov, tin, tout in by_prov:
+            c = costs.get(prov, 0.0)
+            tail = f" · {c:.6f} credits" if c else " · (no metered cost, e.g. subscription)"
+            lines.append(f"  {prov}: {tin:,} in / {tout:,} out{tail}")
+        lines.append(f"Total: {result.input_tokens:,} in / {result.output_tokens:,} out")
+        return lines
+    # Single provider: flat line, cost labeled by the provider (not hardcoded).
+    lines.append(f"Tokens: {result.input_tokens:,} in / {result.output_tokens:,} out")
+    cost = float(getattr(result, "cost", 0.0) or 0.0)
+    if cost:
+        label = by_prov[0][0] if by_prov else (getattr(result, "provider", "") or "provider")
+        lines.append(f"{label} cost: {cost:.6f} credits")
+    return lines
+
+
 def _parse_iso_timestamp(value) -> "float | None":
     """Epoch seconds for a stored ISO-8601 message timestamp, else None.
 
@@ -1931,13 +1960,7 @@ class CommandHandler:
                             pseq.append(p)
                     lines.append("Providers: " + " -> ".join(pseq))
                 if result.input_tokens or result.output_tokens:
-                    lines.append(
-                        f"Tokens: {result.input_tokens:,} in / "
-                        f"{result.output_tokens:,} out"
-                    )
-                cost = float(getattr(result, "cost", 0.0) or 0.0)
-                if cost:
-                    lines.append(f"OpenRouter cost: {cost:.6f} credits")
+                    lines.extend(_solve_token_lines(result))
                 if result.error:
                     lines.append(f"Error: {result.error}")
                     if "did not run" in result.error:
@@ -2051,13 +2074,7 @@ class CommandHandler:
                     if step.error:
                         lines.append(f"    {step.error}")
                 if result.input_tokens or result.output_tokens:
-                    lines.append(
-                        f"Tokens: {result.input_tokens:,} in / "
-                        f"{result.output_tokens:,} out"
-                    )
-                cost = float(getattr(result, "cost", 0.0) or 0.0)
-                if cost:
-                    lines.append(f"OpenRouter cost: {cost:.6f} credits")
+                    lines.extend(_solve_token_lines(result))
                 if result.diff_stat:
                     # The per-file stat is the compact "what changed" -- keep it;
                     # the full diff stays in the worktree rather than flooding chat.
@@ -2147,13 +2164,7 @@ class CommandHandler:
                     if sub.error:
                         lines.append(f"    {sub.error}")
                 if result.input_tokens or result.output_tokens:
-                    lines.append(
-                        f"Tokens: {result.input_tokens:,} in / "
-                        f"{result.output_tokens:,} out"
-                    )
-                cost = float(getattr(result, "cost", 0.0) or 0.0)
-                if cost:
-                    lines.append(f"OpenRouter cost: {cost:.6f} credits")
+                    lines.extend(_solve_token_lines(result))
                 if result.diff_stat:
                     lines.append(result.diff_stat.strip())
                 elif result.changed_files:

@@ -498,7 +498,7 @@ def test_verified_task_restores_tampered_tests_but_keeps_impl_and_new_files(
     monkeypatch.setattr(solve_mod, "_preflight_gate", lambda *a, **k: None)
     monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: ("ok", 0))
 
-    result, _models, _providers = run_verified_task(
+    result, _models, _providers, *_ = run_verified_task(
         _prov(), str(tmp_path), "add feature", "pytest", bulk_model="b", frontier_model="f"
     )
 
@@ -824,7 +824,7 @@ def test_guardrail_greens_the_suite_by_dropping_a_needless_modification(
 
     monkeypatch.setattr(solve_mod, "run_agent_in_worktree", fake_agent)
 
-    result, _models, _providers = run_verified_task(
+    result, _models, _providers, *_ = run_verified_task(
         _prov(),
         str(tmp_path),
         "add g()",
@@ -892,7 +892,7 @@ def test_guardrail_restores_worker_changes_when_the_revert_breaks_the_target(
 
     monkeypatch.setattr(solve_mod, "run_agent_in_worktree", fake_agent)
 
-    result, _models, _providers = run_verified_task(
+    result, _models, _providers, *_ = run_verified_task(
         _prov(),
         str(tmp_path),
         "make f return 2",
@@ -937,7 +937,7 @@ def test_run_verified_task_escalates_to_a_different_provider(monkeypatch):
     results = iter([("fail", 1), ("fail", 1), ("ok", 0)])
     monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: next(results))
 
-    result, models_used, providers_used = run_verified_task(
+    result, models_used, providers_used, *_ = run_verified_task(
         primary,
         "/tmp/wt",
         "task",
@@ -975,7 +975,7 @@ def test_escalation_provider_falls_back_to_its_own_model_when_none(monkeypatch):
     results = iter([("fail", 1), ("ok", 0)])
     monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: next(results))
 
-    _result, models_used, _providers = run_verified_task(
+    _result, models_used, _providers, *_ = run_verified_task(
         primary,
         "/tmp/wt",
         "task",
@@ -1002,7 +1002,7 @@ def test_run_verified_task_without_escalation_provider_is_unchanged(monkeypatch)
     results = iter([("fail", 1), ("ok", 0)])
     monkeypatch.setattr(solve_mod, "_run_tests_in", lambda c, w, t: next(results))
 
-    _result, models_used, providers_used = run_verified_task(
+    _result, models_used, providers_used, *_ = run_verified_task(
         prov,
         "/tmp/wt",
         "task",

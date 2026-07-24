@@ -459,7 +459,7 @@ def run_fanout(
             if on_progress:
                 on_progress("subtask", f"{task.id}: {task.description}")
             try:
-                result, models_used, _providers = run_verified_task(
+                result, models_used, _providers, *_ = run_verified_task(
                     _clone_provider(provider),
                     prepared[task.id].path,
                     task.prompt,

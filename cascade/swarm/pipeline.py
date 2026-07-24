@@ -314,7 +314,7 @@ def run_pipeline(
             if on_progress:
                 on_progress("step", f"{task.id}: {task.description}")
             before_patch = manager.diff_patch(path)
-            result, models_used, _providers_used = run_verified_task(
+            result, models_used, _providers_used, *_ = run_verified_task(
                 provider,
                 path,
                 _step_prompt(objective, task, completed),
