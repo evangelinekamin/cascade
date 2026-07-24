@@ -203,6 +203,17 @@ class HistoryDB:
         )
         self._conn.commit()
 
+    def update_session_model(self, session_id: str, model: str) -> None:
+        """Record the model most recently used in a session (for /resume)."""
+        if not model:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            "UPDATE sessions SET model = ?, updated_at = ? WHERE id = ?",
+            (model, now, session_id),
+        )
+        self._conn.commit()
+
     # -- messages --
 
     def add_message(

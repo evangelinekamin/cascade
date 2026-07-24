@@ -1549,6 +1549,13 @@ class CommandHandler:
         if session_provider in getattr(cli_app, "providers", {}):
             restored_mode = self._mode_for_provider(cli_app, session_provider)
             self._apply_provider_model(self.app, session_provider, restored_mode, fast=False)
+            # Pick up the session's last-used model, not just the mode default,
+            # so resuming a session lands you back on the exact model you left.
+            session_model = str(session.get("model", "") or "").strip()
+            if session_model:
+                prov = cli_app.providers.get(session_provider)
+                if prov is not None and getattr(prov, "config", None) is not None:
+                    prov.config.model = session_model
             self.app.state.set_provider(session_provider, restored_mode)
             try:
                 self.app.screen._active_provider = session_provider

@@ -195,6 +195,41 @@ def test_resume_resets_state_preserves_roles_and_emits_hook(tmp_path):
     assert cli_app.hook_runner.emit.call_args.args[0] == HookEvent.SESSION_RESUME
     assert cli_app.hook_runner.emit.call_args.args[1].session_id == session["id"]
 
+
+def test_resume_restores_last_used_model(tmp_path):
+    db = HistoryDB(db_path=str(tmp_path / "model.db"))
+    # Session left on a specific model (not the mode default).
+    session = db.create_session(provider="claude", title="S", model="claude-opus-4-8")
+    db.add_message(session["id"], role="user", content="hi")
+    db.add_message(session["id"], role="claude", content="hey", token_count=3)
+
+    screen = MagicMock()
+    screen._header_visible = True
+    screen.query_one.side_effect = lambda selector: MagicMock()
+
+    prov = MagicMock()
+    prov.config.model = "some-default-model"
+    cli_app = MagicMock()
+    cli_app.providers = {"claude": prov}
+    app = _FakeApp(db, screen, cli_app)
+
+    handler = CommandHandler(app)
+    handler._post_system = lambda text: None
+    handler._cmd_resume([session["id"]])
+
+    # The provider's model was restored to the session's stored model.
+    assert prov.config.model == "claude-opus-4-8"
+
+
+def test_update_session_model_persists(tmp_path):
+    db = HistoryDB(db_path=str(tmp_path / "persist.db"))
+    session = db.create_session(provider="openrouter", title="S", model="deepseek/deepseek-v4-flash")
+    db.update_session_model(session["id"], "claude/claude-opus-4-8")
+    reloaded = db.get_session(session["id"])
+    assert reloaded["model"] == "claude/claude-opus-4-8"
+    # Empty model is a no-op (never clobbers a real value).
+    db.update_session_model(session["id"], "")
+    assert db.get_session(session["id"])["model"] == "claude/claude-opus-4-8"
     db.close()
 
 

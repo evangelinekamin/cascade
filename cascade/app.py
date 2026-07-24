@@ -336,6 +336,17 @@ class CascadeTUI(App):
             token_count=token_count,
         )
 
+        # Persist the model that actually produced this provider turn, so
+        # /resume lands back on the last-used model (not the mode default).
+        # This is the one chokepoint every turn passes through, regardless of
+        # how the model was selected (command or Shift+Tab).
+        if provider:
+            cli_app = getattr(self, "cli_app", None)
+            prov = cli_app.providers.get(provider) if cli_app else None
+            model = getattr(getattr(prov, "config", None), "model", "") or ""
+            if model:
+                self.db.update_session_model(session["id"], model)
+
         # Auto-title from first user message
         if role == "user" and not session.get("title"):
             title = content[:60]
