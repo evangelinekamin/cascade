@@ -65,33 +65,38 @@ def test_record_message_persists_parent_chain_via_branching(tui_app):
 
 
 def test_tui_window_title_tracks_busy_activity(tui_app):
-    tui_app.console.set_window_title = MagicMock()
     tui_app.state.active_provider = "claude"
     tui_app.state.set_session_id("night-river")
+    tui_app.state.cwd = "/home/eve/projects/aqua"
+    tui_app.state.mode = "build"
 
-    assert tui_app._formatted_window_title() == "cascade . claude . night-river"
+    # Project leads -- terminal tabs truncate on the right, so the token that
+    # tells two cascade tabs apart has to survive a ~20 character tab.
+    idle = "aqua . build . cascade . claude . night-river"
+    assert tui_app._terminal_window_title() == idle
 
     tui_app.start_title_activity("chat", "claude", "thinking")
-    busy_title = tui_app._formatted_window_title()
-    assert "cascade . claude . night-river" in busy_title
+    busy_title = tui_app._terminal_window_title()
+    assert busy_title.startswith(idle)
     assert "thinking" in busy_title
 
     tui_app.stop_title_activity("chat")
-    assert tui_app._formatted_window_title() == "cascade . claude . night-river"
+    assert tui_app._terminal_window_title() == idle
 
 
 def test_tui_thinking_event_updates_window_title_state(tui_app):
-    tui_app.console.set_window_title = MagicMock()
     tui_app.state.active_provider = "gemini"
     tui_app.state.set_session_id("cedar-pulse")
+    tui_app.state.cwd = "/home/eve/projects/aqua"
+    tui_app.state.mode = "design"
 
     tui_app.on_thinking_changed(ThinkingChanged("openrouter", True, "routing"))
-    title = tui_app._formatted_window_title()
+    title = tui_app._terminal_window_title()
     assert "routing" in title
     assert "openrouter" in title
 
     tui_app.on_thinking_changed(ThinkingChanged("openrouter", False, ""))
-    assert tui_app._formatted_window_title() == "cascade . gemini . cedar-pulse"
+    assert tui_app._terminal_window_title() == "aqua . design . cascade . gemini . cedar-pulse"
 
 
 class _FakeApp:

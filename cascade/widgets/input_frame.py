@@ -9,6 +9,7 @@ dropdown appears when typing slash commands.
 from rich.text import Text
 from textual import events
 from textual.binding import Binding
+from textual.dom import NoScreen
 from textual.message import Message
 from textual.widget import Widget
 from textual.app import ComposeResult
@@ -29,7 +30,15 @@ class ChatTextArea(TextArea):
       opaque ``[pasted N chars]`` placeholder.
     - Up/Down navigate prompt history only when the cursor is on the
       first/last line; otherwise they move between lines as normal.
+    - Height tracks the soft-wrapped content up to ``MAX_ROWS``.
     """
+
+    MAX_ROWS = 12
+    """Tallest the composer gets; past this it scrolls internally."""
+
+    _rows: int = 1
+    """Current rendered row count. A class default because TextArea's own
+    __init__ reaches _refresh_size before subclass attributes are assigned."""
 
     class Submitted(Message):
         """The user submitted the composed prompt."""
@@ -38,6 +47,17 @@ class ChatTextArea(TextArea):
             super().__init__()
             self.text_area = widget
             self.value = value
+
+    class Resized(Message):
+        """The composer's row count changed.
+
+        Carries the signed row delta so the screen can tell whether the
+        transcript was pinned to the bottom *before* the layout shifted.
+        """
+
+        def __init__(self, delta: int) -> None:
+            super().__init__()
+            self.delta = delta
 
     BINDINGS = [
         Binding("shift+enter", "newline", "Newline", show=False),
@@ -52,6 +72,49 @@ class ChatTextArea(TextArea):
         self._history: list[str] = []
         self._history_idx: int = -1
         self._draft: str = ""
+
+    # -- auto-grow ------------------------------------------------------
+
+    def _row_cap(self) -> int:
+        """Tallest allowed right now: ``MAX_ROWS``, or half a short terminal.
+
+        The frame, the mode line and the status bar all live below the
+        composer, so a full-height composer on a small pane would push its own
+        top border off the screen.
+        """
+        try:
+            viewport = self.screen.size.height
+        except NoScreen:  # constructed, not yet mounted
+            return self.MAX_ROWS
+        return max(1, min(self.MAX_ROWS, viewport // 2))
+
+    def _refresh_size(self) -> None:
+        """Resize to fit the content -- stock TextArea is fixed-height.
+
+        ``height: auto`` cannot do this: TextArea is a ScrollView, so CSS
+        resolves its height from ``virtual_size``, and cascade.tcss pins
+        ``.main-input`` to one row anyway. An inline height outranks every
+        stylesheet, so the composer sizes itself.
+
+        This is TextArea's single choke point for "the rendered height may
+        have changed" -- edits, undo/redo, load_text and the rewrap after a
+        terminal resize all funnel through it -- so soft-wrapped rows are
+        counted with the wrap width that is actually in effect.
+        """
+        super()._refresh_size()
+        # virtual_size is the wrapped row count (or raw line count when soft
+        # wrap is off). The composer draws no border and no padding, so rows
+        # and box height are the same number.
+        rows = max(1, min(self.virtual_size.height, self._row_cap()))
+        self.styles.height = rows
+        if rows != self._rows:
+            delta = rows - self._rows
+            self._rows = rows
+            # ChatHistory is height:1fr, so growing here shrinks the transcript
+            # and raises its max_scroll_y while the offset stays put -- the
+            # newest messages would slide below the fold. The screen owns that
+            # re-anchoring; the composer stays unaware of the transcript.
+            self.post_message(self.Resized(delta))
 
     # -- history --------------------------------------------------------
 
@@ -255,9 +318,9 @@ class FramedInput(Widget):
         layout: horizontal;
     }
     FramedInput #main_input {
-        height: auto;
-        min-height: 1;
-        max-height: 12;
+        /* Height belongs to ChatTextArea, which sizes itself to its content
+           (see MAX_ROWS). A CSS height here cannot auto-grow and a CSS
+           max-height would not reach this container's auto height. */
         width: 1fr;
         background: #0d1117;
         border: none;

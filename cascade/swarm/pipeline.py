@@ -92,6 +92,11 @@ class PipelineResult:
     input_tokens: int = 0
     output_tokens: int = 0
     cost: float = 0.0
+    # Per-provider breakdown, same shape as SolveResult's: an escalated step's
+    # tokens and cost belong to the model that incurred them, not to the base
+    # provider. (provider, input_tokens, output_tokens) and (provider, cost).
+    tokens_by_provider: tuple[tuple[str, int, int], ...] = ()
+    cost_by_provider: tuple[tuple[str, float], ...] = ()
     error: str = ""
 
 
@@ -133,6 +138,25 @@ def _parse_steps(objective: str, response: str) -> List[PipelineTask]:
     return steps or fallback
 
 
+def _director_for(app, provider_name: str) -> "tuple[Optional[object], str, Optional[str]]":
+    """The planner: the configured escalation target, else the primary provider.
+
+    Planning is the one frontier-model call in a pipeline, so run_pipeline needs
+    the same answer plan_steps acts on to bill it to the right provider.
+    """
+    target = app.config.get_escalation_target(provider_name)
+    if not isinstance(target, (str, tuple, list)):
+        target = None
+    director, director_name, director_model = _resolve_escalation(app, target)
+    if director is not None:
+        return director, director_name, director_model
+    return (
+        app.providers.get(provider_name),
+        provider_name,
+        app.config.get_model_for(provider_name, fast=False),
+    )
+
+
 def plan_steps(
     app,
     objective: str,
@@ -143,17 +167,9 @@ def plan_steps(
     cancel_token: Optional[CancellationToken] = None,
 ) -> List[PipelineTask]:
     """Ask the director (on its frontier model) to decompose the objective."""
-    primary = app.providers.get(provider_name)
-    if primary is None:
+    if app.providers.get(provider_name) is None:
         return [PipelineTask(id="step_1", description=objective, prompt=objective)]
-    target = app.config.get_escalation_target(provider_name)
-    if not isinstance(target, (str, tuple, list)):
-        target = None
-    director, director_name, director_model = _resolve_escalation(app, target)
-    if director is None:
-        director = primary
-        director_name = provider_name
-        director_model = app.config.get_model_for(provider_name, fast=False)
+    director, director_name, director_model = _director_for(app, provider_name)
     if on_progress:
         on_progress(
             "planning",
@@ -246,6 +262,8 @@ def run_pipeline(
 
     token_totals = [0, 0]
     cost_total = [0.0]
+    tokens_by_provider: dict[str, list[int]] = {}
+    cost_by_provider: dict[str, float] = {}
 
     def _accumulate_tokens(input_tokens: int, output_tokens: int) -> None:
         token_totals[0] += input_tokens
@@ -260,14 +278,45 @@ def run_pipeline(
         if run_context is not None:
             run_context.add_cost(cost)
 
+    def _credit_tokens(label: str, input_tokens: int, output_tokens: int) -> None:
+        bucket = tokens_by_provider.setdefault(label, [0, 0])
+        bucket[0] += input_tokens
+        bucket[1] += output_tokens
+
+    def _credit_cost(label: str, cost: float) -> None:
+        cost_by_provider[label] = cost_by_provider.get(label, 0.0) + cost
+
+    def _token_breakdown() -> "tuple[tuple[str, int, int], ...]":
+        return tuple(
+            (label, tokens[0], tokens[1]) for label, tokens in tokens_by_provider.items()
+        )
+
+    def _credit_step(attribution: list) -> None:
+        """Fold one step's per-provider breakdown into the run-wide one."""
+        for label, step_in, step_out in (attribution[0] if attribution else ()):
+            _credit_tokens(label, step_in, step_out)
+        for label, step_cost in (attribution[1] if len(attribution) > 1 else ()):
+            _credit_cost(label, step_cost)
+
+    _director, director_name, _director_model = _director_for(app, provider_name)
+
+    def _plan_tokens(input_tokens: int, output_tokens: int) -> None:
+        """Planning runs on the director's provider, not on a step worker's."""
+        _credit_tokens(director_name, input_tokens, output_tokens)
+        _accumulate_tokens(input_tokens, output_tokens)
+
+    def _plan_cost(cost: float) -> None:
+        _credit_cost(director_name, cost)
+        _accumulate_cost(cost)
+
     plan_kwargs = {
         "on_progress": on_progress,
-        "on_tokens": _accumulate_tokens,
+        "on_tokens": _plan_tokens,
     }
     if token is not None:
         plan_kwargs["cancel_token"] = token
     if "on_cost" in inspect.signature(plan_steps).parameters:
-        plan_kwargs["on_cost"] = _accumulate_cost
+        plan_kwargs["on_cost"] = _plan_cost
     tasks = plan_steps(app, objective, provider_name, **plan_kwargs)
     if run_context is not None:
         for index, task in enumerate(tasks):
@@ -314,7 +363,7 @@ def run_pipeline(
             if on_progress:
                 on_progress("step", f"{task.id}: {task.description}")
             before_patch = manager.diff_patch(path)
-            result, models_used, _providers_used, *_ = run_verified_task(
+            result, models_used, _providers_used, *attribution = run_verified_task(
                 provider,
                 path,
                 _step_prompt(objective, task, completed),
@@ -334,6 +383,7 @@ def run_pipeline(
                 on_cost=_accumulate_cost,
                 cancel_token=token,
             )
+            _credit_step(attribution)
             if token is not None:
                 token.checkpoint()
             step_error = getattr(result, "error", "") or ""
@@ -420,6 +470,8 @@ def run_pipeline(
             input_tokens=token_totals[0],
             output_tokens=token_totals[1],
             cost=cost_total[0],
+            tokens_by_provider=_token_breakdown(),
+            cost_by_provider=tuple(cost_by_provider.items()),
             error=error,
         )
     except RunCancelled as exc:
@@ -443,6 +495,8 @@ def run_pipeline(
             input_tokens=token_totals[0],
             output_tokens=token_totals[1],
             cost=cost_total[0],
+            tokens_by_provider=_token_breakdown(),
+            cost_by_provider=tuple(cost_by_provider.items()),
             error=str(exc),
         )
     except Exception as exc:
@@ -457,5 +511,7 @@ def run_pipeline(
             input_tokens=token_totals[0],
             output_tokens=token_totals[1],
             cost=cost_total[0],
+            tokens_by_provider=_token_breakdown(),
+            cost_by_provider=tuple(cost_by_provider.items()),
             error=str(exc),
         )

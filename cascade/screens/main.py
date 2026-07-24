@@ -1458,6 +1458,35 @@ class MainScreen(Screen):
         except Exception:
             return None
 
+    def on_resize(self, event: events.Resize) -> None:
+        """Re-fit the composer when the terminal resizes.
+
+        Its row cap is half the viewport, but its own height is pinned by an
+        inline style -- so a height-only resize (a tmux split, a window drag)
+        changes the cap while delivering no Resize to the composer itself. Left
+        alone, a tall composer keeps its old height and pushes its own top
+        border off-screen.
+        """
+        del event
+        composer = self._input_widget()
+        if composer is not None:
+            composer._refresh_size()
+
+    def on_chat_text_area_resized(self, event: ChatTextArea.Resized) -> None:
+        """Keep the transcript pinned to the bottom when the composer grows.
+
+        Only re-anchor if it was already at the bottom: the delta tells us how
+        far max_scroll_y just moved, so a user who deliberately scrolled back
+        is left where they are.
+        """
+        try:
+            chat = self.query_one(ChatHistory)
+        except Exception:
+            return
+        slack = max(0, event.delta) + 1
+        if chat.scroll_offset.y >= chat.max_scroll_y - slack:
+            self.call_after_refresh(chat.scroll_end, animate=False)
+
     def _disarm_exit(self) -> None:
         """Cancel a pending second-press-to-exit."""
         self._exit_armed = False

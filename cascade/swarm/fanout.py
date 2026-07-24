@@ -110,6 +110,11 @@ class FanoutResult:
     input_tokens: int = 0
     output_tokens: int = 0
     cost: float = 0.0
+    # Per-provider breakdown, same shape as SolveResult's: an escalated subtask's
+    # tokens and cost belong to the model that incurred them, not to the base
+    # provider. (provider, input_tokens, output_tokens) and (provider, cost).
+    tokens_by_provider: tuple[tuple[str, int, int], ...] = ()
+    cost_by_provider: tuple[tuple[str, float], ...] = ()
     error: str = ""
 
 
@@ -332,12 +337,16 @@ def run_fanout(
     # when one is configured, else the primary provider's own frontier model.
     if escalation_provider is not None:
         director = escalation_provider
+        director_name = escalation_name
         director_model = escalation_model or escalation_provider.config.model
     else:
         director = provider
+        director_name = provider_name
         director_model = frontier_model
     token_totals = [0, 0]
     cost_total = [0.0]
+    tokens_by_provider: dict[str, list[int]] = {}
+    cost_by_provider: dict[str, float] = {}
     token_lock = Lock()
 
     def _accumulate_tokens(input_tokens: int, output_tokens: int) -> None:
@@ -355,14 +364,49 @@ def run_fanout(
         if run_context is not None:
             run_context.add_cost(cost)
 
+    def _credit_tokens(label: str, input_tokens: int, output_tokens: int) -> None:
+        with token_lock:
+            bucket = tokens_by_provider.setdefault(label, [0, 0])
+            bucket[0] += input_tokens
+            bucket[1] += output_tokens
+
+    def _credit_cost(label: str, cost: float) -> None:
+        with token_lock:
+            cost_by_provider[label] = cost_by_provider.get(label, 0.0) + cost
+
+    def _token_breakdown() -> "tuple[tuple[str, int, int], ...]":
+        return tuple(
+            (label, tokens[0], tokens[1]) for label, tokens in tokens_by_provider.items()
+        )
+
+    def _credit_subtask(attribution: list) -> None:
+        """Fold one subtask's per-provider breakdown into the run-wide one.
+
+        Called from the worker threads, so every credit takes the lock; the two
+        loops are separate acquisitions rather than one held across both.
+        """
+        for label, sub_in, sub_out in (attribution[0] if attribution else ()):
+            _credit_tokens(label, sub_in, sub_out)
+        for label, sub_cost in (attribution[1] if len(attribution) > 1 else ()):
+            _credit_cost(label, sub_cost)
+
+    def _plan_tokens(input_tokens: int, output_tokens: int) -> None:
+        """Planning runs on the director's provider, not on a subtask worker's."""
+        _credit_tokens(director_name, input_tokens, output_tokens)
+        _accumulate_tokens(input_tokens, output_tokens)
+
+    def _plan_cost(cost: float) -> None:
+        _credit_cost(director_name, cost)
+        _accumulate_cost(cost)
+
     plan_kwargs = {
         "on_progress": on_progress,
-        "on_tokens": _accumulate_tokens,
+        "on_tokens": _plan_tokens,
     }
     if token is not None:
         plan_kwargs["cancel_token"] = token
     if "on_cost" in inspect.signature(plan_subtasks).parameters:
-        plan_kwargs["on_cost"] = _accumulate_cost
+        plan_kwargs["on_cost"] = _plan_cost
     tasks = plan_subtasks(
         app, objective, director, director_model, **plan_kwargs,
     )
@@ -377,6 +421,8 @@ def run_fanout(
             outcome=RunOutcome.BLOCKED,
             input_tokens=token_totals[0],
             output_tokens=token_totals[1],
+            tokens_by_provider=_token_breakdown(),
+            cost_by_provider=tuple(cost_by_provider.items()),
             error=f"invalid parallel plan: {plan_error}",
         )
     if run_context is not None:
@@ -419,6 +465,8 @@ def run_fanout(
                 outcome=RunOutcome.BLOCKED,
                 input_tokens=token_totals[0],
                 output_tokens=token_totals[1],
+                tokens_by_provider=_token_breakdown(),
+                cost_by_provider=tuple(cost_by_provider.items()),
                 error=(
                     "base test suite is not green -- fix it before fanning out "
                     "(a red base makes every subtask fix the same failures and "
@@ -459,7 +507,7 @@ def run_fanout(
             if on_progress:
                 on_progress("subtask", f"{task.id}: {task.description}")
             try:
-                result, models_used, _providers, *_ = run_verified_task(
+                result, models_used, _providers, *attribution = run_verified_task(
                     _clone_provider(provider),
                     prepared[task.id].path,
                     task.prompt,
@@ -479,6 +527,7 @@ def run_fanout(
                     on_cost=_accumulate_cost,
                     cancel_token=token,
                 )
+                _credit_subtask(attribution)
                 if token is not None:
                     token.checkpoint()
                 path = prepared[task.id].path
@@ -645,6 +694,8 @@ def run_fanout(
             input_tokens=token_totals[0],
             output_tokens=token_totals[1],
             cost=cost_total[0],
+            tokens_by_provider=_token_breakdown(),
+            cost_by_provider=tuple(cost_by_provider.items()),
             error="; ".join(errors),
         )
     except RunCancelled as exc:
@@ -672,6 +723,8 @@ def run_fanout(
             input_tokens=token_totals[0],
             output_tokens=token_totals[1],
             cost=cost_total[0],
+            tokens_by_provider=_token_breakdown(),
+            cost_by_provider=tuple(cost_by_provider.items()),
             error=str(exc),
         )
     except Exception as exc:
@@ -691,5 +744,7 @@ def run_fanout(
             input_tokens=token_totals[0],
             output_tokens=token_totals[1],
             cost=cost_total[0],
+            tokens_by_provider=_token_breakdown(),
+            cost_by_provider=tuple(cost_by_provider.items()),
             error=str(exc),
         )

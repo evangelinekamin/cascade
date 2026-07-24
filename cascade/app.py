@@ -4,6 +4,8 @@ Gets providers, config, hooks, tools for free via the CLI app.
 """
 
 import asyncio
+import os
+import sys
 from collections import OrderedDict
 
 from textual.app import App
@@ -15,6 +17,41 @@ from .swarm.lifecycle import RunLedger
 from .theme import MODES, get_provider_theme
 
 _TITLE_SPINNER_FRAMES = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+_OSC_TITLE = "\x1b]0;{title}\x07"
+_DUMB_TERMS = {"dumb", "unknown"}
+
+
+def _printable(title: str) -> str:
+    """Drop control characters: an OSC string ends at the first BEL or ESC.
+
+    Activity labels carry model-authored text, so an unfiltered title could
+    close the escape early and leave the rest running as terminal commands.
+    """
+    return "".join(char for char in title if char.isprintable())
+
+
+def _emit_terminal_title(title: str) -> bool:
+    """Write an OSC title to the terminal; True when the escape was written.
+
+    Textual builds ``App.console`` on a null file, so Rich's set_window_title is
+    a no-op inside a running app and the tab keeps whatever the shell left there.
+    The escape has to go to the stream the driver itself owns -- stderr, which
+    stays attached to the terminal even when stdout is redirected.
+    """
+    stream = sys.__stderr__
+    if stream is None or os.environ.get("TERM", "").strip().lower() in _DUMB_TERMS:
+        return False
+    try:
+        if not stream.isatty():
+            return False
+        stream.write(_OSC_TITLE.format(title=_printable(title)))
+        stream.flush()
+    except Exception:
+        # Blanket by design: on_unmount calls this ahead of closing the run
+        # ledger and the history DB, so a cosmetic title must never be able to
+        # abort session cleanup and strand an uncheckpointed WAL.
+        return False
+    return True
 
 
 class CascadeTUI(App):
@@ -45,6 +82,9 @@ class CascadeTUI(App):
         self._title_timer = None
         self._title_idx = 0
         self._title_activities: OrderedDict[str, tuple[str, str]] = OrderedDict()
+        # Last string actually written to the terminal; repeats are skipped so
+        # the 10Hz activity tick cannot thrash the tab strip.
+        self._last_emitted_title: str | None = None
 
         # Populate state from CLI app
         if cli_app:
@@ -70,7 +110,6 @@ class CascadeTUI(App):
                     self.state.provider_tokens[name] = 0
 
         # Resolve cwd and branch
-        import os
         import subprocess
         self.state.cwd = os.getcwd()
         try:
@@ -111,7 +150,7 @@ class CascadeTUI(App):
         if self._title_timer is not None:
             self._title_timer.stop()
             self._title_timer = None
-        self._sync_window_title()
+        self._clear_window_title()
         try:
             self.run_ledger.close()
         except Exception:
@@ -180,32 +219,73 @@ class CascadeTUI(App):
         compact = " ".join(str(label or "").split()).strip() or "working"
         return compact if len(compact) <= 72 else f"{compact[:69]}..."
 
-    def _base_window_title(self) -> str:
-        parts = ["cascade"]
-        provider = (self.state.active_provider or "").strip()
-        session_id = (self.state.session_id or "").strip()
-        if provider:
-            parts.append(provider)
-        if session_id:
-            parts.append(session_id)
-        return " . ".join(parts)
+    def _project_name(self) -> str:
+        """Basename of the working directory."""
+        return os.path.basename((self.state.cwd or "").rstrip(os.sep))
 
-    def _formatted_window_title(self) -> str:
-        base = self._base_window_title()
+    def _title_tokens(self) -> list[str]:
+        """Title tokens, most-distinguishing first.
+
+        Terminal tabs are narrow and truncate on the RIGHT, so the project
+        directory leads: two cascade tabs in different repos must stay tellable
+        apart at ~20 visible characters, which "cascade . build . <project>"
+        does not survive. The rest still rides along for wide tabs and the
+        window title.
+        """
+        parts = [
+            token
+            for token in (self._project_name(), (self.state.mode or "").strip())
+            if token
+        ]
+        parts.append("cascade")
+        parts.extend(
+            token
+            for token in (
+                (self.state.active_provider or "").strip(),
+                (self.state.session_id or "").strip(),
+            )
+            if token
+        )
+        return parts
+
+    def _with_activity(self, base: str) -> str:
+        """Append the busiest activity, when there is one.
+
+        Deliberately carries no spinner frame: the title is re-synced on every
+        animation tick, and an animated tab makes the strip relayout ~10x a
+        second -- flicker exactly while she is scanning tabs. The label alone
+        changes rarely, which (with the emit memo) collapses writes to roughly
+        one per real state change.
+        """
         if not self._title_activities:
             return base
         provider, label = next(reversed(self._title_activities.values()))
-        frame = _TITLE_SPINNER_FRAMES[self._title_idx % len(_TITLE_SPINNER_FRAMES)]
         provider = (provider or "").strip()
         if provider and provider != self.state.active_provider and provider not in label:
-            return f"{frame} {base} . {provider} . {label}"
-        return f"{frame} {base} . {label}"
+            return f"{base} . {provider} . {label}"
+        return f"{base} . {label}"
+
+    def _terminal_window_title(self) -> str:
+        """The session line as the terminal tab shows it, with workspace context."""
+        return self._with_activity(" . ".join(self._title_tokens()))
 
     def _sync_window_title(self) -> None:
-        try:
-            self.console.set_window_title(self._formatted_window_title())
-        except Exception:
-            pass
+        title = self._terminal_window_title()
+        if title == self._last_emitted_title:
+            return
+        if _emit_terminal_title(title):
+            self._last_emitted_title = title
+
+    def _clear_window_title(self) -> None:
+        """Hand the tab back on exit.
+
+        The previous title cannot be read back portably, so clear it: the
+        terminal falls back to its own default rather than keeping a dead
+        session's name in the tab strip. Bypasses the emit memo -- shutdown
+        must always write, whatever was last sent.
+        """
+        self._last_emitted_title = None
+        _emit_terminal_title("")
 
     def action_cycle_mode(self) -> None:
         """Delegate to the current screen."""
