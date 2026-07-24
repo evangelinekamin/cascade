@@ -17,6 +17,16 @@ _DEFAULT_MODE_CONFIG = {
     for mode_name, mode_cfg in MODES.items()
 }
 
+# OAuth-backed providers store a read-through reference, never the live token:
+# apply_credential writes the sentinel and the key resolver dereferences it via
+# the source CLI's auth file at read time. This keeps the secret off disk and
+# always current (OAuth tokens refresh; a persisted copy would go stale).
+_CLI_CREDENTIAL_SENTINELS = {
+    "claude": "@claude-cli",
+    "openai": "@codex-cli",
+    "gemini": "@gemini-cli",
+}
+
 
 class ConfigManager:
     """Manage Cascade configuration from YAML."""
@@ -115,8 +125,10 @@ class ConfigManager:
             },
             "modes": _DEFAULT_MODE_CONFIG,
             "prompts": {
+                # include_design_language is intentionally omitted: absent means
+                # "auto", which scopes design.md to design mode. Set it to true
+                # or false to force the design language on or off in every mode.
                 "use_default_system_prompt": True,
-                "include_design_language": True,
                 "design_md_path": "",
             },
             "memory": {
@@ -212,7 +224,10 @@ class ConfigManager:
         }
 
         entry["enabled"] = True
-        entry["api_key"] = token
+        # Never persist the OAuth secret: store a sentinel that get_provider_config
+        # resolves read-through. Providers without a source CLI (e.g. openrouter's
+        # pasted API key) keep storing their value.
+        entry["api_key"] = _CLI_CREDENTIAL_SENTINELS.get(provider_name, token)
         entry.setdefault("model", default_models.get(provider_name, ""))
         if provider_name == "openrouter":
             entry.setdefault("fallback_model", "minimax/minimax-m2.5")
@@ -226,7 +241,7 @@ class ConfigManager:
         if not provider_data.get("enabled", False):
             return None
 
-        api_key = self._resolve_env_var(provider_data.get("api_key", ""))
+        api_key = self._resolve_api_key(provider_data.get("api_key", ""))
         # Self-hosted / local endpoints can opt out of the key requirement.
         if not api_key and provider_data.get("requires_key", True):
             return None
@@ -242,11 +257,41 @@ class ConfigManager:
             provider_preferences=provider_data.get("provider_preferences"),
         )
 
+    def _resolve_api_key(self, value: str) -> str:
+        """Resolve a stored api_key reference to a live secret, in memory only.
+
+        Two indirections, neither of which persists the resolved secret:
+          - a ``@<cli>-cli`` sentinel -> the current OAuth token from the source
+            CLI's auth file (read-through, so a refreshed token is always current)
+          - ``${VAR}`` -> environment variable
+        Any other value (including a legacy inlined token) passes through
+        unchanged, so existing configs keep working.
+        """
+        detector = self._cli_sentinel_detector(value)
+        if detector is not None:
+            cred = detector()
+            return cred.token if cred is not None else ""
+        return self._resolve_env_var(value)
+
+    @staticmethod
+    def _cli_sentinel_detector(value: str):
+        """Return the detect_* function a CLI sentinel resolves through, or None.
+
+        Imported at call time so tests (and refreshed tokens) see the current
+        detectors rather than a reference captured at module load.
+        """
+        from . import auth
+        return {
+            "@claude-cli": auth.detect_claude,
+            "@codex-cli": auth.detect_codex,
+            "@gemini-cli": auth.detect_gemini,
+        }.get(value)
+
     def _resolve_env_var(self, value: str) -> str:
         """Resolve environment variable references like ${VAR_NAME}."""
         if not value.startswith("${") or not value.endswith("}"):
             return value
-        
+
         var_name = value[2:-1]
         return os.getenv(var_name, "")
 
@@ -349,10 +394,14 @@ class ConfigManager:
         return [name for name, config in providers.items() if config.get("enabled", False)]
 
     def get_prompt_config(self) -> Dict[str, Any]:
-        """Get prompt system configuration."""
+        """Get prompt system configuration.
+
+        include_design_language is deliberately left out of the defaults so its
+        absence is distinguishable from an explicit true/false: callers read a
+        missing key as "auto" (design.md scoped to design mode).
+        """
         defaults = {
             "use_default_system_prompt": True,
-            "include_design_language": True,
             "design_md_path": "",
         }
         config = self.data.get("prompts", {})

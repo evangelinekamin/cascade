@@ -166,8 +166,33 @@ def get_mode_directive(mode: str) -> str:
     return MODE_DIRECTIVES.get(mode, "")
 
 
+def design_language_section(
+    include_design_language: Optional[bool],
+    mode: Optional[str],
+    design_md_path: Optional[str] = None,
+) -> str:
+    """The ``Design Language:`` block when it applies, else ``""``.
+
+    Tri-state gate: an explicit True/False setting wins; ``None`` scopes it to
+    design mode, so a UI/UX design brief does not bias plan/build/test output.
+    Injected per-request (against the ACTIVE mode), not baked into the mode-
+    agnostic base pipeline, so a Shift+Tab into design mode actually enables it.
+    """
+    want = (
+        include_design_language
+        if include_design_language is not None
+        else mode == "design"
+    )
+    if not want:
+        return ""
+    content = _find_design_md(explicit_path=design_md_path)
+    if not content:
+        return ""
+    return "Design Language:\n" + content.strip()
+
+
 def build_default_prompt(
-    include_design_language: bool = True,
+    include_design_language: Optional[bool] = None,
     design_md_path: Optional[str] = None,
     current_date: Optional[str] = None,
     mode: Optional[str] = None,
@@ -175,10 +200,13 @@ def build_default_prompt(
     """Assemble the full default system prompt.
 
     Args:
-        include_design_language: Whether to search for and include design.md.
+        include_design_language: Tri-state gate for the design.md section.
+            True/False force it on/off regardless of mode; None (the default)
+            scopes it to design mode so a UI/UX design brief does not bias
+            plan/build/test output.
         design_md_path: Explicit path to design.md.
         current_date: Override for the current date string.
-        mode: Active mode (design, plan, build, test) for role-specific behavior.
+        mode: Active mode; scopes the design language when the gate is on auto.
 
     Returns:
         Complete system prompt string.
@@ -187,19 +215,10 @@ def build_default_prompt(
 
     sections = [DEFAULT_IDENTITY, ""]
 
-    # Mode-specific directive (before everything else so it sets the tone)
-    if mode:
-        directive = get_mode_directive(mode)
-        if directive:
-            sections.append(directive)
-            sections.append("")
-
-    if include_design_language:
-        design_content = _find_design_md(explicit_path=design_md_path)
-        if design_content:
-            sections.append("Design Language:")
-            sections.append(design_content.strip())
-            sections.append("")
+    design = design_language_section(include_design_language, mode, design_md_path)
+    if design:
+        sections.append(design)
+        sections.append("")
 
     sections.append(_QUALITY_GATES)
     sections.append("")

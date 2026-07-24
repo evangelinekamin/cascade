@@ -56,7 +56,7 @@ class CodeBlock(Static):
                 title=title,
                 title_align="left",
                 border_style=PALETTE.border,
-                background=PALETTE.code_bg,
+                style=f"on {PALETTE.code_bg}",
                 padding=(0, 1),
                 expand=True,
             )

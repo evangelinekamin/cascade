@@ -8,8 +8,15 @@ import httpx
 from dataclasses import replace
 from .base import BaseProvider, ProviderConfig, Message, ToolEvent, ToolEventCallback
 from ._cli_proxy import CLIProxyConfig, ClaudeEventHandler, stream_cli_proxy
+from ._openai_tools import (
+    _CHARS_PER_TOKEN,
+    _CONTEXT_BUDGET_FRACTION,
+    _KEEP_RECENT_MESSAGES,
+    _read_dedup_key,
+)
 from .registry import register_provider
 from .usage import Usage
+from ..context.budget import window_for
 
 if TYPE_CHECKING:
     from ..tools.schema import ToolDef
@@ -22,6 +29,116 @@ _NO_SAMPLING_TAGS = ("opus-4-7", "opus-4-8", "sonnet-5", "fable-5", "mythos")
 
 def _accepts_sampling(model: str) -> bool:
     return not any(tag in model for tag in _NO_SAMPLING_TAGS)
+
+
+class _AccumulatingClaudeEventHandler(ClaudeEventHandler):
+    """Sum output across ``claude -p``'s internal turns.
+
+    ``claude -p`` runs a whole agentic solve in one subprocess, emitting a
+    message_start/message_delta pair per internal turn. The base handler keeps
+    only the latest turn's usage, so an 8k-line solve reported a single turn's
+    output. Bank each finished turn: ``total_usage`` is the accumulated spend,
+    while the base ``last_usage`` stays the final-turn context anchor.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.total_usage: Optional[Usage] = None
+        self._turn_usage: Optional[Usage] = None
+
+    def on_json_event(self, event: dict) -> Iterator[tuple[str, str]]:
+        inner = event.get("event") if event.get("type") == "stream_event" else None
+        inner_type = inner.get("type") if isinstance(inner, dict) else None
+        if inner_type == "message_start":
+            self.bank_final_turn()  # a new turn begins: commit the finished one
+        yield from super().on_json_event(event)
+        # message_start seeds the turn's input; message_delta finalizes its
+        # output. The result event (which overwrites last_usage with the final
+        # turn only) is deliberately not folded in a second time.
+        if inner_type in ("message_start", "message_delta"):
+            self._turn_usage = self.last_usage
+
+    def bank_final_turn(self) -> None:
+        """Fold the in-flight turn into the accumulated total."""
+        if self._turn_usage is not None:
+            self.total_usage = (
+                self._turn_usage
+                if self.total_usage is None
+                else self.total_usage.add(self._turn_usage)
+            )
+            self._turn_usage = None
+
+
+def _estimate_anthropic_tokens(messages: list[dict]) -> int:
+    """Rough token count (~1 token / 4 chars) for Anthropic api_message dicts.
+
+    Counts string content, tool_use inputs, and tool_result content -- where
+    accumulated file reads pile up. Mirrors the OpenAI-loop estimator.
+    """
+    chars = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            chars += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                kind = block.get("type")
+                if kind == "text":
+                    chars += len(block.get("text") or "")
+                elif kind == "tool_use":
+                    chars += len(json.dumps(block.get("input") or {}, default=str))
+                elif kind == "tool_result" and isinstance(block.get("content"), str):
+                    chars += len(block["content"])
+    return chars // _CHARS_PER_TOKEN
+
+
+def _compact_anthropic_tool_results(
+    messages: list[dict], budget: int, keep_recent: int,
+) -> list[dict]:
+    """Elide old, large tool_result blocks to a stub so *messages* fits *budget*.
+
+    Only the inner content string of a tool_result is replaced -- the block, its
+    ``tool_use_id``, and every tool_use stay in place, so the Anthropic
+    tool_use/tool_result pairing contract is never broken. Protects the first
+    user turn (the task) and the most recent *keep_recent* messages. Pure:
+    returns new dicts on eviction; the input list is never mutated.
+    """
+    if _estimate_anthropic_tokens(messages) <= budget:
+        return messages
+    protected: set[int] = set()
+    for idx, message in enumerate(messages):
+        if message.get("role") == "user":
+            protected.add(idx)
+            break
+    if keep_recent > 0:
+        protected.update(range(max(0, len(messages) - keep_recent), len(messages)))
+
+    result = [dict(message) for message in messages]
+    for idx, message in enumerate(result):
+        if _estimate_anthropic_tokens(result) <= budget:
+            break
+        if idx in protected or not isinstance(message.get("content"), list):
+            continue
+        new_blocks: list = []
+        changed = False
+        for block in message["content"]:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and isinstance(block.get("content"), str)
+            ):
+                original = block["content"]
+                stub = f"[elided to fit context: tool result, {len(original)} chars]"
+                if len(stub) < len(original):
+                    new_blocks.append({**block, "content": stub})
+                    changed = True
+                    continue
+            new_blocks.append(block)
+        if changed:
+            result[idx] = {**message, "content": new_blocks}
+    return result
 
 
 @register_provider("claude")
@@ -102,7 +219,7 @@ class ClaudeProvider(BaseProvider):
         if system:
             cmd.extend(["--system-prompt", system])
 
-        handler = ClaudeEventHandler()
+        handler = _AccumulatingClaudeEventHandler()
         cfg = CLIProxyConfig(
             binary=self._claude_bin,
             cli_name="claude",
@@ -116,7 +233,13 @@ class ClaudeProvider(BaseProvider):
             yield from stream_cli_proxy(
                 cfg, handler, self._emit_activity, cancel_token,
             )
-        if handler.last_usage:
+        handler.bank_final_turn()
+        if handler.total_usage is not None:
+            # Accumulated spend across every internal turn; the base handler's
+            # last_usage is the final turn only -- the context-occupancy anchor.
+            self._last_usage = handler.total_usage
+            self._last_round_usage = handler.last_usage or handler.total_usage
+        elif handler.last_usage:
             self._last_usage = handler.last_usage
             self._last_round_usage = handler.last_usage
 
@@ -216,16 +339,38 @@ class ClaudeProvider(BaseProvider):
             }
             for td in tools.values()
         ]
+        # Prompt caching (direct API only -- the CLI proxy manages its own).
+        # Render order is tools -> system -> messages, so a breakpoint on the
+        # last tool and one on the system block cache the whole stable prefix;
+        # only the growing message tail pays full price each round.
+        if tool_defs:
+            tool_defs[-1] = {**tool_defs[-1], "cache_control": {"type": "ephemeral"}}
+        system_blocks = (
+            [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+            if system
+            else None
+        )
 
         api_messages = [
             {"role": m["role"], "content": m["content"]}
             for m in messages
         ]
         tool_log = []
+        # Bound accumulated tool results and skip re-reading a known path, as the
+        # shared OpenAI loop does -- otherwise every file read is re-sent in full
+        # on every round.
+        budget = int(
+            window_for("claude", self.config.model, self.config.context_window)
+            * _CONTEXT_BUDGET_FRACTION
+        )
+        seen_reads: set[tuple[str, str]] = set()
 
         text_parts = []
         for round_num in range(max_rounds):
             self.raise_if_cancelled()
+            api_messages = _compact_anthropic_tool_results(
+                api_messages, budget, _KEEP_RECENT_MESSAGES,
+            )
             payload = {
                 "model": self.config.model,
                 "max_tokens": self.config.max_tokens or 2048,
@@ -234,8 +379,8 @@ class ClaudeProvider(BaseProvider):
             }
             if _accepts_sampling(self.config.model):
                 payload["temperature"] = self.config.temperature
-            if system:
-                payload["system"] = system
+            if system_blocks:
+                payload["system"] = system_blocks
 
             url = f"{self.base_url}/messages"
             try:
@@ -291,10 +436,16 @@ class ClaudeProvider(BaseProvider):
                         tool_input=tool_input,
                     ))
 
-                try:
-                    result = executor.execute(tool_name, tool_input)
-                except PermissionAbort as exc:
-                    return ("".join(text_parts) + f"\n\n[stopped: {exc}]").strip(), tool_log
+                dedup_key = _read_dedup_key(tool_name, tool_input)
+                if dedup_key is not None and dedup_key in seen_reads:
+                    result = f"[already read above: {dedup_key[1]}]"
+                else:
+                    try:
+                        result = executor.execute(tool_name, tool_input)
+                    except PermissionAbort as exc:
+                        return ("".join(text_parts) + f"\n\n[stopped: {exc}]").strip(), tool_log
+                    if dedup_key is not None:
+                        seen_reads.add(dedup_key)
                 self.raise_if_cancelled()
                 tool_log.append({
                     "tool": tool_name,

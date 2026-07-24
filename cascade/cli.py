@@ -133,10 +133,11 @@ class CascadeCore:
         pipeline = PromptPipeline()
 
         if prompt_config.get("use_default_system_prompt", True):
-            default_prompt = build_default_prompt(
-                include_design_language=prompt_config.get("include_design_language", True),
-                design_md_path=prompt_config.get("design_md_path") or None,
-            )
+            # The base pipeline is mode-agnostic: design.md is mode-specific
+            # content and is injected per-request against the ACTIVE mode by the
+            # TUI assembler (a static default mode here would ride every request
+            # regardless of a later Shift+Tab).
+            default_prompt = build_default_prompt(include_design_language=False)
             pipeline = pipeline.add_layer("default", default_prompt, PRIORITY_DEFAULT)
 
         if self.project.found:

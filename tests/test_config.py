@@ -2,7 +2,16 @@
 
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
+
+from cascade.auth import DetectedCredential
 from cascade.config import ConfigManager
+
+
+def _fake_cred(provider: str, token: str) -> DetectedCredential:
+    return DetectedCredential(
+        provider=provider, source="test", token=token, email="", plan="",
+    )
 
 
 def test_config_creation():
@@ -116,7 +125,7 @@ def test_non_env_var_passthrough():
 
 
 def test_apply_credential_enables_provider():
-    """Test that apply_credential enables a provider with a token."""
+    """apply_credential enables a provider and resolves its live token read-through."""
     with tempfile.TemporaryDirectory() as tmpdir:
         config_path = Path(tmpdir) / "config.yaml"
         manager = ConfigManager(str(config_path))
@@ -124,10 +133,15 @@ def test_apply_credential_enables_provider():
         # gemini starts disabled in default config
         assert manager.get_provider_config("gemini") is None
 
-        manager.apply_credential("gemini", "ya29.test-token")
-        config = manager.get_provider_config("gemini")
+        manager.apply_credential("gemini", "fake-gemini-token")
+        # The live secret is never written to config; a sentinel is.
+        assert manager.data["providers"]["gemini"]["api_key"] == "@gemini-cli"
+
+        with patch("cascade.auth.detect_gemini",
+                   return_value=_fake_cred("gemini", "fake-gemini-token")):
+            config = manager.get_provider_config("gemini")
         assert config is not None
-        assert config.api_key == "ya29.test-token"
+        assert config.api_key == "fake-gemini-token"
         # Model comes from the default config (already set before apply_credential)
         assert config.model == "gemini-3.1-pro-preview"
 
@@ -148,29 +162,37 @@ def test_apply_credential_does_not_overwrite_existing():
 
 
 def test_apply_credential_overwrite_updates_existing():
-    """Test that apply_credential can overwrite when requested."""
+    """Overwriting a stale inlined token replaces it with the sentinel."""
     with tempfile.TemporaryDirectory() as tmpdir:
         config_path = Path(tmpdir) / "config.yaml"
         manager = ConfigManager(str(config_path))
 
         manager.data["providers"]["gemini"]["enabled"] = True
-        manager.data["providers"]["gemini"]["api_key"] = "old-token"
+        manager.data["providers"]["gemini"]["api_key"] = "old-inlined-token"
 
-        manager.apply_credential("gemini", "new-token", overwrite=True)
-        config = manager.get_provider_config("gemini")
-        assert config.api_key == "new-token"
+        manager.apply_credential("gemini", "fresh-gemini-token", overwrite=True)
+        assert manager.data["providers"]["gemini"]["api_key"] == "@gemini-cli"
+
+        with patch("cascade.auth.detect_gemini",
+                   return_value=_fake_cred("gemini", "fresh-gemini-token")):
+            config = manager.get_provider_config("gemini")
+        assert config.api_key == "fresh-gemini-token"
 
 
 def test_apply_credential_new_provider():
-    """Test that apply_credential works for a provider not in default config."""
+    """apply_credential works for a provider not in default config."""
     with tempfile.TemporaryDirectory() as tmpdir:
         config_path = Path(tmpdir) / "config.yaml"
         manager = ConfigManager(str(config_path))
 
-        manager.apply_credential("openai", "sk-test-token")
-        config = manager.get_provider_config("openai")
+        manager.apply_credential("openai", "fake-openai-token")
+        assert manager.data["providers"]["openai"]["api_key"] == "@codex-cli"
+
+        with patch("cascade.auth.detect_codex",
+                   return_value=_fake_cred("openai", "fake-openai-token")):
+            config = manager.get_provider_config("openai")
         assert config is not None
-        assert config.api_key == "sk-test-token"
+        assert config.api_key == "fake-openai-token"
 
 
 def test_get_provider_config_allows_keyless_when_requires_key_false():
@@ -213,7 +235,8 @@ def test_provider_config_context_window_defaults_to_none():
         config_path = Path(tmpdir) / "config.yaml"
         manager = ConfigManager(str(config_path))
 
-        manager.apply_credential("openai", "sk-test-token")
+        manager.data["providers"]["openai"]["enabled"] = True
+        manager.data["providers"]["openai"]["api_key"] = "literal-key"
         config = manager.get_provider_config("openai")
         assert config.context_window is None
 
@@ -291,7 +314,8 @@ def test_provider_config_defaults_provider_preferences_to_none():
         config_path = Path(tmpdir) / "config.yaml"
         manager = ConfigManager(str(config_path))
 
-        manager.apply_credential("openai", "sk-test-token")
+        manager.data["providers"]["openai"]["enabled"] = True
+        manager.data["providers"]["openai"]["api_key"] = "literal-key"
         config = manager.get_provider_config("openai")
         assert config.provider_preferences is None
 

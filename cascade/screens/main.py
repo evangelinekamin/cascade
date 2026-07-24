@@ -20,11 +20,13 @@ from ..episodes import generate_episode
 from ..providers.base import ToolEvent
 from ..providers.usage import Usage
 from ..widgets.header import WelcomeHeader, ProviderGhostTable
-from ..widgets.message import ChatHistory, MessageWidget, ThinkingIndicator
+from ..widgets.message import (
+    ChatHistory, MessageWidget, TurnIndicator, QueuePreview,
+)
 from ..widgets.input_frame import InputFrame, ChatTextArea
 from ..widgets.status_bar import StatusBar
 from ..widgets.stream_message import StreamMessage
-from ..widgets.tool_call import ToolCallWidget, render_tool_widget
+from ..widgets.tool_call import ToolCallWidget, render_tool_widget, append_tool_activity
 from ..theme import PALETTE, MODE_CYCLE, MODES, get_provider_theme
 from ..commands import CommandHandler
 from ..hooks import HookContext, HookEvent
@@ -89,7 +91,8 @@ class MainScreen(Screen):
         self._summary_failures = 0
         self._header_visible = True
         self._cmd_handler: CommandHandler | None = None
-        self._thinking: ThinkingIndicator | None = None
+        # The persistent, bottom-anchored turn indicator (resolved on mount).
+        self._thinking: TurnIndicator | None = None
         self._exit_hook_fired = False
         self._activity_timer = None
         self._activity_provider = None
@@ -162,6 +165,7 @@ class MainScreen(Screen):
         # Discard queued type-ahead prompts: cancelling means "stop", not
         # "run the next thing I typed".
         self._queued_prompts.clear()
+        self._refresh_queue_preview()
         try:
             self.workers.cancel_all()
         except Exception:
@@ -176,8 +180,7 @@ class MainScreen(Screen):
         """Return the input/UI to idle without recording an assistant response."""
         self._stop_activity_poll()
         if self._thinking:
-            self._thinking.remove()
-            self._thinking = None
+            self._thinking.stop()
         self.app.state.set_thinking(self._active_provider, False)
         self._set_input_locked(False)
         stream = getattr(self, "_stream_msg", None)
@@ -253,6 +256,10 @@ class MainScreen(Screen):
             id="welcome_header",
         )
         yield ChatHistory()
+        # Both sit in the flow between the 1fr transcript and the docked input
+        # frame, so they pin just above it and collapse to nothing when idle.
+        yield TurnIndicator(id="turn_indicator")
+        yield QueuePreview(id="queue_preview")
         yield InputFrame(
             active_provider=self._active_provider,
             mode=self._mode,
@@ -264,6 +271,10 @@ class MainScreen(Screen):
     def on_mount(self) -> None:
         try:
             self.query_one("#main_input").focus()
+        except Exception:
+            pass
+        try:
+            self._thinking = self.query_one(TurnIndicator)
         except Exception:
             pass
         self._cmd_handler = CommandHandler(self.app)
@@ -314,6 +325,7 @@ class MainScreen(Screen):
                     self._cmd_handler.handle(prompt)
                     return
             self._queued_prompts.append(prompt)
+            self._refresh_queue_preview()
             depth = len(self._queued_prompts)
             self.app.notify(
                 f"Queued ({depth} pending) — runs after the current work."
@@ -386,10 +398,9 @@ class MainScreen(Screen):
         chat = self.query_one(ChatHistory)
         self._set_input_locked(True)
 
-        # Show thinking spinner
-        self._thinking = ThinkingIndicator(self._active_provider)
-        chat.mount(self._thinking)
-        self._scroll_chat_end(chat, force=True)
+        # Reveal the bottom-anchored turn indicator (stays visible all turn).
+        if self._thinking is not None:
+            self._thinking.start(self._active_provider)
         self.app.state.set_thinking(self._active_provider, True)
 
         # Mount a StreamMessage that will accumulate chunks
@@ -438,12 +449,24 @@ class MainScreen(Screen):
         """
         pipeline = cli_app.prompt_pipeline
         from ..prompts.layers import PRIORITY_MODE, PRIORITY_REPL_CONTEXT
-        from ..prompts.default import get_mode_directive
+        from ..prompts.default import get_mode_directive, design_language_section
 
         # Inject mode-specific directive
         directive = get_mode_directive(self._mode)
         if directive:
             pipeline = pipeline.add_layer("mode_directive", directive, PRIORITY_MODE)
+
+        # Design language rides only where relevant (design mode, or forced by
+        # config), scoped to the ACTIVE mode -- not baked into the base prompt,
+        # where it would bias plan/build/test on every request.
+        prompt_cfg = cli_app.config.get_prompt_config()
+        design = design_language_section(
+            prompt_cfg.get("include_design_language"),
+            self._mode,
+            prompt_cfg.get("design_md_path") or None,
+        )
+        if design:
+            pipeline = pipeline.add_layer("design_language", design, PRIORITY_MODE)
 
         if cli_app.context_builder.source_count > 0:
             upload_ctx = cli_app.context_builder.build()
@@ -1198,9 +1221,12 @@ class MainScreen(Screen):
                 self._thinking.set_label(f"{event.tool_name} done")
             chat = self.query_one(ChatHistory)
             follow = self._should_follow_chat(chat)
-            chat.mount(render_tool_widget(
-                event.tool_name, event.tool_input, event.tool_output,
-            ))
+            # Plain successes fold into a bounded, self-scrolling activity box
+            # so a 30-tool turn stays a small region; writes/edits/failures
+            # still mount as standalone always-visible blocks.
+            append_tool_activity(
+                chat, event.tool_name, event.tool_input, event.tool_output,
+            )
             if follow:
                 self._scroll_chat_end(chat, force=True)
 
@@ -1217,8 +1243,7 @@ class MainScreen(Screen):
 
         # Remove thinking indicator
         if self._thinking:
-            self._thinking.remove()
-            self._thinking = None
+            self._thinking.stop()
         self.app.state.set_thinking(provider, False)
         self._set_input_locked(False)
 
@@ -1271,8 +1296,7 @@ class MainScreen(Screen):
 
         # Remove thinking indicator
         if self._thinking:
-            self._thinking.remove()
-            self._thinking = None
+            self._thinking.stop()
         self.app.state.set_thinking(provider, False)
         self._set_input_locked(False)
 
@@ -1308,8 +1332,7 @@ class MainScreen(Screen):
         self._stop_activity_poll()
 
         if self._thinking:
-            self._thinking.remove()
-            self._thinking = None
+            self._thinking.stop()
         self.app.state.set_thinking(self._active_provider, False)
         self._set_input_locked(False)
 
@@ -1624,7 +1647,26 @@ class MainScreen(Screen):
         if self._is_busy() or not self._queued_prompts:
             return
         prompt = self._queued_prompts.popleft()
+        self._refresh_queue_preview()
         self._dispatch_prompt(prompt)
+
+    def _refresh_queue_preview(self) -> None:
+        """Mirror the type-ahead deque into its preview widget."""
+        try:
+            preview = self.query_one(QueuePreview)
+        except Exception:
+            return
+        preview.refresh_queue(list(self._queued_prompts))
+
+    def on_queue_preview_retract_requested(
+        self, event: QueuePreview.RetractRequested,
+    ) -> None:
+        """Drop a queued prompt the user clicked, before it is dispatched."""
+        event.stop()
+        if 0 <= event.index < len(self._queued_prompts):
+            del self._queued_prompts[event.index]
+            self._refresh_queue_preview()
+            self.app.notify("Retracted a queued prompt.")
 
     @staticmethod
     def _should_follow_chat(chat: ChatHistory, threshold: float = 2.0) -> bool:

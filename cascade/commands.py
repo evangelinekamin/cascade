@@ -99,8 +99,8 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("clear", "/clear", "Clear chat history from screen"),
     CommandDef("compact", "/compact", "Compact conversation memory now"),
     CommandDef("permissions", "/permissions [posture <p>]", "Permission posture + audit trail"),
-    CommandDef("history", "/history [limit]", "List recent chat sessions"),
-    CommandDef("resume", "/resume <id>", "Resume a previous session"),
+    CommandDef("history", "/history [limit]", "List this directory's recent sessions"),
+    CommandDef("resume", "/resume [id]", "Resume a session (opens a picker if no id)"),
     CommandDef("export", "/export [id]", "Export session messages to a file"),
     CommandDef("solve", "/solve <task>", "Code a task in an isolated worktree, verified by tests"),
     CommandDef("apply", "/apply", "Land the last passing /solve's changes on your working tree"),
@@ -1500,8 +1500,12 @@ class CommandHandler:
     # History / Resume / Export
     # ------------------------------------------------------------------
 
+    def _current_cwd(self) -> str:
+        """The directory the current session belongs to, for dir-scoped lists."""
+        return str(getattr(getattr(self.app, "state", None), "cwd", "") or "")
+
     def _cmd_history(self, args: list[str]) -> None:
-        """List recent chat sessions."""
+        """List this directory's recent chat sessions."""
         limit = 10
         if args:
             try:
@@ -1509,19 +1513,20 @@ class CommandHandler:
             except ValueError:
                 pass
 
-        sessions = self.app.db.list_sessions(limit=limit)
+        sessions = self.app.db.list_sessions_for_cwd(self._current_cwd(), limit=limit)
         if not sessions:
-            self._post_system("No sessions found.")
+            self._post_system("No sessions found for this directory.")
             return
 
-        lines = ["Recent sessions:"]
+        lines = ["Recent sessions in this directory:"]
         for s in sessions:
-            title = s.get("title", "(untitled)")[:40] or "(untitled)"
+            title = (s.get("title") or "")[:40] or "(untitled)"
             created = s.get("created_at", "")[:16]
+            count = int(s.get("message_count") or 0)
             sid = s["id"]
-            lines.append(f"  {sid}  {created}  {title}")
+            lines.append(f"  {sid}  {created}  {title}  ({count} msgs)")
         lines.append("")
-        lines.append("Use /resume <id> to continue a session.")
+        lines.append("Use /resume for a picker, or /resume <id> to jump directly.")
         self._post_system("\n".join(lines))
 
     def _restore_compaction_coverage(self, boundary: str, count: int) -> None:
@@ -1552,13 +1557,29 @@ class CommandHandler:
                 m.metadata["compacted"] = True
                 flagged += 1
 
-    def _cmd_resume(self, args: list[str]) -> None:
-        """Resume a previous session by loading its messages."""
-        if not args:
-            self._post_system("Usage: /resume <session_id>")
+    def _open_resume_picker(self) -> None:
+        """Open the recent-sessions picker for this directory (no id needed)."""
+        sessions = self.app.db.list_sessions_for_cwd(self._current_cwd(), limit=20)
+        if not sessions:
+            self._post_system("No sessions to resume in this directory.")
             return
+        from .screens.session_picker import SessionPickerScreen
 
-        session_id = args[0]
+        def _on_pick(session_id: "str | None") -> None:
+            if session_id:
+                self._resume_session_id(session_id)
+
+        self.app.push_screen(SessionPickerScreen(sessions), _on_pick)
+
+    def _cmd_resume(self, args: list[str]) -> None:
+        """Resume a session: /resume opens a picker, /resume <id> jumps directly."""
+        if not args:
+            self._open_resume_picker()
+            return
+        self._resume_session_id(args[0])
+
+    def _resume_session_id(self, session_id: str) -> None:
+        """Resume a previous session by loading its messages."""
         session = self.app.db.get_session(session_id)
         if session is None:
             self._post_system(f"Session '{session_id}' not found.")

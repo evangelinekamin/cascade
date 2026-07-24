@@ -12,11 +12,94 @@ import shutil
 import httpx
 from .base import BaseProvider, ProviderConfig, Message, ToolEvent, ToolEventCallback
 from ._cli_proxy import CLIProxyConfig, GeminiEventHandler, stream_cli_proxy
+from ._openai_tools import (
+    _CHARS_PER_TOKEN,
+    _CONTEXT_BUDGET_FRACTION,
+    _KEEP_RECENT_MESSAGES,
+    _read_dedup_key,
+)
 from .registry import register_provider
 from .usage import Usage
+from ..context.budget import window_for
 
 if TYPE_CHECKING:
     from ..tools.schema import ToolDef
+
+
+def _estimate_gemini_tokens(contents: list[dict]) -> int:
+    """Rough token count (~1 token / 4 chars) for Gemini contents dicts.
+
+    Counts part text, functionCall args, and functionResponse results -- where
+    accumulated file reads pile up. Mirrors the OpenAI-loop estimator.
+    """
+    chars = 0
+    for entry in contents:
+        for part in entry.get("parts") or ():
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str):
+                chars += len(text)
+            call = part.get("functionCall")
+            if isinstance(call, dict):
+                chars += len(json.dumps(call.get("args") or {}, default=str))
+            response = part.get("functionResponse")
+            if isinstance(response, dict):
+                result = response.get("response", {}).get("result")
+                if isinstance(result, str):
+                    chars += len(result)
+    return chars // _CHARS_PER_TOKEN
+
+
+def _compact_gemini_tool_results(
+    contents: list[dict], budget: int, keep_recent: int,
+) -> list[dict]:
+    """Elide old, large functionResponse results to a stub within *budget*.
+
+    Only the inner result string is replaced; the functionResponse part and its
+    ``name`` stay, so the model still sees which call each response answers.
+    Protects the first turn and the most recent *keep_recent* entries. Pure:
+    returns new dicts on eviction; the input list is never mutated.
+    """
+    if _estimate_gemini_tokens(contents) <= budget:
+        return contents
+    protected: set[int] = set()
+    for idx, entry in enumerate(contents):
+        if entry.get("role") == "user":
+            protected.add(idx)
+            break
+    if keep_recent > 0:
+        protected.update(range(max(0, len(contents) - keep_recent), len(contents)))
+
+    result = [dict(entry) for entry in contents]
+    for idx, entry in enumerate(result):
+        if _estimate_gemini_tokens(result) <= budget:
+            break
+        if idx in protected or not isinstance(entry.get("parts"), list):
+            continue
+        new_parts: list = []
+        changed = False
+        for part in entry["parts"]:
+            response = part.get("functionResponse") if isinstance(part, dict) else None
+            inner = (
+                response.get("response", {}).get("result")
+                if isinstance(response, dict)
+                else None
+            )
+            if isinstance(inner, str):
+                stub = f"[elided to fit context: tool result, {len(inner)} chars]"
+                if len(stub) < len(inner):
+                    merged = {
+                        **response,
+                        "response": {**response.get("response", {}), "result": stub},
+                    }
+                    new_parts.append({**part, "functionResponse": merged})
+                    changed = True
+                    continue
+            new_parts.append(part)
+        if changed:
+            result[idx] = {**entry, "parts": new_parts}
+    return result
 
 
 @register_provider("gemini")
@@ -250,10 +333,21 @@ class GeminiProvider(BaseProvider):
 
         tool_log = []
         headers, params = self._auth_params()
+        # Bound accumulated tool results and skip re-reading a known path, as the
+        # shared OpenAI loop does -- otherwise every file read is re-sent in full
+        # on every round.
+        budget = int(
+            window_for("gemini", self.config.model, self.config.context_window)
+            * _CONTEXT_BUDGET_FRACTION
+        )
+        seen_reads: set[tuple[str, str]] = set()
 
         text_parts = []
         for round_num in range(max_rounds):
             self.raise_if_cancelled()
+            contents = _compact_gemini_tool_results(
+                contents, budget, _KEEP_RECENT_MESSAGES,
+            )
             url = f"{self.base_url}/{self.config.model}:generateContent"
             payload = {
                 "contents": contents,
@@ -319,10 +413,16 @@ class GeminiProvider(BaseProvider):
                         tool_input=tool_args,
                     ))
 
-                try:
-                    result = executor.execute(tool_name, tool_args)
-                except PermissionAbort as exc:
-                    return ("".join(text_parts) + f"\n\n[stopped: {exc}]").strip(), tool_log
+                dedup_key = _read_dedup_key(tool_name, tool_args)
+                if dedup_key is not None and dedup_key in seen_reads:
+                    result = f"[already read above: {dedup_key[1]}]"
+                else:
+                    try:
+                        result = executor.execute(tool_name, tool_args)
+                    except PermissionAbort as exc:
+                        return ("".join(text_parts) + f"\n\n[stopped: {exc}]").strip(), tool_log
+                    if dedup_key is not None:
+                        seen_reads.add(dedup_key)
                 self.raise_if_cancelled()
                 tool_log.append({
                     "tool": tool_name,

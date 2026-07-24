@@ -14,7 +14,7 @@ from rich.cells import cell_len
 from rich.text import Text
 from textual import events
 from textual.message import Message
-from textual.containers import VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.widget import Widget
 from textual.app import ComposeResult
 from textual.widgets import Static
@@ -575,3 +575,138 @@ class ThinkingIndicator(Static):
         else:
             t.append(f" {label}", style=f"dim {PALETTE.text_dim}")
         return t
+
+
+class TurnIndicator(ThinkingIndicator):
+    """Turn status pinned just above the input frame for the whole turn.
+
+    ThinkingIndicator mounts inline in the transcript, so on a long turn it
+    scrolls off the top and stops being useful. This one lives in the screen's
+    flow between the transcript and the input frame -- the 1fr transcript keeps
+    it docked at the bottom -- so the spinner, activity text and elapsed clock
+    stay visible until the turn ends, then it collapses to nothing. Reuses the
+    parent's spinner rendering; start()/stop() own the spinner timer instead of
+    mount/unmount, because the widget outlives any single turn.
+    """
+
+    DEFAULT_CSS = """
+    TurnIndicator {
+        display: none;
+        height: 1;
+        width: 100%;
+        padding: 0 0 0 12;
+    }
+    TurnIndicator.active {
+        display: block;
+    }
+    """
+
+    def on_mount(self) -> None:
+        # Persistent: the parent auto-starts its spinner on mount, but this one
+        # must stay collapsed until a turn begins. start()/stop() drive it.
+        pass
+
+    def start(self, provider: str, label: str = "thinking...") -> None:
+        """Reveal the indicator for a new turn and run the spinner."""
+        self._provider = provider
+        self._label = label
+        self._idx = 0
+        self._started_at = time.monotonic()
+        self.add_class("active")
+        if self._timer is None:
+            self._timer = self.set_interval(0.1, self._tick)
+        self.refresh()
+
+    def stop(self) -> None:
+        """Collapse to nothing and halt the spinner."""
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+        self.remove_class("active")
+
+    @property
+    def active(self) -> bool:
+        return self.has_class("active")
+
+
+def summarize_queued_prompt(prompt: str, width: int = 56) -> str:
+    """One-line, length-capped preview of a queued prompt."""
+    body = prompt.strip()
+    line = body.splitlines()[0] if body else ""
+    extra = body.count("\n")
+    if len(line) > width:
+        line = line[: width - 1].rstrip() + "…"
+    if extra:
+        line = f"{line} (+{extra} lines)"
+    return line
+
+
+class QueuePreview(Vertical):
+    """Pending type-ahead prompts, shown just above the input frame.
+
+    Collapses to nothing when the queue is empty. Holds no queue state of its
+    own: the screen owns the FIFO deque and calls refresh_queue() from every
+    site that mutates it (enqueue, drain, interrupt-clear, retract). Each row
+    is clickable to retract that prompt before it runs.
+    """
+
+    class RetractRequested(Message):
+        """A queued prompt should be dropped before it is dispatched."""
+
+        def __init__(self, index: int) -> None:
+            super().__init__()
+            self.index = index
+
+    DEFAULT_CSS = """
+    QueuePreview {
+        display: none;
+        height: auto;
+        width: 100%;
+        padding: 0;
+    }
+    QueuePreview.has-items {
+        display: block;
+    }
+    """
+
+    def refresh_queue(self, prompts: list[str]) -> None:
+        """Rebuild the rows from the current queue contents."""
+        self.remove_children()
+        if prompts:
+            self.add_class("has-items")
+            self.mount_all([QueuedPromptRow(i, p) for i, p in enumerate(prompts)])
+        else:
+            self.remove_class("has-items")
+
+
+class QueuedPromptRow(Static):
+    """A single queued prompt; click it to retract it before it runs."""
+
+    DEFAULT_CSS = """
+    QueuedPromptRow {
+        height: 1;
+        width: 100%;
+        padding: 0 0 0 12;
+    }
+    QueuedPromptRow:hover {
+        background: #161b22;
+    }
+    """
+
+    def __init__(self, index: int, prompt: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._index = index
+        self._prompt = prompt
+
+    def render(self) -> Text:
+        t = Text()
+        t.append("× ", style=PALETTE.text_dim)  # retract affordance
+        t.append(summarize_queued_prompt(self._prompt), style=f"dim {PALETTE.text_dim}")
+        t.append("  queued", style=f"dim {PALETTE.text_muted}")
+        return t
+
+    def on_click(self, event: events.Click) -> None:
+        event.stop()
+        # Index is fresh: the screen rebuilds the whole preview on every queue
+        # mutation, so the row's index always matches the live deque.
+        self.post_message(QueuePreview.RetractRequested(self._index))

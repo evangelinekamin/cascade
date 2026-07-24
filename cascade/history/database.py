@@ -6,6 +6,7 @@ Schema:
 """
 
 import json
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -19,7 +20,7 @@ from ..episodes import Episode
 _DEFAULT_DB_PATH = "~/.config/cascade/history.db"
 
 # Bumped when _migrate() gains a new step. Guarded by PRAGMA user_version.
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 class HistoryDB:
@@ -101,6 +102,20 @@ class HistoryDB:
                     compaction_count    INTEGER NOT NULL DEFAULT 0
                 );
             """)
+            # Each step stamps its OWN version so the chain stays crash-safe
+            # and idempotent as later steps are appended (never the moving
+            # _SCHEMA_VERSION, which would mark a DB current mid-migration).
+            self._conn.execute("PRAGMA user_version = 2")
+            self._conn.commit()
+            version = 2
+        if version < 3:
+            # /resume filters recent chats to the directory they happened in.
+            # Added via ALTER (not _create_tables) so a fresh DB and an
+            # upgraded one converge on one schema through the same path;
+            # existing rows backfill to '' -- treated as unknown/any-dir.
+            self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN cwd TEXT NOT NULL DEFAULT ''"
+            )
             self._conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
             self._conn.commit()
 
@@ -125,9 +140,16 @@ class HistoryDB:
         title: str = "",
         metadata: Optional[dict] = None,
         session_id: Optional[str] = None,
+        cwd: Optional[str] = None,
     ) -> dict:
-        """Create a new conversation session. Returns the session dict."""
+        """Create a new conversation session. Returns the session dict.
+
+        ``cwd`` records the directory the chat happened in so /resume can
+        show only this project's recent sessions. Omitted -> the current
+        process directory; explicit '' -> unknown (reachable from any dir).
+        """
         now = datetime.now(timezone.utc).isoformat()
+        resolved_cwd = os.getcwd() if cwd is None else cwd
         if session_id:
             exists = self._conn.execute(
                 "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
@@ -141,13 +163,14 @@ class HistoryDB:
             "title": title,
             "provider": provider,
             "model": model,
+            "cwd": resolved_cwd,
             "created_at": now,
             "updated_at": now,
             "metadata": json.dumps(metadata or {}),
         }
         self._conn.execute(
-            "INSERT INTO sessions (id, title, provider, model, created_at, updated_at, metadata) "
-            "VALUES (:id, :title, :provider, :model, :created_at, :updated_at, :metadata)",
+            "INSERT INTO sessions (id, title, provider, model, cwd, created_at, updated_at, metadata) "
+            "VALUES (:id, :title, :provider, :model, :cwd, :created_at, :updated_at, :metadata)",
             row,
         )
         self._conn.commit()
@@ -158,6 +181,22 @@ class HistoryDB:
         rows = self._conn.execute(
             "SELECT * FROM sessions ORDER BY updated_at DESC LIMIT ? OFFSET ?",
             (limit, offset),
+        ).fetchall()
+        return [self._row_to_session(r) for r in rows]
+
+    def list_sessions_for_cwd(self, cwd: str, limit: int = 20) -> list[dict]:
+        """Recent sessions for a directory, newest first, with message_count.
+
+        Unknown-directory sessions (cwd '') are always included so
+        pre-migration rows stay reachable from any directory instead of being
+        stranded. Each returned dict carries a ``message_count`` for the picker.
+        """
+        rows = self._conn.execute(
+            "SELECT s.*, "
+            "(SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count "
+            "FROM sessions s WHERE s.cwd = ? OR s.cwd = '' "
+            "ORDER BY s.updated_at DESC LIMIT ?",
+            (cwd, limit),
         ).fetchall()
         return [self._row_to_session(r) for r in rows]
 

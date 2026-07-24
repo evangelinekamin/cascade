@@ -39,6 +39,9 @@ class _Config:
     def get_orchestration_config(self):
         return self.orchestration
 
+    def get_prompt_config(self):
+        return {}
+
     def get_escalation_target(self, _provider):
         return None
 
