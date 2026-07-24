@@ -121,20 +121,9 @@ def _find_project_config(start: Optional[str] = None) -> Optional[Path]:
     return None
 
 
-def _project_verify_test() -> Optional[str]:
-    """Read the verify/test command from a project-local .cascade.yml, if any.
-
-    Accepts either the global-config shape (``workflows.verify.test``) or a
-    terser top-level ``verify.test``.
-    """
-    path = _find_project_config()
-    if path is None:
-        return None
-    try:
-        import yaml
-
-        data = yaml.safe_load(path.read_text()) or {}
-    except Exception:
+def _verify_test_from(data: dict) -> Optional[str]:
+    """Pull ``workflows.verify.test`` or a terser ``verify.test`` from a doc."""
+    if not isinstance(data, dict):
         return None
     workflows = data.get("workflows", {})
     nested = workflows.get("verify", {}) if isinstance(workflows, dict) else {}
@@ -146,21 +135,107 @@ def _project_verify_test() -> Optional[str]:
     return None
 
 
-def _test_command(app) -> str:
+def _project_verify_test(start: Optional[str] = None) -> Optional[str]:
+    """Read the verify/test command from a project-local config, if any.
+
+    Checks both a top-level ``.cascade.yml`` and the ``.cascade/agents.yaml``
+    that ``/init`` writes -- previously only the former was consulted, so an
+    ``/init``-scaffolded verify command was silently ignored.
+    """
+    import yaml
+
+    root = Path(start or os.getcwd()).resolve()
+    candidates = [_find_project_config(str(root))]
+    for directory in (root, *root.parents):
+        candidates.append(directory / ".cascade" / "agents.yaml")
+        if (directory / ".git").exists():
+            break
+    for path in candidates:
+        if path is None or not path.is_file():
+            continue
+        try:
+            data = yaml.safe_load(path.read_text()) or {}
+        except Exception:
+            continue
+        test = _verify_test_from(data)
+        if test:
+            return test
+    return None
+
+
+# Ecosystem -> default verify command, chosen from the project's manifests so a
+# Node repo never inherits a python runner (and vice-versa). A greenfield TS
+# project with no test script still gets a meaningful gate: does it typecheck?
+def _detect_test_command(root: Path) -> Optional[str]:
+    """Best-effort verify command for the project's ecosystem, or None."""
+    pkg = root / "package.json"
+    if pkg.is_file():
+        try:
+            import json
+
+            scripts = json.loads(pkg.read_text()).get("scripts", {})
+        except Exception:
+            scripts = {}
+        if isinstance(scripts, dict) and str(scripts.get("test", "")).strip():
+            return "npm test"
+        if (root / "tsconfig.json").is_file():
+            return "npx tsc --noEmit"
+        return "npm test"
+    if (root / "Cargo.toml").is_file():
+        return "cargo test"
+    if (root / "go.mod").is_file():
+        return "go test ./..."
+    if any((root / f).is_file() for f in ("pyproject.toml", "setup.py", "setup.cfg")):
+        return "python -m pytest -x -q"
+    return None
+
+
+def _command_ecosystem(cmd: str) -> str:
+    c = (cmd or "").lower()
+    if any(k in c for k in ("pytest", "python", "uv ", "tox", "nox", "unittest")):
+        return "python"
+    if any(k in c for k in ("npm", "pnpm", "yarn", "vitest", "jest", "tsc", "bun", "node")):
+        return "node"
+    if "cargo" in c:
+        return "rust"
+    if "go test" in c:
+        return "go"
+    return ""
+
+
+def _test_command(app, root: Optional[Path] = None) -> str:
     """Resolve the verify/test command.
 
-    Project-local ``.cascade.yml`` wins over the global config, which wins over
-    the built-in default -- so a repo can pin its own runner (e.g. ``uv run
-    pytest``) without changing the user's global settings.
+    Precedence: an explicit project-local config (``.cascade.yml`` or
+    ``.cascade/agents.yaml``) always wins. Otherwise the project's detected
+    ecosystem decides -- and a globally-configured command is honored only when
+    it matches that ecosystem (so a custom ``uv run pytest`` survives on a
+    python repo, but a python default never runs on a Node repo). The built-in
+    default is the last resort.
     """
-    project = _project_verify_test()
+    project = _project_verify_test(str(root) if root else None)
     if project:
         return project
+
     try:
-        verify = app.config.data.get("workflows", {}).get("verify", {})
-        return verify.get("test") or DEFAULT_TEST_CMD
+        configured = (
+            app.config.data.get("workflows", {}).get("verify", {}).get("test") or ""
+        ).strip()
     except Exception:
-        return DEFAULT_TEST_CMD
+        configured = ""
+
+    detected = _detect_test_command(root or Path(os.getcwd()))
+    if configured:
+        # Override a global command ONLY on a proven cross-ecosystem mismatch
+        # (e.g. python default vs a Node repo). A custom/unrecognized command
+        # -- make test, ./run.sh, a stub -- is respected, since an unknown
+        # ecosystem is not proof it's wrong for this project.
+        eco_c = _command_ecosystem(configured)
+        eco_d = _command_ecosystem(detected) if detected else ""
+        if detected and eco_c and eco_d and eco_c != eco_d:
+            return detected
+        return configured
+    return detected or DEFAULT_TEST_CMD
 
 
 # --- Anti-proxy verification classifier -----------------------------------------

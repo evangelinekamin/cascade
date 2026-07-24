@@ -4,12 +4,54 @@ Creates the directory structure and writes template files based on
 the detected or chosen project type.
 """
 
+import subprocess
 from pathlib import Path
 from typing import Callable, Optional
 
 import yaml
 
 from .templates import get_template
+
+
+def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], cwd=str(cwd),
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+def _ensure_git_repo(path: Path) -> list[str]:
+    """Init a git repo with a first commit so /solve can branch worktrees.
+
+    No-op if already a repo. Sets a repo-local identity only when git has no
+    global one (so the initial commit can't fail with 'identity unknown'),
+    and respects .gitignore via ``git add -A``. Returns progress lines.
+    """
+    if (path / ".git").exists():
+        return ["  skipped: git repo (already initialized)"]
+    try:
+        init = _run_git(["init", "-b", "main"], path)
+        if init.returncode != 0:  # older git without -b
+            _run_git(["init"], path)
+            _run_git(["checkout", "-B", "main"], path)
+
+        who = _run_git(["config", "user.email"], path)
+        if not who.stdout.strip():
+            _run_git(["config", "--local", "user.email", "cascade@localhost"], path)
+            _run_git(["config", "--local", "user.name", "Cascade"], path)
+
+        _run_git(["add", "-A"], path)
+        commit = _run_git(
+            ["commit", "-m", "chore: initial commit (cascade init)"], path,
+        )
+        if commit.returncode == 0:
+            return ["  created: git repo (main) + initial commit"]
+        # Nothing to commit (empty dir): still leave an empty root commit so
+        # worktree lanes have a HEAD to branch from.
+        _run_git(["commit", "--allow-empty", "-m", "chore: cascade init"], path)
+        return ["  created: git repo (main), empty initial commit"]
+    except (FileNotFoundError, subprocess.SubprocessError) as exc:
+        return [f"  skipped: git init failed ({exc})"]
 
 
 def run_init(
@@ -20,6 +62,7 @@ def run_init(
     enable_system_prompt: bool = True,
     enable_agents: bool = True,
     enable_context: bool = True,
+    init_git: bool = True,
 ) -> str:
     """Scaffold a .cascade/ project directory.
 
@@ -96,11 +139,20 @@ def run_init(
             created.append("context/")
             _log("  created: context/")
 
+    # Git repo: /solve and the other worktree lanes need a HEAD to branch from,
+    # so a fresh project is made into a committed repo here (opt-out via flag).
+    git_lines: list[str] = []
+    if init_git:
+        git_lines = _ensure_git_repo(path)
+        for line in git_lines:
+            _log(line)
+
     # Build summary
     lines = [f"Initialized .cascade/ for '{project_type}' project"]
     if created:
         lines.append(f"  created: {', '.join(created)}")
     if skipped:
         lines.append(f"  skipped: {', '.join(skipped)}")
+    lines.extend(git_lines)
 
     return "\n".join(lines)
