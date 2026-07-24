@@ -720,8 +720,8 @@ class MainScreen(Screen):
             # Orchestration ran in lane clones; the base provider's anchor
             # is stale for this turn. Honest display: unknown until the
             # next direct response.
-            _call(self.app.state.set_context_anchor, None)
-            _call(self._refresh_context_display)
+            self._emit_for_run(run, self.app.state.set_context_anchor, None)
+            self._emit_for_run(run, self._refresh_context_display)
             total_tokens = result.input_tokens + result.output_tokens
             episode = generate_episode(
                 user_content=prompt,
@@ -833,7 +833,7 @@ class MainScreen(Screen):
                 ),
             )
 
-            _call(self.app.state.set_context_anchor, prov.last_round_usage)
+            self._emit_for_run(run, self.app.state.set_context_anchor, prov.last_round_usage)
             live_run.finish(RunOutcome.SUCCEEDED)
             self._emit_for_run(
                 run,
@@ -974,7 +974,7 @@ class MainScreen(Screen):
                 ),
             )
 
-            _call(self.app.state.set_context_anchor, prov.last_round_usage)
+            self._emit_for_run(run, self.app.state.set_context_anchor, prov.last_round_usage)
             live_run.finish(RunOutcome.SUCCEEDED)
             self._emit_for_run(
                 run,

@@ -82,8 +82,8 @@ class DiffBlock(Static):
             title_align="left",
             subtitle=subtitle,
             subtitle_align="right",
-            border_style=f"{PALETTE.amber} 40%",
-            background=PALETTE.code_bg,
+            border_style=f"dim {PALETTE.amber}",
+            style=f"on {PALETTE.code_bg}",
             padding=(0, 1),
             expand=True,
         )
@@ -140,8 +140,8 @@ class WriteBlock(Static):
             title_align="left",
             subtitle=subtitle,
             subtitle_align="right",
-            border_style=f"{PALETTE.amber} 40%",
-            background=PALETTE.code_bg,
+            border_style=f"dim {PALETTE.amber}",
+            style=f"on {PALETTE.code_bg}",
             padding=(0, 1),
             expand=True,
         )
