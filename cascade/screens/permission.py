@@ -62,7 +62,7 @@ class PermissionScreen(ModalScreen[str]):
             if isinstance(value, str) and value:
                 shown = value if len(value) <= 200 else value[:200] + "…"
                 detail.append(f"{key}: ", style=f"dim {PALETTE.text_dim}")
-                detail.append(shown, style=PALETTE.text)
+                detail.append(shown, style=PALETTE.text_primary)
                 break
 
         reason = Text(self._reason, style=f"dim {PALETTE.text_dim}")
