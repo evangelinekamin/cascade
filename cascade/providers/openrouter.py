@@ -244,6 +244,7 @@ class OpenRouterProvider(BaseProvider):
         system: Optional[str] = None,
         max_rounds: int = 5,
         on_tool_event: ToolEventCallback = None,
+        on_pending_message=None,
     ) -> tuple[str, list[dict]]:
         """OpenAI-compatible tool calling via OpenRouter."""
         self._last_usage = None
@@ -261,6 +262,7 @@ class OpenRouterProvider(BaseProvider):
                 system=system,
                 max_rounds=max_rounds,
                 on_tool_event=on_tool_event,
+                on_pending_message=on_pending_message,
                 on_usage=lambda usage: setattr(self, "_last_usage", usage),
                 on_round_usage=lambda usage: setattr(self, "_last_round_usage", usage),
                 hook_runner=self.hook_runner,
@@ -291,6 +293,7 @@ class OpenRouterProvider(BaseProvider):
                     system=system,
                     max_rounds=max_rounds,
                     on_tool_event=on_tool_event,
+                    on_pending_message=on_pending_message,
                     on_usage=lambda usage: setattr(self, "_last_usage", usage),
                 on_round_usage=lambda usage: setattr(self, "_last_round_usage", usage),
                 hook_runner=self.hook_runner,
