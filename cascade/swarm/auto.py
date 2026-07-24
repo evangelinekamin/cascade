@@ -490,6 +490,12 @@ def execute_auto(
             verify_mode = mode == "test"
             recon_tools = ws.build_verify() if verify_mode else ws.build_read_only()
             recon_system = _RECON_VERIFY_SYSTEM if verify_mode else _RECON_READONLY_SYSTEM
+            if verify_mode:
+                # A CLI-proxy provider (codex) runs its own sandbox, not our
+                # tools, so read-only-tools alone won't let it execute; this
+                # flag forces its writable sandbox. Harmless on direct-API
+                # providers, which don't have it.
+                setattr(provider, "_force_repo_write", True)
             with scope, callback_scope:
                 response, _log = provider.ask_with_tools(
                     [{"role": "user", "content": prompt}],

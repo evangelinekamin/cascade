@@ -379,3 +379,20 @@ def test_cli_proxy_keeps_repo_workspace_for_repo_wide_audits_without_file_refs(t
     assert chunks == ["OK"]
     assert captured["cwd"] == str(tmp_path)
     assert "--skip-git-repo-check" not in captured["cmd_args"]
+
+
+def test_force_repo_write_gives_codex_a_writable_sandbox():
+    """Test-mode verify recon forces codex out of its read-only sandbox so it
+    can actually run the project's checks (which write /tmp)."""
+    with patch("cascade.providers.openai_provider.shutil.which", return_value="/usr/bin/codex"):
+        provider = OpenAIProvider(ProviderConfig(api_key="eyJ.a.b", model="gpt-5.6-terra"))
+
+    msgs = [{"role": "user", "content": "does this project work?"}]
+    # Default: an inspection prompt is NOT forced writable.
+    with provider._cli_workspace(msgs, "inspect read-only") as (_p, _wd, mode, _k):
+        assert mode != "repo-write"
+
+    # Forced: the lane requested execution -> codex's workspace-write sandbox.
+    provider._force_repo_write = True
+    with provider._cli_workspace(msgs, "verify: run the tests") as (_p, _wd, mode, _k):
+        assert mode == "repo-write"

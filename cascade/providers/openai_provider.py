@@ -108,6 +108,11 @@ class OpenAIProvider(BaseProvider):
         self._codex_sessions: dict[str, str] = {}
         self._filename_index_cache: dict[str, tuple[float, dict[str, Path]]] = {}
         self._line_count_cache: dict[str, tuple[int, int, int]] = {}
+        # When a caller needs codex to actually run things (the test-mode verify
+        # recon), this forces the workspace-write sandbox instead of letting the
+        # agentic heuristic decide -- otherwise an inspection-style prompt gets
+        # the read-only sandbox that blocks /tmp writes (so tests can't run).
+        self._force_repo_write = False
         self._use_oauth_cli = self._looks_like_jwt(config.api_key)
         self._use_cli_proxy = (
             self._use_oauth_cli
@@ -438,6 +443,15 @@ class OpenAIProvider(BaseProvider):
         workdir = self.get_working_directory()
         agentic = self._looks_agentic_request(self._latest_user_prompt(messages).lower(), system)
         system_fingerprint = self._system_fingerprint(system)
+        if self._force_repo_write:
+            # Forced writable sandbox on the real repo (test-mode verify recon):
+            # it must run the project's checks, which the read-only sandbox
+            # forbids. The lane's prompt still says not to edit source.
+            session_key = (
+                f"repo-write:{Path(workdir).resolve()}:{self.config.model}:{system_fingerprint}"
+            )
+            yield prompt, workdir, "repo-write", session_key
+            return
         if self._should_use_repo_workspace(messages, system, workdir):
             workspace_mode = "repo-write" if agentic else "repo-read"
             session_key = (
