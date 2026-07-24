@@ -196,7 +196,9 @@ def test_resume_resets_state_preserves_roles_and_emits_hook(tmp_path):
     assert input_frame.active_provider == "claude"
     assert input_frame.mode == "plan"
     assert header.display is False
-    assert posted[-1] == "Resumed session: Saved Session (3 messages)"
+    assert posted[-1].startswith("Resumed session: Saved Session (3 messages)")
+    # The provider/model list is re-printed on resume.
+    assert "Models:" in posted[-1] or "No providers configured." in posted[-1]
     assert cli_app.hook_runner.emit.call_args.args[0] == HookEvent.SESSION_RESUME
     assert cli_app.hook_runner.emit.call_args.args[1].session_id == session["id"]
 

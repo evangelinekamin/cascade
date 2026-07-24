@@ -891,18 +891,20 @@ class CommandHandler:
             lines.append(f"  {c.usage:<22s} {c.description}")
         self._post_system("Commands:\n" + "\n".join(lines))
 
-    def _cmd_providers(self, args: list[str]) -> None:
+    def _provider_list_text(self, header: str = "Available providers:") -> str:
+        """Formatted provider -> active-model list, or a 'none' notice."""
         cli_app = getattr(self.app, "cli_app", None)
-        if cli_app and cli_app.providers:
-            lines = []
-            for name, prov in cli_app.providers.items():
-                model = prov.config.model if hasattr(prov, "config") else "?"
-                active = " (active)" if name == self.app.state.active_provider else ""
-                lines.append(f"  {name}: {model}{active}")
-            text = "Available providers:\n" + "\n".join(lines)
-        else:
-            text = "No providers configured."
-        self._post_system(text)
+        if not (cli_app and cli_app.providers):
+            return "No providers configured."
+        lines = []
+        for name, prov in cli_app.providers.items():
+            model = prov.config.model if hasattr(prov, "config") else "?"
+            active = " (active)" if name == self.app.state.active_provider else ""
+            lines.append(f"  {name}: {model}{active}")
+        return f"{header}\n" + "\n".join(lines)
+
+    def _cmd_providers(self, args: list[str]) -> None:
+        self._post_system(self._provider_list_text())
 
     # ------------------------------------------------------------------
     # Agent / Workflow commands
@@ -1732,8 +1734,11 @@ class CommandHandler:
             )
 
         title = session.get("title", "(untitled)")
+        # Re-print the provider/model list on resume -- otherwise, after loading
+        # a session, there is no on-screen record of what is active.
         self._post_system(
-            f"Resumed session: {title} ({len(messages)} messages)"
+            f"Resumed session: {title} ({len(messages)} messages)\n"
+            + self._provider_list_text("Models:")
         )
 
     def _cmd_export(self, args: list[str]) -> None:
