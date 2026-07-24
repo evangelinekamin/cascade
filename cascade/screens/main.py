@@ -729,6 +729,7 @@ class MainScreen(Screen):
                 prompt,
                 provider_name,
                 decision,
+                mode=self._mode,
                 on_progress=_progress,
                 on_tool_event=_tool_event,
                 cancel_token=live_run.token,

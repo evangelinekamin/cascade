@@ -160,6 +160,22 @@ class WorkspaceTools:
             ),
         }
 
+    def build_verify(self) -> dict[str, ToolDef]:
+        """Read-only inspection tools PLUS run_command, but no write tools.
+
+        The test-mode recon lane: it must actually run the project's checks
+        (tests/build/type-check) to verify it works -- which a pure read-only
+        set cannot -- while still being unable to edit source. run_command is
+        permission-gated at the executor, so transparent test/build commands
+        auto-approve and destructive ones are refused.
+        """
+        tools = self.build_read_only()
+        tools["run_command"] = callable_to_tool_def(
+            "run_command", self.run_command,
+            description="Run a shell command in the workspace root",
+        )
+        return tools
+
     def _resolve(self, path: str) -> Path:
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():

@@ -153,6 +153,26 @@ def test_recon_lane_exposes_only_read_only_tools():
     assert "Found it" in result.text
 
 
+def test_recon_in_test_mode_can_run_checks_but_not_write():
+    app, _original = _app()
+    decision = RouteDecision(WorkflowKind.RECON, "verify it works", 0.9)
+
+    result = auto.execute_auto(
+        app, "does this project work?", "openai", decision, mode="test",
+    )
+
+    provider = _FakeOpenRouter.last_instance
+    assert result.outcome == RunOutcome.SUCCEEDED
+    # Test mode is verification: recon can actually run the project's checks.
+    assert "run_command" in provider.tools
+    # ...but must not modify source (no write/edit tools).
+    assert "write_file" not in provider.tools
+    _messages, kwargs = provider.tool_call
+    system = kwargs["system"].lower()
+    assert "may run" in system
+    assert "not edit source" in system
+
+
 def test_focused_route_delegates_to_verified_solve(monkeypatch):
     app, _original = _app()
     solve_result = SimpleNamespace(

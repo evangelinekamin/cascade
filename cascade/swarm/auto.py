@@ -60,6 +60,23 @@ class AutoResult:
 
 ProgressCallback = Optional[Callable[[str, str], None]]
 
+_RECON_READONLY_SYSTEM = (
+    "Inspect the repository to answer the request. You have only read-only "
+    "tools. Cite file paths and concrete evidence; do not claim to have changed "
+    "anything."
+)
+
+# Test mode: the goal is to CONFIRM the project works, so running its checks is
+# the whole point. The permission gate still stops anything destructive.
+_RECON_VERIFY_SYSTEM = (
+    "Verify whether this project actually works, and report concrete pass/fail "
+    "evidence. You MAY run its tests, type-checks, linters, and build (e.g. "
+    "'npm test', 'npm run build', 'pytest', 'tsc --noEmit') -- running them is "
+    "how you confirm it works, not a guess from reading. Prefer the project's "
+    "own configured commands. Do NOT edit source files; build artifacts and "
+    "temp files are expected. Cite file paths and the actual command output."
+)
+
 
 _ROUTER_SYSTEM = """\
 You route software-assistant requests. Choose the smallest workflow that can
@@ -396,6 +413,7 @@ def execute_auto(
     active_provider: str,
     decision: RouteDecision,
     *,
+    mode: str = "",
     on_progress: ProgressCallback = None,
     on_tool_event=None,
     cancel_token: Optional[CancellationToken] = None,
@@ -463,15 +481,20 @@ def execute_auto(
                 if disposable_provider and token is not None and callable(close_callback)
                 else nullcontext()
             )
+            # Test mode is about verification, which means actually RUNNING the
+            # project's checks -- a read-only pass can only guess. So recon in
+            # test mode gets run_command (permission-gated: transparent
+            # test/build commands auto-approve, dangerous ones are denied) and a
+            # prompt that permits running checks but not editing source.
+            ws = WorkspaceTools(os.getcwd(), cancel_token=token)
+            verify_mode = mode == "test"
+            recon_tools = ws.build_verify() if verify_mode else ws.build_read_only()
+            recon_system = _RECON_VERIFY_SYSTEM if verify_mode else _RECON_READONLY_SYSTEM
             with scope, callback_scope:
                 response, _log = provider.ask_with_tools(
                     [{"role": "user", "content": prompt}],
-                    WorkspaceTools(os.getcwd(), cancel_token=token).build_read_only(),
-                    system=(
-                        "Inspect the repository to answer the request. You have only "
-                        "read-only tools. Cite file paths and concrete evidence; do not "
-                        "claim to have changed anything."
-                    ),
+                    recon_tools,
+                    system=recon_system,
                     max_rounds=config["recon_max_rounds"],
                     on_tool_event=on_tool_event,
                 )
