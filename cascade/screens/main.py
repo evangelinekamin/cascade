@@ -51,11 +51,11 @@ class MainScreen(Screen):
     # A stream pause longer than this, right after a sentence, becomes a paragraph
     # break -- a model that pauses between thoughts then reads as separate paragraphs.
     _PAUSE_NEWLINE_SECONDS = 0.8
-    # Tool-using chat handles moderate multi-file work in one turn (10 rounds
-    # wasn't enough to even finish exploring a repo). /solve is still the path
-    # for builds you want *proven* -- it differs by being verified (test-gated),
-    # worktree-isolated, and retry-looped, not merely by round budget.
-    _CHAT_TOOL_MAX_ROUNDS = 24
+    # Tool-using chat should just finish the task, not dead-end into "use
+    # /solve". A high ceiling here is a runaway backstop, not a productivity
+    # limit -- the doom-loop guard catches genuine loops. /solve stays distinct
+    # by being verified + worktree-isolated, not by round budget.
+    _CHAT_TOOL_MAX_ROUNDS = 50
     # Ctrl+C on an empty input arms exit; a second press within this window
     # confirms it, so a stray Ctrl+C never quits mid-session.
     _EXIT_HINT = "press ctrl+c again to exit"

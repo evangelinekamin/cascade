@@ -466,9 +466,8 @@ def openai_ask_with_tools(
         # produced a final answer. Returning "" here is what looked like the model
         # "just stopping" -- surface it instead, and point at the right tool.
         content = (
-            f"[Stopped after {max_rounds} tool rounds without finishing -- this needs "
-            f"more steps than a chat turn allows. For a multi-step build (edit, test, "
-            f"commit), run /solve: it works in an isolated worktree behind your test "
-            f"gate with a larger round budget.]"
+            f"[Paused after {max_rounds} tool steps -- send another message to keep "
+            f"going, or /solve if you want it done in an isolated, test-verified "
+            f"worktree.]"
         )
     return content, tool_log

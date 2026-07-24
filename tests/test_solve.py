@@ -1307,7 +1307,9 @@ def test_run_solve_rejects_a_green_noop(monkeypatch):
 
     assert result.passed is False
     assert result.outcome == "failed"
-    assert "no repository changes" in result.error
+    # Reframed from jargon into an honest, actionable message.
+    assert "no code changes were made" in result.error
+    assert "checks already pass" in result.error
 
 
 def test_run_solve_allows_an_intentional_noop(monkeypatch):

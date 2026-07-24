@@ -1085,8 +1085,10 @@ def run_solve(
         if passed and not snapshot.changed_files and not allow_noop:
             passed = False
             no_change = (
-                "verification passed, but the worker produced no repository changes; "
-                "use allow_noop only for an intentionally no-op task"
+                f"The checks already pass ({test_cmd}) and no code changes were made "
+                "-- the fix may already be in place, or the problem isn't caught by "
+                "that verify command (e.g. a type/lint error the test suite misses). "
+                "If you had a specific change in mind, say exactly what to change."
             )
             error = f"{error}\n{no_change}" if error else no_change
         passed, error = _annotate_verification(
