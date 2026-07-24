@@ -423,4 +423,4 @@ def test_orchestration_config_sanitizes_modes_preferences_and_rounds():
 
         assert cfg["modes"] == ["build"]
         assert cfg["provider_preferences"]["order"] == ["cerebras"]
-        assert cfg["recon_max_rounds"] == 20
+        assert cfg["recon_max_rounds"] == 40  # clamped to the ceiling

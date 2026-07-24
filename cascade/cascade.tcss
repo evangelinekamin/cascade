@@ -5,6 +5,22 @@ Screen {
     overflow: hidden;
 }
 
+/* Elegant scrollbars: thin (1 cell), track blends into the background, thumb is
+   a low-contrast blue-gray that brightens to cyan only when grabbed. Replaces
+   Textual's chunky 2-cell default. Set on the scrollable containers since
+   scrollbar-* is not inherited. */
+ChatHistory, ToolActivityLog, TextArea, OptionList, MessageBody, _ProseBody,
+ScrollableContainer, VerticalScroll {
+    scrollbar-size-vertical: 1;
+    scrollbar-size-horizontal: 1;
+    scrollbar-background: #0d1117;
+    scrollbar-background-hover: #0d1117;
+    scrollbar-background-active: #0d1117;
+    scrollbar-color: #262d3d;
+    scrollbar-color-hover: #3a4457;
+    scrollbar-color-active: #00d4e5;
+}
+
 /* ------------------------------------------------------------------ */
 /* Layout zones                                                        */
 /* ------------------------------------------------------------------ */

@@ -188,7 +188,7 @@ class ConfigManager:
                     "allow_fallbacks": True,
                     "require_parameters": True,
                 },
-                "recon_max_rounds": 10,
+                "recon_max_rounds": 16,
             },
             "integrations": {
                 "shannon": {
@@ -514,7 +514,7 @@ class ConfigManager:
                 "allow_fallbacks": True,
                 "require_parameters": True,
             },
-            "recon_max_rounds": 10,
+            "recon_max_rounds": 16,
         }
         raw = self.data.get("orchestration", {})
         merged = {**defaults, **(raw if isinstance(raw, dict) else {})}
@@ -551,10 +551,10 @@ class ConfigManager:
         merged["fast_provider_preferences"] = dict(fast_preferences)
 
         try:
-            rounds = int(merged.get("recon_max_rounds", 10))
+            rounds = int(merged.get("recon_max_rounds", 16))
         except (TypeError, ValueError):
             rounds = 10
-        merged["recon_max_rounds"] = max(1, min(rounds, 20))
+        merged["recon_max_rounds"] = max(1, min(rounds, 40))
         return merged
 
     def get_integrations_config(self) -> Dict[str, Any]:
