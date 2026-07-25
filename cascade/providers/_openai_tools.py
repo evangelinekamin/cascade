@@ -265,7 +265,12 @@ def openai_ask_with_tools(
     total_usage = Usage()
     round_usage = None
     budget = int(context_window * _CONTEXT_BUDGET_FRACTION)
-    seen_reads: set[tuple[str, str]] = set()
+    # dedup_key -> the tool_call_id whose result holds that read. When budget
+    # compaction later ELIDES that result, the key is dropped so a repeat read
+    # re-fetches the file instead of being told "[already read above]" while the
+    # content it points at is gone (the model could then neither see nor re-read
+    # it -- a real hole in long loops).
+    seen_reads: dict[tuple[str, str], str] = {}
     doom_streak = 0
     doom_sig = None
     edit_counts: dict[str, int] = {}
@@ -303,9 +308,24 @@ def openai_ask_with_tools(
                 api_messages.append({"role": "user", "content": pending})
         # Bound the running context before every request: evict old, large tool
         # results so accumulated file reads cannot overflow the model's window.
+        _before = api_messages
         api_messages = _compact_messages_to_budget(
             api_messages, budget, keep_recent=_KEEP_RECENT_MESSAGES
         )
+        # A read whose result was just elided must become re-readable: drop its
+        # dedup key so the model can fetch the file again rather than be pointed
+        # at content that no longer exists. (_compact returns a same-length list,
+        # so a tool message whose content changed was elided.)
+        if seen_reads and len(_before) == len(api_messages):
+            elided_ids = {
+                new.get("tool_call_id")
+                for old, new in zip(_before, api_messages)
+                if old.get("role") == "tool" and old.get("content") != new.get("content")
+            }
+            if elided_ids:
+                seen_reads = {
+                    key: cid for key, cid in seen_reads.items() if cid not in elided_ids
+                }
         payload = {
             "model": model,
             "messages": api_messages,
@@ -436,7 +456,7 @@ def openai_ask_with_tools(
                         note = f"\n\n[stopped: {exc}]"
                         return (content + note).strip(), tool_log
                     if dedup_key is not None:
-                        seen_reads.add(dedup_key)
+                        seen_reads[dedup_key] = tc["id"]
             _checkpoint()
             tool_log.append({
                 "tool": tool_name,

@@ -20,6 +20,11 @@ from .episodes import Episode, compact_to_episodes, episodes_to_context
 # (otherwise the clip in state_messages_to_provider silently drops them).
 RAW_MESSAGE_WINDOW = 40
 
+# Even under the 'summary' policy, the most recent N other-provider turns are
+# carried verbatim (not just as episodes), so a cross-model hand-off -- codex's
+# found errors, a review, a plan -- is visible to the model asked to act on it.
+_STICKY_CROSS_TURNS = 2
+
 # A gap at or above this (seconds) is worth marking in the timeline so the
 # model can tell the user stepped away. Smaller consecutive gaps stay
 # unmarked to avoid cluttering rapid back-and-forth.
@@ -163,12 +168,23 @@ def state_messages_to_provider(
             "content": "Understood, I have the episode context from prior interactions.",
         })
 
-    # off and summary emit identically here (they differ only in which
-    # episodes inject, handled above); full additionally carries other
-    # providers' turns inline. One loop covers all three, plus the optional
-    # timeline markers keyed to the last EMITTED message's timestamp.
+    # 'full' carries every other-provider turn inline. 'off'/'summary' rely on
+    # episodes -- EXCEPT that the most recent cross-provider turns are kept
+    # VERBATIM regardless of policy: a hand-off from another model (e.g. codex's
+    # list of found errors) is exactly what the next model needs, and a
+    # ~300-char episode outcome silently loses it. Older cross-provider turns
+    # still fall back to episodes. One loop covers all three policies, plus the
+    # optional timeline markers keyed to the last EMITTED message's timestamp.
     include_cross = policy == "full"
     window = visible_messages[-max_messages:]
+    cross_positions = [
+        i for i, m in enumerate(window)
+        if m.role not in ("you", "system", target_provider)
+    ]
+    # 'off' opts out of cross-model context entirely, so no sticky carry there.
+    sticky_cross = (
+        set(cross_positions[-_STICKY_CROSS_TURNS:]) if policy == "summary" else set()
+    )
     prev_ts = 0.0
     for i, msg in enumerate(window):
         marker = (
@@ -180,7 +196,7 @@ def state_messages_to_provider(
             result.append({"role": "user", "content": marker + msg.content})
         elif msg.role == target_provider:
             result.append({"role": "assistant", "content": marker + msg.content})
-        elif include_cross:
+        elif include_cross or i in sticky_cross:
             result.append({
                 "role": "user",
                 "content": marker + f"[Response from {msg.role}]\n{msg.content}",

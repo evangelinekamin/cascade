@@ -434,3 +434,34 @@ class TestUnsentTail:
         assert should_compact(msgs, "claude", anchor=anchor) is False
         near = Usage(input=168_000, output=4_000)
         assert should_compact(msgs, "claude", anchor=near) is True
+
+
+def test_summary_keeps_recent_cross_provider_turns_verbatim():
+    """A hand-off from another model (codex's found errors) must reach the model
+    asked to act on it -- the summary policy used to drop it entirely."""
+    messages = _msgs(
+        ("you", "check the project"),
+        ("openai", "FAIL: npm start hangs; FAIL: --include CACError; DepopHardRejectError"),
+        ("you", "fix the errors codex found"),
+    )
+    result = state_messages_to_provider(messages, "openrouter", policy="summary")
+    blob = "\n".join(m["content"] for m in result)
+    # The openai (cross-provider) report is now inline + verbatim for openrouter.
+    assert "DepopHardRejectError" in blob
+    assert "[Response from openai]" in blob
+
+
+def test_summary_only_keeps_the_last_two_cross_provider_turns():
+    messages = _msgs(
+        ("you", "q"),
+        ("gemini", "OLD cross turn one"),
+        ("claude", "OLD cross turn two"),
+        ("openai", "RECENT cross turn A"),
+        ("openai", "RECENT cross turn B"),
+        ("you", "now you act, openrouter"),
+    )
+    result = state_messages_to_provider(messages, "openrouter", policy="summary")
+    blob = "\n".join(m["content"] for m in result)
+    assert "RECENT cross turn A" in blob and "RECENT cross turn B" in blob
+    # The 3rd-most-recent cross turn falls back to episode-only (dropped here).
+    assert "OLD cross turn one" not in blob

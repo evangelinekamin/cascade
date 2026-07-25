@@ -487,3 +487,30 @@ def test_loop_raises_on_choice_error_after_generation_started():
 
     with pytest.raises(RuntimeError, match="provider disconnected"):
         _run_loop(client, {}, context_window=200000)
+
+
+def test_evicted_read_is_re_readable_not_falsely_deduped():
+    """After budget compaction elides a read's result, a repeat read must
+    re-fetch the file -- not be told '[already read above]' while the content it
+    points at is gone (a real hole in long loops)."""
+    calls: list[str] = []
+    tools = _big_read_tools(calls)
+    responses = [
+        _tool_call_response("c1", "read_file", {"path": "a.py"}),  # read A (big)
+        _tool_call_response("c2", "read_file", {"path": "b.py"}),
+        _tool_call_response("c3", "read_file", {"path": "c.py"}),
+        _tool_call_response("c4", "read_file", {"path": "d.py"}),
+        _tool_call_response("c5", "read_file", {"path": "e.py"}),  # A now old -> evicted
+        _tool_call_response("c6", "read_file", {"path": "a.py"}),  # re-read A
+        _final_response("done"),
+    ]
+    client = _FakeClient(responses)
+
+    text, log = _run_loop(client, tools, context_window=8000)
+
+    assert text == "done"
+    # A was read, evicted, then re-read: the executor ran for a.py TWICE.
+    assert calls.count("a.py") == 2, calls
+    # Neither a.py result was the false dedup stub.
+    a_outputs = [e["output"] for e in log if e["input"].get("path") == "a.py"]
+    assert all("already read above" not in o for o in a_outputs), a_outputs

@@ -110,18 +110,34 @@ class TestPayloadTimeline:
         assert out[0]["content"] == "q1"
         assert out[1]["content"] == "a1"
 
-    def test_gap_measured_between_visible_messages_under_summary(self):
-        # A skipped cross-provider turn's elapsed time folds into the next
-        # visible gap rather than resetting it.
+    def test_gap_measured_from_recent_visible_cross_provider_under_summary(self):
+        # A RECENT cross-provider turn is now kept verbatim (sticky), so it is
+        # visible and the following gap measures from it -- not folded away.
         msgs = [
             _msg("you", "q1", _at(hour=9, minute=0)),
-            _msg("gemini", "other-provider", _at(hour=9, minute=30)),  # skipped
-            _msg("you", "q2", _at(hour=9, minute=45)),  # 45m since q1 (visible)
+            _msg("gemini", "other-provider", _at(hour=9, minute=30)),  # sticky -> visible
+            _msg("you", "q2", _at(hour=9, minute=45)),
         ]
         out = state_messages_to_provider(msgs, "claude", policy="summary", with_timeline=True)
-        # Only the two "you" turns survive; the second is marked vs the first.
-        assert len(out) == 2
-        assert out[1]["content"].startswith("[09:45, 45m later]")
+        blob = "\n".join(m["content"] for m in out)
+        assert "other-provider" in blob  # recent cross-provider turn inlined
+        # q2's gap is from the now-visible gemini (15m), not from q1 (45m).
+        assert out[-1]["content"].startswith("[09:45, 15m later]")
+
+    def test_old_skipped_cross_provider_gap_folds_into_next_visible(self):
+        # Beyond the sticky window, an old cross-provider turn is still dropped,
+        # and its elapsed time folds into the next visible gap.
+        msgs = [
+            _msg("you", "q1", _at(hour=9, minute=0)),
+            _msg("gemini", "old-cross", _at(hour=9, minute=30)),   # 3rd-back -> skipped
+            _msg("openai", "recent-1", _at(hour=9, minute=35)),    # sticky
+            _msg("openai", "recent-2", _at(hour=9, minute=40)),    # sticky
+            _msg("you", "q2", _at(hour=9, minute=45)),
+        ]
+        out = state_messages_to_provider(msgs, "claude", policy="summary", with_timeline=True)
+        blob = "\n".join(m["content"] for m in out)
+        assert "old-cross" not in blob            # oldest cross dropped
+        assert "recent-1" in blob and "recent-2" in blob
 
     def test_full_policy_marks_cross_provider_turns(self):
         msgs = [
