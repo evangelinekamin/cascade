@@ -1851,8 +1851,8 @@ class CommandHandler:
 
         if not self._last_solve_patch:
             self._post_system(
-                "Nothing to apply. Run /solve first; /apply lands its verified "
-                "changes here once it passes."
+                "Nothing to apply. Run /solve or /compete-code first; /apply "
+                "lands the verified change (or the competition winner) here."
             )
             return
 
@@ -2452,6 +2452,21 @@ class CommandHandler:
                 )
                 if winner_entry is not None:
                     lines.append(f"Winner worktree: {winner_entry.worktree_path}")
+                    # Stage the winner's patch so /apply can land it on the real
+                    # working tree -- same mechanism /solve uses. A fresh manager
+                    # diffs the worktree against HEAD (the competition base).
+                    try:
+                        from .swarm.worktree import WorktreeManager
+
+                        winner_patch = WorktreeManager().diff_patch(
+                            winner_entry.worktree_path
+                        )
+                    except Exception:
+                        winner_patch = ""
+                    if winner_patch:
+                        self._last_solve_patch = winner_patch
+                        self._last_solve_changed = tuple(winner_entry.changed_files)
+                        lines.append("Run /apply to land the winner's changes here.")
 
                 lines.append("")
 

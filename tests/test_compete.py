@@ -288,6 +288,30 @@ class TestCompetitionOrchestrator:
         assert "do not merely narrate" in deepseek_system.lower()
         assert "do not merely narrate" not in openai_system.lower()
 
+    def test_winner_patch_capture_applies_to_the_tree(self):
+        # /compete-code captures the winner's patch with a FRESH WorktreeManager
+        # (baseline defaults to HEAD = the competition base), so /apply -- which
+        # uses apply_to_tree -- can land the winner's changes on the real tree.
+        from cascade.swarm.worktree import WorktreeManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _init_git_repo(tmpdir)
+            mgr = WorktreeManager(cwd=tmpdir)
+            wt = mgr.prepare("winner").path
+            (Path(wt) / "new_file.py").write_text("print('winner')\n")
+
+            patch = WorktreeManager().diff_patch(wt)  # fresh manager, HEAD baseline
+            assert "new_file.py" in patch
+
+            applied, msg = WorktreeManager.apply_to_tree(tmpdir, patch)
+            assert applied, msg
+            assert (Path(tmpdir) / "new_file.py").exists()
+
+            subprocess.run(
+                ["git", "-C", tmpdir, "worktree", "remove", "--force", wt],
+                check=False, capture_output=True, text=True,
+            )
+
 
 class TestWorktreeManager:
     def test_prepare_copies_dirty_and_untracked_state(self):
