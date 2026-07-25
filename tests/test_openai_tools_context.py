@@ -514,3 +514,61 @@ def test_evicted_read_is_re_readable_not_falsely_deduped():
     # Neither a.py result was the false dedup stub.
     a_outputs = [e["output"] for e in log if e["input"].get("path") == "a.py"]
     assert all("already read above" not in o for o in a_outputs), a_outputs
+
+
+def test_loop_executes_tool_calls_even_when_finish_reason_is_stop():
+    # Compat hosts (vLLM-class local Kimi/GLM, many OpenRouter endpoints) return
+    # tool calls with finish_reason "stop"; the old gate dropped them -> "no
+    # changes, no error". They must execute regardless of finish_reason.
+    ran = []
+
+    def write_file(path: str) -> str:
+        """Write a file."""
+        ran.append(path)
+        return "edited"
+
+    tools = {"write_file": callable_to_tool_def("write_file", write_file, "edit")}
+    resp = _tool_call_response("c1", "write_file", {"path": "a.py"})
+    resp["choices"][0]["finish_reason"] = "stop"  # NOT "tool_calls"
+    text, _log = _run_loop(
+        _FakeClient([resp, _final_response("done")]), tools, context_window=1_000_000
+    )
+    assert ran == ["a.py"]
+    assert text == "done"
+
+
+def test_loop_reports_malformed_tool_args_instead_of_executing_empty():
+    # Truncated/garbage arguments must not run the tool with {} (a silent no-op);
+    # the model gets a corrective result it can re-issue from.
+    ran = []
+
+    def write_file(path: str = "MISSING") -> str:
+        """Write a file."""
+        ran.append(path)
+        return "edited"
+
+    tools = {"write_file": callable_to_tool_def("write_file", write_file, "edit")}
+    bad = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "write_file", "arguments": "{bad json"},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+    text, log = _run_loop(
+        _FakeClient([bad, _final_response("recovered")]), tools, context_window=1_000_000
+    )
+    assert ran == []  # never executed with empty args
+    assert any("not valid JSON" in str(entry.get("output", "")) for entry in log)
+    assert text == "recovered"

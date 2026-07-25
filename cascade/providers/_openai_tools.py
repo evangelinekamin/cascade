@@ -168,6 +168,35 @@ def _invalidates_read(tool_name: str, tool_args: dict) -> Optional[str]:
     return None
 
 
+def _repair_json(raw: str) -> Optional[dict]:
+    """Best-effort recovery of a truncated/mangled tool-argument object.
+
+    The common failure is an output-limit truncation that cuts the JSON off
+    mid-value; closing a dangling string and the open brackets usually restores
+    a parseable object. Returns the parsed dict, or ``None`` if it still cannot
+    be read as one (so the caller reports the error rather than guessing).
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    candidates = [raw]
+    if raw.count('"') % 2 == 1:  # an unterminated string
+        candidates.append(raw + '"')
+    for base in list(candidates):
+        opens = base.count("{") - base.count("}")
+        brackets = base.count("[") - base.count("]")
+        if opens > 0 or brackets > 0:
+            candidates.append(base + ("]" * max(0, brackets)) + ("}" * max(0, opens)))
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
 def _edit_run_target(tool_name: str, tool_args: dict) -> Optional[tuple[str, str]]:
     """Classify a call for the edit-run cycle guard.
 
@@ -390,9 +419,17 @@ def openai_ask_with_tools(
         tool_calls = message.get("tool_calls", [])
         content = message.get("content", "") or ""
 
-        if not tool_calls or finish_reason != "tool_calls":
+        if not tool_calls:
             _finalize_usage()
             return content, tool_log
+
+        # Tool calls present -> execute them REGARDLESS of finish_reason. The old
+        # `finish_reason != "tool_calls"` gate silently dropped calls from compat
+        # hosts (vLLM-class: local Kimi/GLM and many OpenRouter endpoints) that
+        # report finish_reason "stop" alongside tool calls, or "length" when the
+        # output limit truncates the final call -- which is exactly the "produced
+        # no changes, no error" failure. Truncated arguments are recovered or
+        # reported per-call below rather than executed as empty.
 
         # Append the assistant message (must include tool_calls)
         api_messages.append(message)
@@ -402,10 +439,28 @@ def openai_ask_with_tools(
             _checkpoint()
             fn = tc.get("function", {})
             tool_name = fn.get("name", "")
+            raw_args = fn.get("arguments", "") or "{}"
             try:
-                tool_args = json.loads(fn.get("arguments", "{}"))
-            except json.JSONDecodeError:
-                tool_args = {}
+                tool_args = json.loads(raw_args)
+            except json.JSONDecodeError as exc:
+                repaired = _repair_json(raw_args)
+                if repaired is not None:
+                    tool_args = repaired
+                else:
+                    # Never fall back to {}: running a tool with empty arguments
+                    # looks like a successful no-op. Report the malformed call so
+                    # the model re-issues it (common when a large write_file payload
+                    # is truncated at the output limit).
+                    err = (
+                        f"[tool-call error] arguments were not valid JSON: {exc}. "
+                        f"Re-issue {tool_name} with complete, valid JSON arguments "
+                        f"(make the payload smaller if it was cut off)."
+                    )
+                    tool_log.append({"tool": tool_name, "input": raw_args, "output": err})
+                    api_messages.append(
+                        {"role": "tool", "tool_call_id": tc["id"], "content": err}
+                    )
+                    continue
 
             # Doom-loop guard: the same tool + same args over and over is a stall.
             # A different call in between resets it (so read -> edit -> read is fine).
