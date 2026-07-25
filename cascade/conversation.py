@@ -196,6 +196,15 @@ def state_messages_to_provider(
             result.append({"role": "user", "content": marker + msg.content})
         elif msg.role == target_provider:
             result.append({"role": "assistant", "content": marker + msg.content})
+        elif msg.role == "system":
+            # Session-event notices ("[Solve] <objective>", etc.) are factual and
+            # provider-agnostic; the model should know an orchestrated action ran,
+            # regardless of cross-model policy, so it is never silently dropped.
+            result.append({
+                "role": "user",
+                "content": marker + f"[System notice]\n{msg.content}",
+            })
+            result.append({"role": "assistant", "content": "Noted."})
         elif include_cross or i in sticky_cross:
             result.append({
                 "role": "user",

@@ -137,8 +137,42 @@ def _extract_actions(assistant_content: str, tool_log: list[dict] | None = None)
     return tuple(actions)
 
 
+# High-signal failure lines -- patterns that rarely appear in success prose, so a
+# match credibly means the turn is reporting a failure worth preserving verbatim.
+_FAILURE_LINE_RE = re.compile(
+    r"^.*(?:"
+    r"\bFAILED\b"                              # pytest fail line (uppercase)
+    r"|\b\d+\s+(?:failed|failing|errors?)\b"   # "3 failed", "2 errors"
+    r"|\bTraceback\b"
+    r"|\bAssertionError\b"
+    r"|\bException\b"
+    r"|\b[A-Za-z]\w+Error:"                    # TypeError:, McpError: (CamelCase)
+    r"|\bdid not pass\b|\bnot passing\b"
+    r"|[✗❌]"                         # cross marks
+    r").*$",
+    re.MULTILINE,
+)
+
+
 def _extract_outcome(assistant_content: str, max_len: int = 300) -> str:
-    """Extract a concise outcome from the assistant response."""
+    """Extract a concise outcome from the assistant response.
+
+    A turn that reports failures keeps the FAIL lines verbatim -- a generic
+    closing paragraph ("let me know if you need anything") would drop exactly
+    what a later model needs to act on. Otherwise falls back to the last
+    meaningful (non-code) paragraph as the conclusion.
+    """
+    failures: list[str] = []
+    seen: set[str] = set()
+    for match in _FAILURE_LINE_RE.finditer(assistant_content):
+        line = match.group(0).strip()
+        if line and line not in seen:
+            seen.add(line)
+            failures.append(line)
+    if failures:
+        joined = "\n".join(failures)
+        return joined[:max_len] + "..." if len(joined) > max_len else joined
+
     # Take the last meaningful paragraph as the conclusion
     paragraphs = [p.strip() for p in assistant_content.split("\n\n") if p.strip()]
     if not paragraphs:

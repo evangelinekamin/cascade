@@ -473,6 +473,19 @@ class MainScreen(Screen):
             pipeline = pipeline.add_layer(
                 "upload_context", upload_ctx, PRIORITY_REPL_CONTEXT,
             )
+
+        # Per-model steering (the same registry the solve worker uses) applies
+        # wherever the model may call edit tools -- the chat tool loop included,
+        # not just isolated solves. Only for tool-capable providers, since the
+        # guidance is about tool behavior.
+        prov = getattr(cli_app, "providers", {}).get(provider_name)
+        if prov is not None and self._should_use_tools(prov):
+            from ..swarm.solve import worker_guidance_for
+
+            model_id = getattr(getattr(prov, "config", None), "model", "") or ""
+            guidance = worker_guidance_for(model_id)
+            if guidance:
+                pipeline = pipeline.add_layer("model_guidance", guidance, PRIORITY_MODE)
         return pipeline.build() or None
 
     def _provider_worker(

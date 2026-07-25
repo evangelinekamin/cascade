@@ -465,3 +465,39 @@ def test_summary_only_keeps_the_last_two_cross_provider_turns():
     assert "RECENT cross turn A" in blob and "RECENT cross turn B" in blob
     # The 3rd-most-recent cross turn falls back to episode-only (dropped here).
     assert "OLD cross turn one" not in blob
+
+
+# --- System-role notices are visible to the model (not silently dropped) --------
+
+
+def test_system_notice_is_emitted_under_summary_policy():
+    messages = _msgs(
+        ("you", "solve the auth bug"),
+        ("system", "[Solve] fix the auth token validation"),
+        ("you", "did that work?"),
+    )
+    result = state_messages_to_provider(messages, "openrouter", policy="summary")
+    blob = "\n".join(m["content"] for m in result)
+    assert "[System notice]" in blob
+    assert "[Solve] fix the auth token validation" in blob
+
+
+def test_system_notice_is_visible_even_under_off_policy():
+    # "off" opts out of CROSS-MODEL chatter, but a session event is a fact about
+    # what the user did, not another model's content, so it stays visible.
+    messages = _msgs(
+        ("you", "run it"),
+        ("system", "[Fanout] build parser and printer"),
+    )
+    result = state_messages_to_provider(messages, "openrouter", policy="off")
+    blob = "\n".join(m["content"] for m in result)
+    assert "[Fanout] build parser and printer" in blob
+
+
+def test_system_notice_pairs_with_an_assistant_ack():
+    # Keeps user/assistant alternation intact for providers that require it.
+    messages = _msgs(("system", "[Pipeline] migrate the schema"))
+    result = state_messages_to_provider(messages, "openrouter", policy="summary")
+    roles = [m["role"] for m in result]
+    assert roles == ["user", "assistant"]
+    assert result[1]["content"] == "Noted."

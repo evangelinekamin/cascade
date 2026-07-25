@@ -158,6 +158,31 @@ class TestOutcomeExtraction:
         result = _extract_outcome(long_text, max_len=100)
         assert len(result) <= 104
 
+    def test_prefers_failure_lines_over_a_generic_closing_paragraph(self):
+        text = (
+            "I ran the suite.\n\n"
+            "FAILED tests/test_stdio.py::test_handshake - Connection closed\n"
+            "3 failed, 340 passed\n\n"
+            "Let me know if you'd like me to keep digging."
+        )
+        outcome = _extract_outcome(text)
+        assert "FAILED tests/test_stdio.py::test_handshake" in outcome
+        assert "3 failed" in outcome
+        assert "keep digging" not in outcome  # the generic sign-off is not the outcome
+
+    def test_captures_a_named_exception_line(self):
+        text = "Trying the fix...\n\nMcpError: MCP error -32000: Connection closed\n\nDone."
+        assert "McpError: MCP error -32000" in _extract_outcome(text)
+
+    def test_success_prose_is_untouched_by_the_failure_scan(self):
+        # "no errors" / "error handling" must NOT be mistaken for a failure line.
+        text = "I added error handling and the tests pass with no errors.\n\nAll green."
+        assert _extract_outcome(text) == "All green."
+
+    def test_failure_outcome_is_bounded(self):
+        text = "\n".join(f"FAILED test_{i} - boom because reasons" for i in range(50))
+        assert len(_extract_outcome(text, max_len=200)) <= 204
+
 
 class TestEpisodesToContext:
     """Tests for rendering episodes as model context."""
