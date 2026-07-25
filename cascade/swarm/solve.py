@@ -68,18 +68,45 @@ Guidance tuned to this model's known failure modes:
 # Substring -> guidance. Order is the concatenation order for a multi-match model id.
 _WORKER_GUIDANCE: tuple[tuple[str, str], ...] = (("deepseek", _DEEPSEEK_GUIDANCE),)
 
+# A backtick-quoted snake_case token in guidance names a tool (e.g. `replace_in_file`).
+_GUIDANCE_TOOL_RE = re.compile(r"`([a-z]+(?:_[a-z]+)+)`")
 
-def worker_guidance_for(model: str) -> str:
-    """Return per-model steering to append to the worker prompt, or "" if none applies.
+
+def _filter_guidance_to_tools(guidance: str, available: "set[str]") -> str:
+    """Drop guidance lines that steer toward a tool absent from *available*.
+
+    The solve worker's WorkspaceTools has ``replace_in_file``; the chat tool loop
+    does not. Injecting "prefer `replace_in_file`" where it does not exist would
+    send the model chasing an unknown tool, so any line naming a tool the current
+    tool-set lacks is removed. Lines that name no tool are always kept.
+    """
+    kept = []
+    for line in guidance.splitlines():
+        named = _GUIDANCE_TOOL_RE.findall(line)
+        if any(tool not in available for tool in named):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def worker_guidance_for(model: str, available_tools: "Optional[set[str]]" = None) -> str:
+    """Return per-model steering for the worker prompt, or "" if none applies.
 
     Each registry entry pairs a case-insensitive substring of the running model id
     with guidance countering that model's empirically-known failure modes. The
     guidance of every matching entry is concatenated in registry order (blank-line
     separated), so a model id can accumulate steering from more than one entry.
+
+    When ``available_tools`` is given (the tool-set the model will actually see),
+    guidance lines that reference a tool not in it are dropped -- so solve-worker
+    advice about ``replace_in_file`` never reaches the chat loop, which lacks it.
     """
     model_id = (model or "").lower()
     matches = [text for needle, text in _WORKER_GUIDANCE if needle in model_id]
-    return "\n\n".join(matches)
+    guidance = "\n\n".join(matches)
+    if available_tools is not None and guidance:
+        guidance = _filter_guidance_to_tools(guidance, set(available_tools))
+    return guidance
 
 
 @dataclass(frozen=True)

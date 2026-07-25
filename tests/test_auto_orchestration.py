@@ -125,23 +125,20 @@ def test_selector_uses_gpt_oss_on_cerebras_without_mutating_chat_provider():
     assert original.config.model == "normal-chat-model"
 
 
-def test_selector_fallback_is_conservative_about_parallelism():
+def test_selector_falls_back_to_chat_when_the_router_is_unavailable():
+    # When no routing model can be built, an unrouted prompt is handled as chat
+    # (which has tools) -- NOT force-routed to a worktree solve by a lexical guess.
     app, _original = _app()
     app.providers = {}
-    app.config.orchestration["local_router"] = False  # exercise the heuristic fallback
+    app.config.orchestration["local_router"] = False  # skip the local tier too
 
-    focused = auto.select_workflow(app, "Implement a parser fix", "build")
-    independent = auto.select_workflow(
-        app,
-        "Implement independent changes in separate modules in parallel",
-        "build",
-    )
+    decision = auto.select_workflow(app, "Implement a parser fix", "build")
 
-    assert focused.workflow == WorkflowKind.SOLVE
-    assert independent.workflow == WorkflowKind.FANOUT
+    assert decision.workflow == WorkflowKind.CHAT
+    assert decision.router_provider == "fallback"
 
 
-# --- Local first-tier router (zero-cost, abstains when unsure) -------------------
+# --- Local first-tier router: precision-1 allowlist (abstains unless certain) ----
 
 
 def test_local_router_short_circuits_a_clear_edit_without_calling_the_model():
@@ -167,75 +164,51 @@ def test_local_router_can_be_disabled_by_config():
     assert decision.router_provider == "openrouter"
 
 
-def test_local_router_abstains_on_mixed_read_and_edit():
-    # "review AND fix" is genuinely ambiguous (recon or solve?) -> defer.
-    assert auto._local_route("review the parser and fix what's broken", "build") is None
-
-
-def test_local_router_abstains_on_a_long_edit_that_might_decompose():
-    long_edit = "implement " + " and ".join(f"feature {i}" for i in range(30))
-    assert auto._local_route(long_edit, "build") is None
-
-
-def test_local_router_referential_edit_still_routes_to_solve():
-    # "fix the errors codex found" is a focused edit regardless of the referent;
-    # lane-context resolves the referent at execution time.
-    decision = auto._local_route("fix the errors codex found", "build")
-    assert decision is not None and decision.workflow == WorkflowKind.SOLVE
-
-
-def test_local_router_rule_matrix():
-    cases = {
-        "explain how the auth module works": WorkflowKind.RECON,
-        "add a dark-mode toggle to settings": WorkflowKind.SOLVE,
-        "migrate the auth flow across the whole stack": WorkflowKind.PIPELINE,
-        "build the parser and the printer in parallel independently": WorkflowKind.FANOUT,
-        "thanks, that worked": WorkflowKind.CHAT,
-    }
-    for prompt, expected in cases.items():
-        decision = auto._local_route(prompt, "build")
-        assert decision is not None, f"expected a confident route for {prompt!r}"
-        assert decision.workflow == expected, f"{prompt!r} -> {decision.workflow}"
-
-
-def test_local_router_abstains_on_vague_deixis():
-    assert auto._local_route("do option a", "build") is None
-    assert auto._local_route("the parser thing", "build") is None
-
-
-def test_local_router_precision_regressions():
-    """Concrete mis-routes the codex judge flagged; each must now be safe."""
-    abstain = [
-        "Should we update this dependency?",        # question, not a command
-        "What does `delete` mean here?",            # quoted token in a question
-        "Update me on progress.",                   # addressed to the assistant
-        "hey, continue fixing it",                  # greeting prefix on an action
-        "Explain how Git rebase works.",            # general knowledge, no repo object
-        "Update the schema and tell me what changed.",  # "tell me" -> self-referential
-        "Migrate the backend and frontend end-to-end in parallel",  # conflicting signals
+def test_local_router_allowlist_routes():
+    """The only three shapes the local tier will confidently route."""
+    solve = [
+        "fix the login redirect bug",
+        "add a dark-mode toggle to settings",
+        "refactor this one function",
+        "please add a health-check endpoint",
+        "fix the errors codex found",   # referential object is fine; lane-context resolves it
     ]
-    for prompt in abstain:
-        assert auto._local_route(prompt, "build") is None, f"{prompt!r} should abstain"
-
-    # A single-function refactor is a solve, not a pipeline (refactor sat in both
-    # the edit and dependent sets before).
-    assert auto._local_route("Refactor this one function.", "build").workflow == WorkflowKind.SOLVE
-    assert auto._local_route("Fix the typo in the migration message.", "build").workflow == WorkflowKind.SOLVE
-
-
-def test_local_router_accepts_polite_imperatives():
-    # "can you fix..." / "please add..." are commands, not questions.
-    assert auto._local_route("can you fix the login bug?", "build").workflow == WorkflowKind.SOLVE
-    assert auto._local_route("please add a health-check endpoint", "build").workflow == WorkflowKind.SOLVE
+    for p in solve:
+        assert auto._local_route(p, "build").workflow == WorkflowKind.SOLVE, p
+    recon = ["review the auth module", "explain the config file", "read the codebase"]
+    for p in recon:
+        assert auto._local_route(p, "build").workflow == WorkflowKind.RECON, p
+    for p in ["thanks, that worked", "hey", "hi", "thank you"]:
+        assert auto._local_route(p, "build").workflow == WorkflowKind.CHAT, p
 
 
-def test_local_router_recon_requires_a_repository_object():
-    # A strong read verb naming a repo object is recon...
-    assert auto._local_route("review the auth module", "build").workflow == WorkflowKind.RECON
-    # ...but the same verb on general knowledge abstains.
-    assert auto._local_route("explain how OAuth works in general", "build") is None
-    # ...and read-then-act is multi-intent, not read-only recon.
-    assert auto._local_route("read through the config folder then apply the changes", "build") is None
+def test_local_router_abstains_on_everything_ambiguous():
+    """The mis-routes the four reviewers flagged -- each must now abstain."""
+    for p in [
+        "update: the tests now pass on CI",              # a heading, not a command
+        "write me a summary of the codebase",            # addressed to the assistant
+        "explain how async/await works in JS",           # general knowledge (the slash)
+        "explain how the map function works in JavaScript",  # general knowledge (generic noun)
+        "explain how OAuth works, e.g. the refresh flow",    # general knowledge (the dot)
+        "Should we update this dependency?",             # a question
+        "What does `delete` mean here?",                 # a question
+        "can you fix the login bug?",                    # a question (trailing ?)
+        "hey, continue fixing it",                       # greeting prefix on an action
+        "do option a",                                   # vague deixis
+        "the parser thing",                              # no imperative
+        "review the parser and fix what's broken",       # "parser" is not a repo-object noun
+    ]:
+        assert auto._local_route(p, "build") is None, f"{p!r} should abstain"
+
+
+def test_local_router_is_mode_aware():
+    # In think-first modes an edit-shaped ask is more likely ideation -> defer.
+    assert auto._local_route("fix the login bug", "plan") is None
+    assert auto._local_route("create an implementation plan for OAuth", "plan") is None
+    # ...but the same command routes in build mode.
+    assert auto._local_route("fix the login bug", "build").workflow == WorkflowKind.SOLVE
+    # Recon is mode-agnostic (inspection is always safe).
+    assert auto._local_route("review the auth module", "plan").workflow == WorkflowKind.RECON
 
 
 def test_recon_lane_exposes_only_read_only_tools():

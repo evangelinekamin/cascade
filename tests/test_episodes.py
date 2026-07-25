@@ -170,12 +170,21 @@ class TestOutcomeExtraction:
         assert "3 failed" in outcome
         assert "keep digging" not in outcome  # the generic sign-off is not the outcome
 
-    def test_captures_a_named_exception_line(self):
-        text = "Trying the fix...\n\nMcpError: MCP error -32000: Connection closed\n\nDone."
-        assert "McpError: MCP error -32000" in _extract_outcome(text)
+    def test_code_fence_is_not_scanned_for_failures(self):
+        # An example with `except Exception:` inside a fence is not a failure.
+        text = (
+            "Here's the pattern:\n\n"
+            "```python\ntry:\n    run()\nexcept Exception:\n    log()\n```\n\n"
+            "All 340 tests pass now."
+        )
+        assert _extract_outcome(text) == "All 340 tests pass now."
+
+    def test_zero_failures_and_fixed_errors_are_not_flagged(self):
+        # Success summaries that mention counts/exceptions must NOT read as failure.
+        assert _extract_outcome("Ran it.\n\n340 passed, 0 failed in 12s") == "340 passed, 0 failed in 12s"
+        assert _extract_outcome("Done.\n\nAdded Exception handling; fixed 3 errors.") == "Added Exception handling; fixed 3 errors."
 
     def test_success_prose_is_untouched_by_the_failure_scan(self):
-        # "no errors" / "error handling" must NOT be mistaken for a failure line.
         text = "I added error handling and the tests pass with no errors.\n\nAll green."
         assert _extract_outcome(text) == "All green."
 

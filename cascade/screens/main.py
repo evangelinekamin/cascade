@@ -483,7 +483,11 @@ class MainScreen(Screen):
             from ..swarm.solve import worker_guidance_for
 
             model_id = getattr(getattr(prov, "config", None), "model", "") or ""
-            guidance = worker_guidance_for(model_id)
+            # Filter to the chat tool-set so guidance never names a tool the chat
+            # loop lacks (e.g. replace_in_file, which lives only in solve worktrees).
+            registry = getattr(cli_app, "tool_registry", None)
+            available = set(registry.tool_names()) if registry is not None else None
+            guidance = worker_guidance_for(model_id, available_tools=available)
             if guidance:
                 pipeline = pipeline.add_layer("model_guidance", guidance, PRIORITY_MODE)
         return pipeline.build() or None
@@ -602,7 +606,7 @@ class MainScreen(Screen):
                     # fast-tier clone. Episodes already carry the content, so
                     # a failed/skipped summary degrades quality, not safety.
                     new_summary = None
-                    if live_run.token is None or not live_run.token.cancelled:
+                    if run.token is None or not run.token.cancelled:
                         new_summary = self._generate_compaction_summary(
                             prov, provider_name, compacted_msgs,
                         )

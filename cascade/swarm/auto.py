@@ -128,130 +128,54 @@ _ROUTE_SCHEMA = {
     "additionalProperties": False,
 }
 
-_READ_RE = re.compile(
-    r"\b(read|inspect|review|explain|trace|find|search|locate|understand|"
-    r"investigate|analy[sz]e|audit|what|where|why|how)\b",
-    re.IGNORECASE,
-)
-_EDIT_RE = re.compile(
-    r"\b(add|build|change|create|delete|edit|fix|implement|migrate|modify|"
-    r"refactor|remove|rename|replace|update|write|wire)\b",
-    re.IGNORECASE,
-)
-_DEPENDENT_RE = re.compile(
-    r"\b(across|end[- ]to[- ]end|multi[- ]step|migration|refactor|throughout|"
-    r"all (?:modules|packages|layers)|backend and frontend|schema and)\b",
-    re.IGNORECASE,
-)
-_PARALLEL_RE = re.compile(
-    r"\b(in parallel|independent(?:ly)?|disjoint|unrelated|separate modules|"
-    r"separate packages)\b",
-    re.IGNORECASE,
-)
 _FAST_EDIT_RE = re.compile(
     r"\b(typo|one[- ]line|tiny|small localized|formatting only)\b",
     re.IGNORECASE,
 )
-# A strong read verb credibly means "inspect the repository" (unlike the bare
-# question words in _READ_RE, which are just as common in ordinary chat), so --
-# paired with a concrete repository object -- it routes recon with confidence.
-_STRONG_READ_RE = re.compile(
-    r"\b(read|inspect|review|explain|trace|locate|understand|investigate|"
-    r"analy[sz]e|audit)\b",
-    re.IGNORECASE,
-)
-# The WHOLE prompt must be a greeting/acknowledgement (optionally "...that
-# worked") to be confidently chat -- a greeting PREFIX on an actionable request
-# ("hey, continue fixing it") must not be mistaken for small talk.
-_CONVERSATIONAL_FULL_RE = re.compile(
-    r"^\s*(hi|hey|hello|thanks|thank you|thx|ty|sup|yo|ok|okay|kk|got it|nice|"
-    r"cool|great|awesome|perfect|good (?:morning|evening|afternoon)|gm|nice one)"
-    r"\b[\s,!.]*(that\s+worked|it\s+worked|works|thanks|perfect|great)?\s*[.!]*$",
-    re.IGNORECASE,
-)
-# An interrogative lead (or a trailing "?") means the prompt asks rather than
-# commands -- not an edit request, whatever edit-shaped tokens it contains.
-_QUESTION_LEAD_RE = re.compile(
-    r"^\s*(?:so|and|but|ok\w*|hmm+|well|hey)?[\s,]*"
-    r"(should|shall|can|could|would|will|do|does|did|is|are|was|were|have|has|"
-    r"what|which|who|whom|whose|when|where|why|how|am|may|might)\b",
-    re.IGNORECASE,
-)
-# A polite wrapper around an imperative ("can you fix...", "please add...") is a
-# command, not a genuine question -- it should route like the bare imperative.
-_POLITE_IMPERATIVE_RE = re.compile(
-    r"^\s*(please\s+|(?:can|could|would)\s+you\s+(?:please\s+)?|"
-    r"go\s+ahead\s+and\s+|let'?s\s+)",
-    re.IGNORECASE,
-)
-# "update me", "tell me", "walk me through" -- addressed to the assistant, not a
-# code change.
-_SELF_REF_RE = re.compile(
-    r"\b(update|tell|remind|catch|fill|keep|walk|show|give)\s+(me|us)\b",
-    re.IGNORECASE,
-)
-# Continuation-style inflected verbs ("continue fixing", "still updating") carry
-# edit intent but almost always refer back to prior context -> defer.
-_ACTION_INFLECTED_RE = re.compile(
-    r"\b(fix(?:ing|ed)|add(?:ing|ed)|updat(?:ing|ed)|implement(?:ing|ed)|"
-    r"refactor(?:ing|ed)|remov(?:ing|ed)|renam(?:ing|ed)|building|built|"
-    r"creat(?:ing|ed)|chang(?:ing|ed)|writing|wrote|migrat(?:ing|ed)|"
-    r"delet(?:ing|ed)|edit(?:ing|ed)|modif(?:ying|ied)|wir(?:ing|ed))\b",
-    re.IGNORECASE,
-)
-# Genuine dependency/sequencing language -- deliberately TIGHTER than the shared
-# _DEPENDENT_RE, which counts a bare "refactor"/"migration" as dependent and so
-# mislabels a one-function refactor as a pipeline.
-_LOCAL_DEPENDENT_RE = re.compile(
-    r"\b(end[- ]to[- ]end|across (?:the )?(?:whole |entire )?(?:stack|codebase|"
-    r"code ?base|app|application|system|project)|throughout the|"
-    r"first\b[\s\S]*\bthen\b|after that|once .* (?:is|are) done|"
-    r"backend and frontend)\b",
-    re.IGNORECASE,
-)
-# A read verb only means recon when it names something in the repository;
-# otherwise it is general-knowledge chat ("explain how git rebase works").
-_REPO_OBJECT_RE = re.compile(
-    r"(\b(repo|repository|codebase|code ?base|files?|modules?|functions?|"
-    r"methods?|class(?:es)?|implementation|config(?:uration)?|diff|commits?|"
-    r"tests?|suite|logs?|errors?|traceback|schema|packages?|director(?:y|ies)|"
-    r"folders?|endpoints?|routes?|components?|widgets?|screens?|handlers?|"
-    r"providers?)\b|/|\.\w{1,4}\b)",
-    re.IGNORECASE,
-)
-# A read verb followed by a downstream action ("read X then do Y") is multi-
-# intent, not read-only recon.
-_READ_THEN_ACT_RE = re.compile(
-    r"\b(then|and then|after (?:that|which)|followed by|afterwards?)\b",
-    re.IGNORECASE,
-)
-# Leading conversational filler/politeness stripped before the verb-lead check,
-# so "yeah ok can you just fix..." is judged on "fix...". Repeated to peel stacked
-# fillers ("oh well actually, please...").
-_LEADING_FILLER_RE = re.compile(
-    r"^\s*(?:(?:so|ok|okay|kk|yeah|yep|yup|alright|aight|right|hey|oh|well|"
-    r"um+|hmm+|and|but|also|now|actually|just|please|first|then|next|lets|"
-    r"let'?s|can|could|would|you|go|ahead|i think|maybe|honestly|"
-    r"i'?d?\s+(?:like|want|love)|i\s+want|to)\b[\s,]*)+",
-    re.IGNORECASE,
-)
-# A confident route needs the governing verb to LEAD the (filler-stripped) prompt
-# -- an edit verb buried in a long conversational message is almost always
-# incidental, not a command.
-_EDIT_LEAD_RE = re.compile(_EDIT_RE.pattern, re.IGNORECASE)
-_READ_LEAD_RE = re.compile(_STRONG_READ_RE.pattern, re.IGNORECASE)
-# A command whose object is a bare trailing pronoun ("fix it", "do that") is
-# referential -- its workflow kind depends on context the local tier cannot see.
-_PRONOUN_TAIL_RE = re.compile(r"\b(it|that|this|them|those|these)\s*[.!?]*\s*$", re.IGNORECASE)
-# An edit ask longer than this may decompose into pipeline/fanout; the local
-# tier defers that judgement to the model router rather than assume solve.
-_LOCAL_SOLVE_MAX_WORDS = 40
+# Precision-first LOCAL router -- a handful of ALLOWLIST rules that fire only on
+# unambiguous imperatives and abstain (return None) on everything else, deferring
+# to the model router. This deliberately favors precision over recall (the
+# roadmap's "allowlist-known-transparent > denylist-known-bad" lesson): it must
+# never confidently mis-route. The embedding tier (Phase 2) grows recall from
+# this safe floor.
 
-
-def _imperative_head(text: str) -> str:
-    """Return *text* with a leading run of filler/politeness removed, for the
-    verb-lead test. Idempotent enough for one pass over stacked fillers."""
-    return _LEADING_FILLER_RE.sub("", text, count=1).lstrip()
+# An edit imperative: a core change verb governing a concrete object
+# (determiner + word). Anchored at the start, so a question ("should we add...")
+# or a buried mention ("the tests add coverage") cannot match, and a bare
+# pronoun object ("fix it") fails the determiner requirement -> abstains.
+_SOLVE_ALLOW_RE = re.compile(
+    r"^(?:please )?"
+    r"(fix|add|remove|delete|rename|implement|create|update|change|refactor|"
+    r"replace|wire|build|make|extract|move|split|revert|bump|upgrade|migrate|"
+    r"write|patch|correct|repair|introduce|enable|disable|convert|rewrite) "
+    r"(the|a|an|this|that|these|those|my|our|its|all|each|every|another|some) "
+    r"\S+",
+    re.IGNORECASE,
+)
+# A read imperative naming a repository object -> recon. A qualifier or two may
+# sit before the object ("review the AUTH module"), but the object set is
+# deliberately code-specific and excludes generic nouns like "function"/"class",
+# so general knowledge ("explain how the map function works") abstains rather
+# than spawning a read-only pass.
+_RECON_ALLOW_RE = re.compile(
+    r"^(?:please )?"
+    r"(read|review|inspect|explain|trace|audit|examine|summari[sz]e|describe) "
+    r"(?:the |this |that |our |my |its )?"
+    r"(?:[\w-]+ ){0,2}"
+    r"(repo|repository|codebase|code|module|modules|implementation|file|files|"
+    r"config|configuration|schema|package|packages|endpoint|endpoints|handler|"
+    r"handlers|component|components|widget|widgets|screen|screens|provider|"
+    r"providers|diff|commit|commits|test suite|tests?)\b",
+    re.IGNORECASE,
+)
+# The WHOLE prompt is a greeting/acknowledgement -> chat. fullmatch means a
+# greeting PREFIX on an action ("hey, continue fixing it") does not match.
+_GREETING_RE = re.compile(
+    r"\s*(hi|hey|hello|thanks|thank you|thx|ty|yo|sup|ok|okay|cool|nice|great|"
+    r"perfect|awesome|good (?:morning|afternoon|evening))"
+    r"[\s,!.]*(that worked|it works|works|thanks|perfect)?[\s.!]*",
+    re.IGNORECASE,
+)
 
 
 def _is_git_worktree() -> bool:
@@ -324,109 +248,54 @@ def _parse_route_payload(payload: object) -> tuple[WorkflowKind, str, float, str
     return workflow, reason, max(0.0, min(confidence, 1.0)), worker_tier
 
 
-def _heuristic_route(prompt: str, mode: str, reason_prefix: str = "") -> RouteDecision:
-    """Conservative fallback used when the configured routing model is unavailable."""
-    reads = bool(_READ_RE.search(prompt))
-    edits = bool(_EDIT_RE.search(prompt))
-    if reads and not edits:
-        workflow = WorkflowKind.RECON
-        reason = "the request asks for repository inspection without an edit"
-    elif edits and _PARALLEL_RE.search(prompt):
-        workflow = WorkflowKind.FANOUT
-        reason = "the request explicitly describes independent work"
-    elif edits and _DEPENDENT_RE.search(prompt):
-        workflow = WorkflowKind.PIPELINE
-        reason = "the request describes multiple dependent changes"
-    elif edits:
-        workflow = WorkflowKind.SOLVE
-        reason = "the request is a focused code change"
-    else:
-        workflow = WorkflowKind.CHAT
-        reason = "the request does not clearly require an automated repository workflow"
-    if reason_prefix:
-        reason = f"{reason_prefix}; {reason}"
-    tier = "fast" if workflow == WorkflowKind.SOLVE and _FAST_EDIT_RE.search(prompt) else "bulk"
+def _safe_fallback(reason: str) -> RouteDecision:
+    """When the model router is unavailable or fails, fall back to CHAT.
+
+    Chat has file + shell tools and can edit/run directly, so an unrouted prompt
+    still gets handled -- without the old lexical heuristic's habit of spawning a
+    worktree solve for a prompt it only pattern-matched as an edit.
+    """
     return RouteDecision(
-        workflow=workflow,
+        workflow=WorkflowKind.CHAT,
         reason=reason,
-        confidence=0.55,
-        worker_tier=tier,
+        confidence=0.5,
+        router_provider="fallback",
     )
 
 
 def _local_route(prompt: str, mode: str) -> Optional[RouteDecision]:
-    """A zero-cost first-tier classifier: a decision when the rule is
-    unambiguous, else ``None`` to defer to the model router.
+    """A zero-cost first tier: a confident decision only on an unambiguous
+    imperative, else ``None`` to defer to the model router.
 
-    This skips the API round-trip on the clear-cut majority -- a short edit ask
-    is a solve, a strong read verb is recon, a bare greeting is chat -- while
-    abstaining on anything genuinely ambiguous (mixed read+edit, a long or vague
-    ask), where a model's judgement earns its call. ``mode`` is accepted for
-    signature parity with the model router and reserved for future mode-aware
-    rules; the workflow kind itself does not depend on it.
+    Three allowlist rules -- an edit imperative governing a concrete object ->
+    solve, a repo-scoped read imperative -> recon, a whole-prompt greeting ->
+    chat. Everything else (questions, referential or conversational phrasing, any
+    multi-part or ambiguous ask) abstains. Precision over recall by design: it
+    must never confidently mis-route, so recall is intentionally low until the
+    embedding tier lands. ``mode`` suppresses solve routing in the think-first
+    modes, where an edit-shaped ask is more likely ideation than a command.
     """
     text = prompt.strip()
-    if not text:
+    if not text or text.endswith("?"):
         return None
-    words = len(text.split())
-    edits = bool(_EDIT_RE.search(text))
-    strong_reads = bool(_STRONG_READ_RE.search(text))
-    parallel = bool(_PARALLEL_RE.search(text))
-    dependent = bool(_LOCAL_DEPENDENT_RE.search(text))
-    polite = bool(_POLITE_IMPERATIVE_RE.match(text))
-    # A polite wrapper around an edit is a command, not a question.
-    is_question = (text.endswith("?") or bool(_QUESTION_LEAD_RE.match(text))) and not (
-        polite and edits
-    )
 
-    def _decide(workflow: WorkflowKind, reason: str, confidence: float,
-                tier: str = "bulk") -> RouteDecision:
+    def _decide(workflow: WorkflowKind, reason: str, tier: str = "bulk") -> RouteDecision:
         return RouteDecision(
             workflow=workflow,
             reason=f"local rule: {reason}",
-            confidence=confidence,
+            confidence=0.9,
             worker_tier=tier,
             router_provider="local",
         )
 
-    # Whole-prompt greeting/ack with no action -> chat.
-    if _CONVERSATIONAL_FULL_RE.match(text) and not (edits or strong_reads):
-        return _decide(WorkflowKind.CHAT, "conversational, no repository action", 0.85)
-
-    # Questions, prompts addressed to the assistant, continuation-style verbs, and
-    # conflicting structural signals are contextual or ambiguous -> defer.
-    if is_question or _SELF_REF_RE.search(text):
-        return None
-    if _ACTION_INFLECTED_RE.search(text) and not edits:
-        return None  # "continue fixing it" -- edit intent, but refers back; defer.
-    if parallel and dependent:
-        return None  # conflicting decomposition signals; let the model decide.
-
-    if edits and strong_reads:
-        return None  # "review and refactor" -- recon or solve? defer to the model.
-
-    # The governing verb must lead the (filler-stripped) prompt for a confident
-    # route; otherwise it is likely incidental in a conversational message.
-    head = _imperative_head(text)
-
-    if edits and _EDIT_LEAD_RE.match(head):
-        if _PRONOUN_TAIL_RE.search(head):
-            return None  # "fix it" -- referential object; defer to context.
-        if parallel:
-            return _decide(WorkflowKind.FANOUT, "explicit independent parallel work", 0.85)
-        if dependent:
-            return _decide(WorkflowKind.PIPELINE, "explicit dependent multi-step change", 0.85)
-        if words <= _LOCAL_SOLVE_MAX_WORDS:
-            tier = "fast" if _FAST_EDIT_RE.search(text) else "bulk"
-            return _decide(WorkflowKind.SOLVE, "a focused code change", 0.85, tier)
-        return None  # a long edit ask may decompose; defer.
-    if strong_reads and _READ_LEAD_RE.match(head):
-        # Only inspect the actual repository -- and not when a downstream action
-        # ("read X then do Y") makes it multi-intent rather than read-only.
-        if _REPO_OBJECT_RE.search(text) and not _READ_THEN_ACT_RE.search(text):
-            return _decide(WorkflowKind.RECON, "repository inspection with no edit", 0.8)
-        return None
-    return None  # weak/vague or non-leading intent: let the model router decide.
+    if _GREETING_RE.fullmatch(text):
+        return _decide(WorkflowKind.CHAT, "a bare greeting")
+    if _RECON_ALLOW_RE.match(text):
+        return _decide(WorkflowKind.RECON, "imperative repository inspection")
+    if mode not in ("plan", "design") and _SOLVE_ALLOW_RE.match(text):
+        tier = "fast" if _FAST_EDIT_RE.search(text) else "bulk"
+        return _decide(WorkflowKind.SOLVE, "imperative edit command", tier)
+    return None
 
 
 def select_workflow(
@@ -453,7 +322,7 @@ def select_workflow(
         config["provider_preferences"],
     )
     if router is None:
-        return _heuristic_route(prompt, mode, "routing model unavailable")
+        return _safe_fallback("routing model unavailable; handled as chat")
 
     try:
         request = f"Current Cascade mode: {mode}\n\nUser request:\n{prompt}"
@@ -506,7 +375,7 @@ def select_workflow(
     except Exception:
         if cancel_token is not None:
             cancel_token.checkpoint()
-        return _heuristic_route(prompt, mode, "routing model failed")
+        return _safe_fallback("routing model failed; handled as chat")
 
 
 def _route_header(decision: RouteDecision, actual: WorkflowKind | None = None) -> str:

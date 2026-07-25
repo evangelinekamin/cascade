@@ -137,18 +137,21 @@ def _extract_actions(assistant_content: str, tool_log: list[dict] | None = None)
     return tuple(actions)
 
 
-# High-signal failure lines -- patterns that rarely appear in success prose, so a
-# match credibly means the turn is reporting a failure worth preserving verbatim.
+# Fenced code (examples, snippets) is never the turn's OUTCOME, so it is stripped
+# before the failure scan -- an ``except Exception:`` in a code sample must not be
+# mistaken for a real failure.
+_CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+# Runner-shaped failure signals only -- deliberately narrow so success prose
+# ("0 failed", "added Exception handling", "fixed the TypeError") does not match.
+# A count must be non-zero; bare "Exception"/"NamedError:" are excluded because
+# they appear just as often when reporting a fix as when reporting a break.
 _FAILURE_LINE_RE = re.compile(
     r"^.*(?:"
-    r"\bFAILED\b"                              # pytest fail line (uppercase)
-    r"|\b\d+\s+(?:failed|failing|errors?)\b"   # "3 failed", "2 errors"
-    r"|\bTraceback\b"
+    r"\bFAILED\b"                               # pytest FAILED line
+    r"|\b(?!0\b)\d+\s+(?:failed|failing)\b"     # "3 failed" but not "0 failed"
+    r"|Traceback \(most recent call last\)"     # a real traceback header
     r"|\bAssertionError\b"
-    r"|\bException\b"
-    r"|\b[A-Za-z]\w+Error:"                    # TypeError:, McpError: (CamelCase)
-    r"|\bdid not pass\b|\bnot passing\b"
-    r"|[✗❌]"                         # cross marks
+    r"|[✗❌]"                          # cross marks
     r").*$",
     re.MULTILINE,
 )
@@ -162,9 +165,10 @@ def _extract_outcome(assistant_content: str, max_len: int = 300) -> str:
     what a later model needs to act on. Otherwise falls back to the last
     meaningful (non-code) paragraph as the conclusion.
     """
+    scannable = _CODE_FENCE_RE.sub("", assistant_content)
     failures: list[str] = []
     seen: set[str] = set()
-    for match in _FAILURE_LINE_RE.finditer(assistant_content):
+    for match in _FAILURE_LINE_RE.finditer(scannable):
         line = match.group(0).strip()
         if line and line not in seen:
             seen.add(line)
