@@ -203,6 +203,41 @@ def test_local_router_abstains_on_vague_deixis():
     assert auto._local_route("the parser thing", "build") is None
 
 
+def test_local_router_precision_regressions():
+    """Concrete mis-routes the codex judge flagged; each must now be safe."""
+    abstain = [
+        "Should we update this dependency?",        # question, not a command
+        "What does `delete` mean here?",            # quoted token in a question
+        "Update me on progress.",                   # addressed to the assistant
+        "hey, continue fixing it",                  # greeting prefix on an action
+        "Explain how Git rebase works.",            # general knowledge, no repo object
+        "Update the schema and tell me what changed.",  # "tell me" -> self-referential
+        "Migrate the backend and frontend end-to-end in parallel",  # conflicting signals
+    ]
+    for prompt in abstain:
+        assert auto._local_route(prompt, "build") is None, f"{prompt!r} should abstain"
+
+    # A single-function refactor is a solve, not a pipeline (refactor sat in both
+    # the edit and dependent sets before).
+    assert auto._local_route("Refactor this one function.", "build").workflow == WorkflowKind.SOLVE
+    assert auto._local_route("Fix the typo in the migration message.", "build").workflow == WorkflowKind.SOLVE
+
+
+def test_local_router_accepts_polite_imperatives():
+    # "can you fix..." / "please add..." are commands, not questions.
+    assert auto._local_route("can you fix the login bug?", "build").workflow == WorkflowKind.SOLVE
+    assert auto._local_route("please add a health-check endpoint", "build").workflow == WorkflowKind.SOLVE
+
+
+def test_local_router_recon_requires_a_repository_object():
+    # A strong read verb naming a repo object is recon...
+    assert auto._local_route("review the auth module", "build").workflow == WorkflowKind.RECON
+    # ...but the same verb on general knowledge abstains.
+    assert auto._local_route("explain how OAuth works in general", "build") is None
+    # ...and read-then-act is multi-intent, not read-only recon.
+    assert auto._local_route("read through the config folder then apply the changes", "build") is None
+
+
 def test_recon_lane_exposes_only_read_only_tools():
     app, _original = _app()
     decision = RouteDecision(WorkflowKind.RECON, "inspect", 0.9)
