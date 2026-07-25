@@ -169,6 +169,40 @@ def _elided_read_ids(before: list[dict], after: list[dict]) -> set[str]:
     return ids
 
 
+def _cache_last_message(api_messages: list[dict]) -> list[dict]:
+    """Return a copy of *api_messages* with an ephemeral cache breakpoint on the
+    last message's final content block.
+
+    Anthropic caches the contiguous prefix up to each ``cache_control`` block.
+    The system prompt and tools are already pinned, but the conversation history
+    is not -- so without this every turn re-bills the entire growing message tail
+    at full input price. Advancing a breakpoint to the tail each turn is the
+    rolling-cache pattern: the next turn reads this whole prefix at cache rates
+    and only the new delta is fresh.
+
+    The breakpoint is added to a COPY (never mutating the caller's list), because
+    the tool loop reuses ``api_messages`` across rounds and a persisted breakpoint
+    would accumulate past Anthropic's four-breakpoint limit. Returns the input
+    unchanged when there is nothing to mark.
+    """
+    if not api_messages:
+        return api_messages
+    *head, last = api_messages
+    content = last.get("content")
+    if isinstance(content, str):
+        if not content:
+            return api_messages
+        new_content = [
+            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+        ]
+    elif isinstance(content, list) and content:
+        new_content = list(content)
+        new_content[-1] = {**new_content[-1], "cache_control": {"type": "ephemeral"}}
+    else:
+        return api_messages
+    return [*head, {**last, "content": new_content}]
+
+
 @register_provider("claude")
 class ClaudeProvider(BaseProvider):
     """Anthropic Claude API provider.
@@ -303,7 +337,10 @@ class ClaudeProvider(BaseProvider):
                 "model": self.config.model,
                 "max_tokens": self.config.max_tokens or 2048,
                 "stream": True,
-                "messages": api_messages,
+                # Roll a cache breakpoint onto the newest message so the next turn
+                # reads this whole conversation prefix at cache rates instead of
+                # re-billing the growing history as fresh input.
+                "messages": _cache_last_message(api_messages),
             }
             if _accepts_sampling(self.config.model):
                 payload["temperature"] = self.config.temperature
@@ -430,7 +467,13 @@ class ClaudeProvider(BaseProvider):
             payload = {
                 "model": self.config.model,
                 "max_tokens": self.config.max_tokens or 2048,
-                "messages": api_messages,
+                # A rolling breakpoint on the tail (a fresh copy -- never persisted
+                # into api_messages, which grows each round and would otherwise
+                # accumulate breakpoints past Anthropic's limit of four) lets each
+                # round read the prior round's prefix at cache rates. This is the
+                # dominant cost in an agentic loop, which re-sends a growing
+                # history every round.
+                "messages": _cache_last_message(api_messages),
                 "tools": tool_defs,
             }
             if _accepts_sampling(self.config.model):
