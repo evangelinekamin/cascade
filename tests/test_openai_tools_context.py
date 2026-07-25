@@ -572,3 +572,51 @@ def test_loop_reports_malformed_tool_args_instead_of_executing_empty():
     assert ran == []  # never executed with empty args
     assert any("not valid JSON" in str(entry.get("output", "")) for entry in log)
     assert text == "recovered"
+
+
+def test_loop_bounces_narration_for_flagged_models():
+    # A registry-flagged model (the loop uses "qwen") that ends a round narrating
+    # an edit is pushed to act, then executes on the next round -- instead of the
+    # run ending with no changes.
+    ran = []
+
+    def write_file(path: str) -> str:
+        """Write."""
+        ran.append(path)
+        return "ok"
+
+    tools = {"write_file": callable_to_tool_def("write_file", write_file, "edit")}
+    narration = {
+        "choices": [
+            {
+                "message": {"content": "I'll now modify a.py to fix it.", "tool_calls": []},
+                "finish_reason": "stop",
+            }
+        ]
+    }
+    client = _FakeClient(
+        [narration, _tool_call_response("c1", "write_file", {"path": "a.py"}), _final_response("done")]
+    )
+    text, _log = _run_loop(client, tools, context_window=1_000_000)
+    assert ran == ["a.py"]
+    assert text == "done"
+    assert any(
+        "without calling a tool" in str(m.get("content", ""))
+        for payload in client.payloads
+        for m in payload.get("messages", [])
+    )
+
+
+def test_loop_does_not_bounce_a_conclusive_answer():
+    # A tool-less round with no future-action language is a real final answer and
+    # returns immediately -- no wasted nudge round.
+    def write_file(path: str) -> str:
+        """Write."""
+        return "ok"
+
+    tools = {"write_file": callable_to_tool_def("write_file", write_file, "edit")}
+    final = _final_response("The bug was a missing null check; no code change is needed.")
+    client = _FakeClient([final])
+    text, _log = _run_loop(client, tools, context_window=1_000_000)
+    assert "missing null check" in text
+    assert len(client.payloads) == 1  # returned without a second round

@@ -5,11 +5,13 @@ the same chat completions API format for tool calling.
 """
 
 import json
+import re
 from typing import Callable, Optional, TYPE_CHECKING
 
 import httpx
 
 from .base import ToolEvent, ToolEventCallback
+from .model_settings import settings_for
 from .usage import Usage
 from ..tools.permissions import PermissionAbort
 
@@ -43,6 +45,35 @@ _DOOM_ABORT = 3
 # path and command runs per normalized prefix across the whole loop; bail once a
 # single file and a single command have both churned this many times.
 _EDIT_RUN_THRESHOLD = 6
+
+# Narration guard: models flagged in the registry (cheap coders) tend to end a
+# turn describing an edit instead of calling the tool. A text-only round is
+# bounced back up to this many times before the text is accepted as final.
+_NARRATION_LIMIT = 2
+_NARRATION_NUDGE = (
+    "You ended your turn without calling a tool, so no files were changed and "
+    "nothing ran -- describing an edit in text does not apply it. If the task is "
+    "already complete, say so plainly; otherwise call the appropriate tool now to "
+    "make the change."
+)
+# Future-tense action language that signals an intended-but-untaken step.
+_NARRATION_RE = re.compile(
+    r"\b(i'?ll|i will|let me|i'?m going to|i am going to|going to|now i|next[,]? i|"
+    r"first[,]? i|then i'?ll|i need to|i should|let'?s)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_narration(content: str) -> bool:
+    """Whether a tool-less round reads as an intended-but-untaken action.
+
+    An empty round (the model just stopped) counts; a conclusive answer with no
+    future-action language does not, so genuine final replies are not bounced.
+    """
+    stripped = content.strip()
+    if not stripped:
+        return True
+    return bool(_NARRATION_RE.search(stripped))
 
 # File-mutating tools whose repeated "path" edits count toward the cycle guard.
 _EDIT_TOOLS = ("write_file", "append_file", "replace_in_file")
@@ -319,6 +350,12 @@ def openai_ask_with_tools(
     doom_sig = None
     edit_counts: dict[str, int] = {}
     run_counts: dict[str, int] = {}
+    narration_streak = 0
+
+    # Per-model tuning: cheap coders want near-0 sampling and narration bounces.
+    settings = settings_for(model)
+    if settings.temperature is not None:
+        temperature = settings.temperature
 
     def _capture_usage(data: dict) -> None:
         nonlocal total_usage, round_usage
@@ -420,8 +457,25 @@ def openai_ask_with_tools(
         content = message.get("content", "") or ""
 
         if not tool_calls:
+            # Narration bounce: a registry-flagged model that ends a turn
+            # describing an edit (or just stops) instead of calling a tool is
+            # pushed to actually act, rather than the run silently ending with
+            # no changes. Bounded so a genuine "done" still returns.
+            if (
+                settings.nudge_on_narration
+                and narration_streak < _NARRATION_LIMIT
+                and round_num < max_rounds - 1
+                and _looks_like_narration(content)
+            ):
+                narration_streak += 1
+                if content.strip():
+                    api_messages.append({"role": "assistant", "content": content})
+                api_messages.append({"role": "user", "content": _NARRATION_NUDGE})
+                continue
             _finalize_usage()
             return content, tool_log
+
+        narration_streak = 0
 
         # Tool calls present -> execute them REGARDLESS of finish_reason. The old
         # `finish_reason != "tool_calls"` gate silently dropped calls from compat

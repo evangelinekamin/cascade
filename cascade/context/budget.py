@@ -41,6 +41,15 @@ MODEL_WINDOWS: dict[tuple[str, str], int] = {
     ("claude", "claude-opus-4-8"): 1_000_000,
 }
 
+# Provider-agnostic substring windows: a model's context window is its own, not
+# the serving host's, so these apply whether the model is reached direct or via
+# OpenRouter. Fixes the 128k-for-every-openrouter-model assumption that made
+# Cascade compact 1M-window models ~8x too early. Checked after exact matches.
+MODEL_SUBSTRING_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("deepseek-v4", 1_000_000),
+    ("mimo-v2", 1_000_000),
+)
+
 _MILLION_SUFFIX = re.compile(r"\[1m\]", re.IGNORECASE)
 
 _CHARS_PER_TOKEN = 4
@@ -68,12 +77,15 @@ def window_for(
     CASCADE_MAX_CONTEXT_TOKENS environment variable caps the result.
     """
     provider = (provider or "").lower()
+    model_l = (model or "").lower()
     if configured:
         window = configured
     elif model and _MILLION_SUFFIX.search(model):
         window = 1_000_000
     elif (provider, model) in MODEL_WINDOWS:
         window = MODEL_WINDOWS[(provider, model)]
+    elif any(needle in model_l for needle, _ in MODEL_SUBSTRING_WINDOWS):
+        window = next(w for needle, w in MODEL_SUBSTRING_WINDOWS if needle in model_l)
     else:
         window = PROVIDER_WINDOWS.get(provider, DEFAULT_WINDOW)
 
