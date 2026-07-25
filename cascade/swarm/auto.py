@@ -414,12 +414,19 @@ def execute_auto(
     decision: RouteDecision,
     *,
     mode: str = "",
+    context: str = "",
     on_progress: ProgressCallback = None,
     on_tool_event=None,
     cancel_token: Optional[CancellationToken] = None,
     run_context: Optional[RunContext] = None,
 ) -> AutoResult:
-    """Execute a non-chat route selected by :func:`select_workflow`."""
+    """Execute a non-chat route selected by :func:`select_workflow`.
+
+    ``context`` is an optional bounded conversation digest (from
+    :func:`cascade.conversation.build_lane_context`) fed into the chosen lane so
+    a referential prompt -- "fix the errors codex found" -- can resolve its
+    referent; the focused lane otherwise runs the bare prompt with no history.
+    """
     token = cancel_token or (run_context.token if run_context is not None else None)
 
     def _checkpoint() -> None:
@@ -496,9 +503,10 @@ def execute_auto(
                 # flag forces its writable sandbox. Harmless on direct-API
                 # providers, which don't have it.
                 setattr(provider, "_force_repo_write", True)
+            recon_input = f"{context}\n\n{prompt}" if context else prompt
             with scope, callback_scope:
                 response, _log = provider.ask_with_tools(
-                    [{"role": "user", "content": prompt}],
+                    [{"role": "user", "content": recon_input}],
                     recon_tools,
                     system=recon_system,
                     max_rounds=config["recon_max_rounds"],
@@ -592,6 +600,7 @@ def execute_auto(
             on_tool_event=on_tool_event,
             cancel_token=token,
             run_context=run_context,
+            context=context,
         )
         result_cost = float(getattr(result, "cost", 0.0) or 0.0)
         return AutoResult(
@@ -612,6 +621,7 @@ def execute_auto(
             on_progress=on_progress,
             cancel_token=token,
             run_context=run_context,
+            context=context,
         )
         result_cost = float(getattr(result, "cost", 0.0) or 0.0)
         return AutoResult(
@@ -632,6 +642,7 @@ def execute_auto(
             on_progress=on_progress,
             cancel_token=token,
             run_context=run_context,
+            context=context,
         )
         # Unsafe/ambiguous parallel plans fail closed in fanout. Sequential work is
         # the safe automatic fallback and preserves progress toward the objective.
@@ -645,6 +656,7 @@ def execute_auto(
                 on_progress=on_progress,
                 cancel_token=token,
                 run_context=run_context,
+                context=context,
             )
             pipeline_cost = float(getattr(pipeline, "cost", 0.0) or 0.0)
             return AutoResult(

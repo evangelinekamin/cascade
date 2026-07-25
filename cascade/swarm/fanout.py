@@ -306,6 +306,7 @@ def run_fanout(
     on_tokens: TokensCallback = None,
     cancel_token: Optional[CancellationToken] = None,
     run_context: Optional[RunContext] = None,
+    context: str = "",
 ) -> FanoutResult:
     """Decompose *objective* into independent subtasks, build each verified in its
     own worktree, merge the passing diffs, and re-verify the whole.
@@ -526,6 +527,7 @@ def run_fanout(
                     on_tokens=_accumulate_tokens,
                     on_cost=_accumulate_cost,
                     cancel_token=token,
+                    context=context,
                 )
                 _credit_subtask(attribution)
                 if token is not None:

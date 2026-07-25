@@ -1880,6 +1880,18 @@ class CommandHandler:
 
         provider = getattr(getattr(self.app, "state", None), "active_provider", None)
 
+        # Carry the prior conversation into the otherwise history-free worktree so
+        # "/solve fix the errors codex found" can resolve its referent. Built
+        # before the command line is recorded, so it reflects genuine context.
+        from .conversation import build_lane_context
+
+        solve_state = getattr(self.app, "state", None)
+        lane_context = (
+            build_lane_context(list(solve_state.messages), provider or "")
+            if solve_state is not None
+            else ""
+        )
+
         self._post_system(f"Solving: {objective}")
         self._record_command_line(f"/solve {objective}", title=f"[Solve] {objective}")
         progress = self._mount_progress_indicator(f"solving: {objective[:60]}")
@@ -1967,6 +1979,7 @@ class CommandHandler:
                     on_tokens=_on_tokens,
                     on_tool_event=_on_tool_event,
                     run_context=run_ctx,
+                    context=lane_context,
                 )
                 outcome = result.outcome
 

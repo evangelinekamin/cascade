@@ -219,6 +219,97 @@ def state_messages_to_provider(
     return result
 
 
+# A focused lane (recon/solve/pipeline/fanout) executes one task prompt in a
+# fresh worktree with no conversation history, so a referential request --
+# "fix the errors codex found", "apply what you suggested" -- reaches it with no
+# trace of its referent. build_lane_context carries the minimum prior context
+# that makes such a request resolvable without turning the lane into a chat.
+_LANE_CONTEXT_MAX_CHARS = 6000
+_LANE_CONTEXT_USER_TURNS = 3
+
+
+def _clip(text: str, cap: int) -> str:
+    """Bound *text* to *cap* chars, eliding the middle so head and tail survive."""
+    text = text.strip()
+    if len(text) <= cap:
+        return text
+    head = cap // 2
+    return text[:head].rstrip() + "\n[...]\n" + text[-(cap - head):].lstrip()
+
+
+def build_lane_context(
+    history: list["ChatMessage"],
+    target_provider: str = "",
+    *,
+    max_chars: int = _LANE_CONTEXT_MAX_CHARS,
+    max_user_turns: int = _LANE_CONTEXT_USER_TURNS,
+) -> str:
+    """A bounded digest of the conversation for a context-free focused lane.
+
+    Returns the minimum prior context that makes a referential task resolvable:
+    the most recent cross-provider report (the classic "the errors codex found")
+    and the most recent same-provider report ("apply what you suggested"), each
+    verbatim but length-bounded, plus the last few user turns that frame the
+    task. Ordered chronologically and wrapped so the model treats it as
+    reference material, not fresh instructions. Returns "" when there is nothing
+    worth carrying (e.g. a fresh first prompt).
+
+    *history* is the conversation BEFORE the current task prompt (the caller
+    slices off the just-submitted turn); *target_provider* names the lane's
+    provider, used to tell same- from cross-provider reports apart.
+    """
+    msgs = [m for m in history if not m.metadata.get("compacted")]
+    if not msgs:
+        return ""
+
+    keep: set[int] = set()
+    # Most recent cross-provider report -- the usual referent of "what X found".
+    for i in range(len(msgs) - 1, -1, -1):
+        role = msgs[i].role
+        if role not in ("you", "system") and role != target_provider:
+            keep.add(i)
+            break
+    # Most recent same-provider report -- the referent of "what you suggested".
+    if target_provider:
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].role == target_provider:
+                keep.add(i)
+                break
+    # No assistant turn matched (e.g. provider names differ from history): fall
+    # back to the single most recent report of any kind.
+    if not keep:
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].role not in ("you", "system"):
+                keep.add(i)
+                break
+    # Recent user turns frame the ongoing task.
+    for i in [j for j, m in enumerate(msgs) if m.role == "you"][-max_user_turns:]:
+        keep.add(i)
+    if not keep:
+        return ""
+
+    # Reports get the bulk of the budget (they are the referent); user turns are
+    # short imperatives. Split the report budget so multiple reports both fit.
+    report_idx = [i for i in keep if msgs[i].role != "you"]
+    user_idx = [i for i in keep if msgs[i].role == "you"]
+    report_budget = max(1500, (max_chars - 400 * len(user_idx)) // max(1, len(report_idx)))
+
+    lines: list[str] = []
+    for i in sorted(keep):
+        m = msgs[i]
+        cap = 400 if m.role == "you" else report_budget
+        lines.append(f"{m.role}: {_clip(m.content, cap)}")
+
+    body = "\n\n".join(lines)
+    if len(body) > max_chars:  # safety net; per-item budgets already fit
+        body = body[:max_chars].rstrip() + "\n[...]"
+    return (
+        "[Prior conversation, for reference only. The task below is your only "
+        "instruction; use this to resolve what it refers to, and do not repeat "
+        "or re-execute anything already done here.]\n\n" + body
+    )
+
+
 def estimate_tokens(messages: list["Message"]) -> int:
     """Rough token estimate. ~1 token per 4 chars for English text."""
     return sum(len(m.get("content", "")) for m in messages) // 4

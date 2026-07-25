@@ -235,6 +235,7 @@ def run_pipeline(
     on_tokens: TokensCallback = None,
     cancel_token: Optional[CancellationToken] = None,
     run_context: Optional[RunContext] = None,
+    context: str = "",
 ) -> PipelineResult:
     """Decompose *objective* and build it step by step, each step test-verified.
 
@@ -382,6 +383,7 @@ def run_pipeline(
                 on_tokens=_accumulate_tokens,
                 on_cost=_accumulate_cost,
                 cancel_token=token,
+                context=context,
             )
             _credit_step(attribution)
             if token is not None:

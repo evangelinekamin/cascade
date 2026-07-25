@@ -747,6 +747,7 @@ def run_verified_task(
     on_cost: CostCallback = None,
     on_tool_event=None,
     cancel_token: Optional[CancellationToken] = None,
+    context: str = "",
 ) -> "tuple[WorkerResult, list[str], list[str]]":
     """Run the escalating verified loop for one task against an existing worktree.
 
@@ -862,6 +863,7 @@ def run_verified_task(
         lambda: worktree_path,
         max_iterations=max_iterations,
         describe_changes=_worktree_change_summary,
+        context=context,
     )
     result = worker.run(task, on_attempt=on_attempt)
 
@@ -933,6 +935,7 @@ def run_solve(
     on_tool_event=None,
     cancel_token: Optional[CancellationToken] = None,
     run_context: Optional[RunContext] = None,
+    context: str = "",
 ) -> SolveResult:
     """Run *task* to a verified diff in an isolated worktree.
 
@@ -951,6 +954,11 @@ def run_solve(
     handoff is visible. ``bulk_model_override`` and
     ``provider_preferences_override`` let the automatic router start a tiny
     verified task on its selected fast lane without mutating global config.
+
+    ``context`` is an optional bounded digest of the prior conversation (see
+    :func:`cascade.conversation.build_lane_context`) prepended to the worker
+    prompt so a referential task -- "fix the errors codex found" -- can resolve
+    its referent; the worktree itself still carries no chat history.
     """
     provider_name = provider_name or app.config.get_default_provider()
     token = cancel_token or (run_context.token if run_context is not None else None)
@@ -1068,6 +1076,7 @@ def run_solve(
             on_cost=_accumulate_cost,
             on_tool_event=on_tool_event,
             cancel_token=token,
+            context=context,
         )
         if token is not None:
             token.checkpoint()

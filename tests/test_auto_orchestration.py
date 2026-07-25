@@ -205,6 +205,40 @@ def test_focused_route_delegates_to_verified_solve(monkeypatch):
     assert "Review + apply: git -C /tmp/solve-wt diff" in result.text
 
 
+def test_recon_lane_receives_conversation_context():
+    app, _original = _app()
+    decision = RouteDecision(WorkflowKind.RECON, "inspect", 0.9)
+
+    auto.execute_auto(
+        app, "trace what codex flagged", "openai", decision,
+        context="[Prior conversation]\ncodex: CTX_REFERENT the bug is in x.py",
+    )
+
+    messages, _kwargs = _FakeOpenRouter.last_instance.tool_call
+    # The referent rides along in the recon user message, ahead of the task.
+    assert "CTX_REFERENT" in messages[0]["content"]
+    assert "trace what codex flagged" in messages[0]["content"]
+
+
+def test_focused_solve_forwards_conversation_context(monkeypatch):
+    app, _original = _app()
+    solve_result = SimpleNamespace(
+        outcome=RunOutcome.SUCCEEDED, iterations=1, provider="openai",
+        models_used=("bulk",), error="", diff_stat="", changed_files=(),
+        worktree_path="/tmp/wt", input_tokens=0, output_tokens=0,
+    )
+    called = MagicMock(return_value=solve_result)
+    monkeypatch.setattr(auto, "run_solve", called)
+    decision = RouteDecision(WorkflowKind.SOLVE, "edit", 0.8)
+
+    auto.execute_auto(
+        app, "fix the errors codex found", "openai", decision,
+        context="codex: CTX_REFERENT list of errors",
+    )
+
+    assert called.call_args.kwargs["context"] == "codex: CTX_REFERENT list of errors"
+
+
 def test_fast_solve_starts_on_mercury_then_escalates_to_active_frontier(monkeypatch):
     app, _original = _app()
     solve_result = SimpleNamespace(
@@ -350,4 +384,5 @@ def test_normal_design_mode_prompt_dispatches_selected_workflow(monkeypatch):
         "Implement the parser",
         "openai",
         decision,
+        context="",  # empty history -> no digest, but the arg is threaded
     )

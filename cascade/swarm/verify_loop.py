@@ -109,6 +109,7 @@ class VerifiedWorker:
         prepare_worktree: PrepareWorktree,
         max_iterations: int = 3,
         describe_changes: Optional[DescribeChanges] = None,
+        context: str = "",
     ) -> None:
         if max_iterations < 1:
             raise ValueError("max_iterations must be >= 1")
@@ -117,6 +118,7 @@ class VerifiedWorker:
         self._prepare_worktree = prepare_worktree
         self._max_iterations = max_iterations
         self._describe_changes = describe_changes
+        self._context = context
 
     def run(
         self,
@@ -157,12 +159,17 @@ class VerifiedWorker:
 
     def _build_prompt(self, task: str, attempts: "List[VerifyAttempt]", path: str) -> str:
         if not attempts:
-            return _INITIAL_PROMPT.format(task=task)
-        failure = _compact_test_output(attempts[-1].test_output)
-        prompt = _RETRY_PROMPT.format(task=task, failure=failure)
-        changes = self._changes_note(path)
-        if changes:
-            return _CHANGES_PREFIX.format(changes=changes) + prompt
+            prompt = _INITIAL_PROMPT.format(task=task)
+        else:
+            failure = _compact_test_output(attempts[-1].test_output)
+            prompt = _RETRY_PROMPT.format(task=task, failure=failure)
+            changes = self._changes_note(path)
+            if changes:
+                prompt = _CHANGES_PREFIX.format(changes=changes) + prompt
+        # Conversation context (if any) leads every iteration so a referential
+        # task keeps its referent through retries, not just the first attempt.
+        if self._context:
+            return f"{self._context}\n\n{prompt}"
         return prompt
 
     def _changes_note(self, path: str) -> str:

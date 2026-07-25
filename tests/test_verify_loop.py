@@ -13,13 +13,17 @@ from cascade.swarm.verify_loop import (
 )
 
 
-def _worker(run_agent, run_tests, *, max_iterations=3, path="/tmp/wt", describe_changes=None):
+def _worker(
+    run_agent, run_tests, *, max_iterations=3, path="/tmp/wt",
+    describe_changes=None, context="",
+):
     return VerifiedWorker(
         run_agent=run_agent,
         run_tests=run_tests,
         prepare_worktree=lambda: path,
         max_iterations=max_iterations,
         describe_changes=describe_changes,
+        context=context,
     )
 
 
@@ -217,3 +221,54 @@ def test_change_summary_describer_errors_do_not_break_the_loop():
     )
     result = worker.run("build feature")
     assert result.passed is True  # a broken describer must not sink the run
+
+
+# --- Conversation context (referential tasks keep their referent) ---------------
+
+
+def test_context_leads_the_initial_prompt():
+    prompts: list[str] = []
+
+    def agent(prompt, path):
+        prompts.append(prompt)
+        return "edited"
+
+    worker = _worker(
+        agent, lambda path: ("ok", 0),
+        context="[Prior conversation]\ncodex: CTX_REFERENT the errors are in x.ts",
+    )
+    worker.run("fix the errors codex found")
+
+    assert prompts[0].startswith("[Prior conversation]")
+    assert "CTX_REFERENT" in prompts[0]
+    assert "fix the errors codex found" in prompts[0]  # task still present
+
+
+def test_context_persists_across_retries():
+    prompts: list[str] = []
+
+    def agent(prompt, path):
+        prompts.append(prompt)
+        return "edited"
+
+    results = iter([("FAILED_ONCE", 1), ("ok", 0)])
+    worker = _worker(agent, lambda path: next(results), context="CTX_REFERENT block")
+    worker.run("do it")
+
+    # The referent must survive into the retry, not just the first attempt.
+    assert "CTX_REFERENT" in prompts[0]
+    assert "CTX_REFERENT" in prompts[1]
+    assert "FAILED_ONCE" in prompts[1]  # retry still carries the failure too
+
+
+def test_empty_context_leaves_the_prompt_unchanged():
+    prompts: list[str] = []
+
+    def agent(prompt, path):
+        prompts.append(prompt)
+        return "edited"
+
+    worker = _worker(agent, lambda path: ("ok", 0), context="")
+    worker.run("plain task")
+
+    assert prompts[0].startswith("Task:")  # no context preamble prepended

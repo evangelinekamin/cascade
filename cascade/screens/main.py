@@ -662,13 +662,24 @@ class MainScreen(Screen):
             run.add_tokens(decision.input_tokens, decision.output_tokens)
             run.add_cost(decision.cost)
             if decision.workflow != WorkflowKind.CHAT:
+                # The focused lane runs the bare prompt in a fresh worktree, so a
+                # referential request ("fix the errors codex found") needs the
+                # referent carried in explicitly -- the current turn is already
+                # in state, so digest everything before it.
+                from ..conversation import build_lane_context
+
+                lane_context = build_lane_context(
+                    list(self.app.state.messages)[:-1], provider_name,
+                )
                 if managed_run:
                     self._auto_orchestration_worker(
                         cli_app, prompt, provider_name, decision, run,
+                        context=lane_context,
                     )
                 else:
                     self._auto_orchestration_worker(
                         cli_app, prompt, provider_name, decision,
+                        context=lane_context,
                     )
                 return
 
@@ -700,6 +711,8 @@ class MainScreen(Screen):
         provider_name: str,
         decision,
         run: RunContext | None = None,
+        *,
+        context: str = "",
     ) -> None:
         """Execute and record a model-selected non-chat workflow."""
         from ..swarm.auto import execute_auto
@@ -730,6 +743,7 @@ class MainScreen(Screen):
                 provider_name,
                 decision,
                 mode=self._mode,
+                context=context,
                 on_progress=_progress,
                 on_tool_event=_tool_event,
                 cancel_token=live_run.token,
