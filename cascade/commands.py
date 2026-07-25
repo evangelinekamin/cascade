@@ -115,8 +115,8 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("log", "/log", "Scroll the last /solve's full activity + verified diff"),
     CommandDef(
         "compete",
-        "/compete [--providers a,b | --models m1,m2] [--judge x] <task>",
-        "Build a coding task across models/providers in worktrees; judge + keep the winner",
+        "/compete [--providers a,b | --models m1,m2] [--judge x] [--list] <task>",
+        "Build a coding task across models/providers in worktrees; judge + keep the winner (--list keeps all + a manifest)",
     ),
     CommandDef(
         "compete-chat",
@@ -558,18 +558,21 @@ class CommandHandler:
     @staticmethod
     def _parse_compete_args(
         args: list[str],
-    ) -> tuple[list[str] | None, list[str] | None, str | None, str | None]:
-        """Parse optional --providers / --models / --judge flags.
+    ) -> tuple[list[str] | None, list[str] | None, str | None, bool, str | None]:
+        """Parse optional --providers / --models / --judge / --list flags.
 
         --providers a,b competes those configured providers (one model each).
         --models m1,m2 competes several OpenRouter model ids through the one
-        openrouter provider/key. --judge x picks the judge. Returns
-        (providers, models, judge, objective), or all-None on a malformed flag.
+        openrouter provider/key. --judge x picks the judge. --list forces list
+        mode -- keep every worktree and write a manifest, no judge -- even for a
+        small heat. Returns (providers, models, judge, list_mode, objective), or
+        all-None/False on a malformed flag.
         """
-        fail = (None, None, None, None)
+        fail = (None, None, None, False, None)
         providers: list[str] | None = None
         models: list[str] | None = None
         judge: str | None = None
+        list_mode = False
         index = 0
 
         def _list(raw: str, lower: bool) -> list[str]:
@@ -580,6 +583,10 @@ class CommandHandler:
             token = args[index]
             # A flag takes its value from "--flag=v" or the next token.
             key, _, inline = token.partition("=")
+            if key == "--list":  # valueless boolean flag
+                list_mode = True
+                index += 1
+                continue
             if key in ("--providers", "--models", "--judge"):
                 if inline:
                     value = inline
@@ -608,7 +615,7 @@ class CommandHandler:
         objective = " ".join(args[index:]).strip()
         if not objective:
             return fail
-        return providers, models, judge, objective
+        return providers, models, judge, list_mode, objective
 
     def _resolve_compete_request(
         self,
@@ -616,11 +623,11 @@ class CommandHandler:
         command_name: str,
         label: str,
     ):
-        providers_arg, models_arg, judge_arg, objective = self._parse_compete_args(args)
+        providers_arg, models_arg, judge_arg, list_mode, objective = self._parse_compete_args(args)
         if objective is None:
             self._post_system(
                 f"Usage: /{command_name} [--providers a,b | --models m1,m2] "
-                f"[--judge x] <task description>"
+                f"[--judge x] [--list] <task description>"
             )
             return None
 
@@ -671,7 +678,7 @@ class CommandHandler:
             )
             return None
 
-        return cli_app, selected, judge_arg, objective, overrides
+        return cli_app, selected, judge_arg, objective, overrides, list_mode
 
     def _build_model_overrides(self, cli_app, models: list[str], label: str):
         """Clone the openrouter provider once per model id (single-key model A/B).
@@ -2372,7 +2379,8 @@ class CommandHandler:
         request = self._resolve_compete_request(args, "compete", "Competition")
         if request is None:
             return
-        cli_app, selected, judge_arg, objective, overrides = request
+        # Chat competition always judges (no worktrees to keep), so --list is n/a.
+        cli_app, selected, judge_arg, objective, overrides, _list_mode = request
         provider_states = {provider: "queued" for provider in selected}
         judge_status = ""
 
@@ -2480,17 +2488,22 @@ class CommandHandler:
         request = self._resolve_compete_request(args, "compete-code", "Code competition")
         if request is None:
             return
-        cli_app, selected, judge_arg, objective, overrides = request
+        cli_app, selected, judge_arg, objective, overrides, list_mode = request
         provider_states = {provider: "queued" for provider in selected}
         judge_status = ""
-        use_judge = len(selected) <= self._COMPETE_JUDGE_MAX
+        # List mode (explicit --list, or more competitors than a judge compares
+        # well) keeps every worktree + a manifest instead of judging a winner.
+        use_judge = not list_mode and len(selected) <= self._COMPETE_JUDGE_MAX
 
-        judge_line = (
-            f"Judge: {judge_arg or 'auto'}"
-            if use_judge
-            else f"Judge: skipped ({len(selected)} > {self._COMPETE_JUDGE_MAX}); "
-            "keeping all worktrees for review"
-        )
+        if use_judge:
+            judge_line = f"Judge: {judge_arg or 'auto'}"
+        elif list_mode:
+            judge_line = "Judge: skipped (--list); keeping all worktrees + manifest"
+        else:
+            judge_line = (
+                f"Judge: skipped ({len(selected)} > {self._COMPETE_JUDGE_MAX}); "
+                "keeping all worktrees + manifest"
+            )
         self._post_system(
             f"Code competition dispatching: {objective}\n"
             f"Providers: {', '.join(selected)}\n"
@@ -2538,12 +2551,11 @@ class CommandHandler:
                 )
 
                 if result.judgment is None:
-                    # List mode: too many competitors to judge well. Report the raw
-                    # per-model data below and leave every worktree in place.
+                    # List mode: report the raw per-model data below and leave
+                    # every worktree in place for downstream review.
                     lines = [
                         f"Code competition complete. {len(result.entries)} models, "
-                        f"judging skipped (> {self._COMPETE_JUDGE_MAX}); "
-                        "all worktrees kept for review."
+                        "judging skipped; all worktrees kept for review."
                     ]
                     lines.append(f"Total tokens: {result.total_tokens:,}")
                     lines.append("")

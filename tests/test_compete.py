@@ -706,14 +706,29 @@ class TestCompeteCommand:
 
 
 def test_parse_compete_args_supports_models_flag():
-    p, m, j, o = CommandHandler._parse_compete_args(
+    p, m, j, lst, o = CommandHandler._parse_compete_args(
         ["--models", "deepseek/deepseek-v4-flash,moonshotai/kimi-k3",
          "--judge", "claude", "build", "the", "thing"]
     )
     assert p is None
     assert m == ["deepseek/deepseek-v4-flash", "moonshotai/kimi-k3"]
     assert j == "claude"
+    assert lst is False
     assert o == "build the thing"
+
+
+def test_parse_compete_args_list_flag_forces_list_mode():
+    p, m, j, lst, o = CommandHandler._parse_compete_args(
+        ["--models", "a/b,c/d", "--list", "do", "it"]
+    )
+    assert m == ["a/b", "c/d"]
+    assert lst is True
+    assert o == "do it"
+    # Order-independent and value-less: --list among other flags still parses.
+    _, _, _, lst2, o2 = CommandHandler._parse_compete_args(
+        ["--list", "--judge", "claude", "go"]
+    )
+    assert lst2 is True and o2 == "go"
 
 
 def test_models_flag_clones_openrouter_per_model():
