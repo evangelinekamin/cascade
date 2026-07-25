@@ -5,7 +5,13 @@ from dataclasses import dataclass, field
 
 @dataclass
 class CompetitionEntry:
-    """Result from running the same task against one provider."""
+    """Result from running the same task against one competitor.
+
+    ``provider`` is the competitor label (a provider name, or a model label when
+    several models compete through one provider). ``model`` records the exact
+    model that ran, and ``cost`` the provider-reported USD when available
+    (OpenRouter); both feed the per-competitor tokens/cost/speed comparison.
+    """
 
     provider: str
     response: str
@@ -18,6 +24,8 @@ class CompetitionEntry:
     diff_stat: str = ""
     diff_excerpt: str = ""
     retained: bool = False
+    model: str = ""
+    cost: float = 0.0
 
 
 @dataclass(frozen=True)

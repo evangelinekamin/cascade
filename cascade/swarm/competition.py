@@ -74,10 +74,20 @@ class CompetitionOrchestrator:
         app: "CascadeCore",
         judge_provider: Optional[str] = None,
         max_workers: int = 4,
+        provider_overrides: Optional[dict] = None,
     ) -> None:
         self._app = app
+        # Competitor label -> a provider INSTANCE that overrides app.providers.
+        # This is how several models compete through one provider (e.g. many
+        # OpenRouter models under one key): each label maps to a clone of the
+        # base provider running that model.
+        self._provider_overrides = dict(provider_overrides or {})
         self._judge_provider = judge_provider or self._pick_judge_provider()
         self._max_workers = max_workers
+
+    def _resolve_provider(self, name: str):
+        """A competitor's provider: an override clone first, else app.providers."""
+        return self._provider_overrides.get(name) or self._app.providers.get(name)
 
     def _pick_judge_provider(self) -> str:
         """Pick the best available provider for judging."""
@@ -117,7 +127,7 @@ class CompetitionOrchestrator:
         if on_progress:
             on_progress("competing", f"[{provider_name}] running")
 
-        provider = self._app.providers.get(provider_name)
+        provider = self._resolve_provider(provider_name)
         if provider is None:
             return CompetitionEntry(
                 provider=provider_name,
@@ -320,7 +330,7 @@ class CompetitionOrchestrator:
         if on_progress:
             on_progress("competing", f"[{provider_name}] coding in {worktree_path}")
 
-        provider = self._app.providers.get(provider_name)
+        provider = self._resolve_provider(provider_name)
         if provider is None:
             return CompetitionEntry(
                 provider=provider_name,
@@ -348,6 +358,8 @@ class CompetitionOrchestrator:
             prompt = self._build_code_prompt(objective, worktree_path)
             response = run_agent_in_worktree(provider, prompt, worktree_path, system=system)
             usage = provider.last_usage or Usage()
+            model = getattr(getattr(provider, "config", None), "model", "") or ""
+            cost = float(usage.cost or 0.0)
             snapshot = self._safe_snapshot(manager, worktree_path)
             if not self._has_code_changes(snapshot):
                 return CompetitionEntry(
@@ -358,6 +370,8 @@ class CompetitionOrchestrator:
                     success=False,
                     error="no changes produced",
                     worktree_path=worktree_path,
+                    model=model,
+                    cost=cost,
                     **self._snapshot_fields(snapshot),
                 )
             return CompetitionEntry(
@@ -367,6 +381,8 @@ class CompetitionOrchestrator:
                 duration_seconds=time.monotonic() - start,
                 success=True,
                 worktree_path=worktree_path,
+                model=model,
+                cost=cost,
                 **self._snapshot_fields(snapshot),
             )
         except Exception as exc:

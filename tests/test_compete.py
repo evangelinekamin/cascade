@@ -463,7 +463,9 @@ class TestCompeteCommand:
                 ["--providers", "claude,openai", "--judge", "gemini", "build", "thing"]
             )
 
-        mock_orchestrator.assert_called_once_with(cli_app, judge_provider="gemini")
+        mock_orchestrator.assert_called_once_with(
+            cli_app, judge_provider="gemini", provider_overrides={}
+        )
         instance.execute.assert_called_once_with(
             "build thing",
             providers=["claude", "openai"],
@@ -536,7 +538,9 @@ class TestCompeteCommand:
                 ["--providers", "claude,openai", "--judge", "gemini", "fix", "bug"]
             )
 
-        mock_orchestrator.assert_called_once_with(cli_app, judge_provider="gemini")
+        mock_orchestrator.assert_called_once_with(
+            cli_app, judge_provider="gemini", provider_overrides={}
+        )
         instance.execute_code.assert_called_once_with(
             "fix bug",
             providers=["claude", "openai"],
@@ -551,7 +555,7 @@ class TestCompeteCommand:
         app.record_message.assert_any_call("user", "/compete-code --providers claude,openai --judge gemini fix bug", token_count=0)
         app.record_message.assert_any_call("system", posted[-1], token_count=0)
         assert "Winner worktree: /tmp/cascade-compete/openai" in posted[-1]
-        assert "[openai] OK (1.00s, 140 tokens) | 1 file changed, 1 insertion(+), 1 deletion(-)" in posted[-1]
+        assert "[openai] OK (1.0s, 140 tok, 140 tok/s) | 1 file changed, 1 insertion(+), 1 deletion(-)" in posted[-1]
         assert "Files: app.txt, tests.txt" in posted[-1]
 
     def test_compete_code_command_shows_no_diff_failures(self):
@@ -608,7 +612,7 @@ class TestCompeteCommand:
             instance.execute_code.return_value = fake_result
             handler._cmd_compete_code(["fix", "bug"])
 
-        assert "[claude] FAIL: no changes produced (1.20s, 150 tokens) | no diff" in posted[-1]
+        assert "[claude] FAIL: no changes produced (1.2s, 150 tok, 125 tok/s) | no diff" in posted[-1]
 
     def test_compete_command_rejects_unknown_provider(self):
         app = MagicMock()
@@ -651,3 +655,48 @@ class TestCompeteCommand:
         assert posted == [
             "Competition judge 'openai' not found. Available: claude, gemini"
         ]
+
+
+def test_parse_compete_args_supports_models_flag():
+    p, m, j, o = CommandHandler._parse_compete_args(
+        ["--models", "deepseek/deepseek-v4-flash,moonshotai/kimi-k3",
+         "--judge", "claude", "build", "the", "thing"]
+    )
+    assert p is None
+    assert m == ["deepseek/deepseek-v4-flash", "moonshotai/kimi-k3"]
+    assert j == "claude"
+    assert o == "build the thing"
+
+
+def test_models_flag_clones_openrouter_per_model():
+    from types import SimpleNamespace
+    from cascade.providers.base import ProviderConfig
+    from cascade.providers.openrouter import OpenRouterProvider
+
+    base = OpenRouterProvider(ProviderConfig(api_key="k", model="base-model"))
+    cli_app = SimpleNamespace(providers={"openrouter": base})
+    handler = CommandHandler(MagicMock())
+    handler._post_system = lambda *a, **k: None
+
+    built = handler._build_model_overrides(
+        cli_app, ["deepseek/deepseek-v4-flash", "moonshotai/kimi-k3"], "Code competition"
+    )
+    assert built is not None
+    labels, overrides = built
+    # Filesystem-safe labels, one clone each, running the requested model, distinct
+    # instances from the base (so config.model swaps don't collide).
+    assert labels == ["deepseek-deepseek-v4-flash", "moonshotai-kimi-k3"]
+    assert overrides[labels[0]].config.model == "deepseek/deepseek-v4-flash"
+    assert overrides[labels[1]].config.model == "moonshotai/kimi-k3"
+    assert overrides[labels[0]] is not base
+
+
+def test_models_flag_needs_openrouter_and_two_models():
+    from types import SimpleNamespace
+
+    handler = CommandHandler(MagicMock())
+    handler._post_system = lambda *a, **k: None
+    # No openrouter provider -> None.
+    assert handler._build_model_overrides(
+        SimpleNamespace(providers={}), ["a/b", "c/d"], "x"
+    ) is None

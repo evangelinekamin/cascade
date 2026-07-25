@@ -115,13 +115,13 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("log", "/log", "Scroll the last /solve's full activity + verified diff"),
     CommandDef(
         "compete",
-        "/compete [--providers a,b] [--judge x] <task>",
-        "Run the same task across providers and pick a winner",
+        "/compete [--providers a,b | --models m1,m2] [--judge x] <task>",
+        "Build a coding task across models/providers in worktrees; judge + keep the winner",
     ),
     CommandDef(
-        "compete-code",
-        "/compete-code [--providers a,b] [--judge x] <task>",
-        "Run a coding task in isolated worktrees and keep the winning workspace",
+        "compete-chat",
+        "/compete-chat [--providers a,b] [--judge x] <prompt>",
+        "Run a chat prompt across providers and pick a winner (no code changes)",
     ),
     CommandDef("episodes", "/episodes", "Show episode history"),
     CommandDef("tree", "/tree", "Show session branch tree"),
@@ -255,8 +255,9 @@ class CommandHandler:
             "pipeline": self._cmd_pipeline,
             "fanout": self._cmd_fanout,
             "log": self._cmd_log,
-            "compete": self._cmd_compete,
-            "compete-code": self._cmd_compete_code,
+            "compete": self._cmd_compete_code,       # it obviously competes on code
+            "compete-code": self._cmd_compete_code,  # alias / muscle memory
+            "compete-chat": self._cmd_compete,       # the no-code chat competition
             "episodes": self._cmd_episodes,
             "tree": self._cmd_tree,
             "branch": self._cmd_branch,
@@ -552,52 +553,57 @@ class CommandHandler:
     @staticmethod
     def _parse_compete_args(
         args: list[str],
-    ) -> tuple[list[str] | None, str | None, str | None]:
-        """Parse optional provider/judge flags from /compete args."""
+    ) -> tuple[list[str] | None, list[str] | None, str | None, str | None]:
+        """Parse optional --providers / --models / --judge flags.
+
+        --providers a,b competes those configured providers (one model each).
+        --models m1,m2 competes several OpenRouter model ids through the one
+        openrouter provider/key. --judge x picks the judge. Returns
+        (providers, models, judge, objective), or all-None on a malformed flag.
+        """
+        fail = (None, None, None, None)
         providers: list[str] | None = None
+        models: list[str] | None = None
         judge: str | None = None
         index = 0
 
+        def _list(raw: str, lower: bool) -> list[str]:
+            items = [(x.strip().lower() if lower else x.strip()) for x in raw.split(",")]
+            return [x for x in items if x]
+
         while index < len(args):
             token = args[index]
-            if token == "--providers":
-                index += 1
-                if index >= len(args):
-                    return None, None, None
-                raw = args[index]
-                providers = [name.strip().lower() for name in raw.split(",") if name.strip()]
-                if not providers:
-                    return None, None, None
-                index += 1
-                continue
-            if token.startswith("--providers="):
-                raw = token.split("=", 1)[1]
-                providers = [name.strip().lower() for name in raw.split(",") if name.strip()]
-                if not providers:
-                    return None, None, None
-                index += 1
-                continue
-            if token == "--judge":
-                index += 1
-                if index >= len(args):
-                    return None, None, None
-                judge = args[index].strip().lower() or None
-                if judge is None:
-                    return None, None, None
-                index += 1
-                continue
-            if token.startswith("--judge="):
-                judge = token.split("=", 1)[1].strip().lower() or None
-                if judge is None:
-                    return None, None, None
-                index += 1
+            # A flag takes its value from "--flag=v" or the next token.
+            key, _, inline = token.partition("=")
+            if key in ("--providers", "--models", "--judge"):
+                if inline:
+                    value = inline
+                    index += 1
+                else:
+                    index += 1
+                    if index >= len(args):
+                        return fail
+                    value = args[index]
+                    index += 1
+                if key == "--providers":
+                    providers = _list(value, lower=True) or None
+                    if providers is None:
+                        return fail
+                elif key == "--models":
+                    models = _list(value, lower=False) or None
+                    if models is None:
+                        return fail
+                else:
+                    judge = value.strip().lower() or None
+                    if judge is None:
+                        return fail
                 continue
             break
 
         objective = " ".join(args[index:]).strip()
         if not objective:
-            return None, None, None
-        return providers, judge, objective
+            return fail
+        return providers, models, judge, objective
 
     def _resolve_compete_request(
         self,
@@ -605,10 +611,11 @@ class CommandHandler:
         command_name: str,
         label: str,
     ):
-        providers_arg, judge_arg, objective = self._parse_compete_args(args)
+        providers_arg, models_arg, judge_arg, objective = self._parse_compete_args(args)
         if objective is None:
             self._post_system(
-                f"Usage: /{command_name} [--providers a,b] [--judge x] <task description>"
+                f"Usage: /{command_name} [--providers a,b | --models m1,m2] "
+                f"[--judge x] <task description>"
             )
             return None
 
@@ -616,41 +623,87 @@ class CommandHandler:
         if cli_app is None:
             self._post_system(f"{label} requires CLI app.")
             return None
-
         available = list(cli_app.providers.keys())
-        if len(available) < 2:
-            self._post_system(
-                f"{label} needs 2+ providers. Have: {available}. "
-                f"Use /login to add more."
-            )
-            return None
 
-        selected = providers_arg or available
-        deduped: list[str] = []
-        for provider_name in selected:
-            if provider_name not in deduped:
-                deduped.append(provider_name)
-        selected = deduped
+        # --models competes several OpenRouter model ids through the ONE openrouter
+        # provider/key -- the shape needed to A/B bulk models. Each becomes a clone
+        # labelled by a filesystem-safe form of its id.
+        if models_arg:
+            built = self._build_model_overrides(cli_app, models_arg, label)
+            if built is None:
+                return None
+            selected, overrides = built
+        else:
+            overrides = {}
+            if len(available) < 2:
+                self._post_system(
+                    f"{label} needs 2+ providers (or use --models). Have: {available}. "
+                    f"Use /login to add more."
+                )
+                return None
+            selected = providers_arg or available
+            deduped: list[str] = []
+            for provider_name in selected:
+                if provider_name not in deduped:
+                    deduped.append(provider_name)
+            selected = deduped
+            invalid = [p for p in selected if p not in cli_app.providers]
+            if invalid:
+                self._post_system(
+                    f"{label} provider(s) not found: {', '.join(invalid)}. "
+                    f"Available: {', '.join(available)}"
+                )
+                return None
+            if len(selected) < 2:
+                self._post_system(
+                    f"{label} needs 2+ selected providers. Selected: {', '.join(selected)}"
+                )
+                return None
 
-        invalid = [provider_name for provider_name in selected if provider_name not in cli_app.providers]
-        if invalid:
-            self._post_system(
-                f"{label} provider(s) not found: {', '.join(invalid)}. "
-                f"Available: {', '.join(available)}"
-            )
-            return None
-        if len(selected) < 2:
-            self._post_system(
-                f"{label} needs 2+ selected providers. Selected: {', '.join(selected)}"
-            )
-            return None
         if judge_arg and judge_arg not in cli_app.providers:
             self._post_system(
                 f"{label} judge '{judge_arg}' not found. Available: {', '.join(available)}"
             )
             return None
 
-        return cli_app, selected, judge_arg, objective
+        return cli_app, selected, judge_arg, objective, overrides
+
+    def _build_model_overrides(self, cli_app, models: list[str], label: str):
+        """Clone the openrouter provider once per model id (single-key model A/B).
+
+        Returns (labels, overrides) -- labels are filesystem-safe competitor names,
+        overrides maps each to a provider clone running that model -- or None
+        (after posting why) on failure.
+        """
+        import re
+        from dataclasses import replace
+
+        base = cli_app.providers.get("openrouter")
+        if base is None:
+            self._post_system(
+                f"{label} --models runs through the 'openrouter' provider, which "
+                f"isn't configured. Add it with /login."
+            )
+            return None
+        labels: list[str] = []
+        overrides: dict = {}
+        for model in models:
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "-", model).strip("-") or "model"
+            if safe in overrides:
+                continue
+            try:
+                clone = type(base)(replace(base.config, model=model))
+                clone.hook_runner = getattr(base, "hook_runner", None)
+                clone.permission_engine = getattr(base, "permission_engine", None)
+            except Exception as exc:
+                self._post_system(f"{label} could not set up model '{model}': {exc}")
+                return None
+            labels.append(safe)
+            overrides[safe] = clone
+        if len(labels) < 2:
+            self._post_system(f"{label} --models needs 2+ distinct models.")
+            return None
+        return labels, overrides
 
     @staticmethod
     def _diff_summary(diff_stat: str, changed_files: list[str]) -> str:
@@ -2286,7 +2339,7 @@ class CommandHandler:
         request = self._resolve_compete_request(args, "compete", "Competition")
         if request is None:
             return
-        cli_app, selected, judge_arg, objective = request
+        cli_app, selected, judge_arg, objective, overrides = request
         provider_states = {provider: "queued" for provider in selected}
         judge_status = ""
 
@@ -2329,7 +2382,9 @@ class CommandHandler:
             try:
                 from .swarm import CompetitionOrchestrator
 
-                compete = CompetitionOrchestrator(cli_app, judge_provider=judge_arg)
+                compete = CompetitionOrchestrator(
+                    cli_app, judge_provider=judge_arg, provider_overrides=overrides
+                )
                 result = compete.execute(objective, providers=selected, on_progress=_on_progress)
 
                 lines = [f"Competition complete. Judge: {result.judge_provider}"]
@@ -2392,7 +2447,7 @@ class CommandHandler:
         request = self._resolve_compete_request(args, "compete-code", "Code competition")
         if request is None:
             return
-        cli_app, selected, judge_arg, objective = request
+        cli_app, selected, judge_arg, objective, overrides = request
         provider_states = {provider: "queued" for provider in selected}
         judge_status = ""
 
@@ -2435,7 +2490,9 @@ class CommandHandler:
             try:
                 from .swarm import CompetitionOrchestrator
 
-                compete = CompetitionOrchestrator(cli_app, judge_provider=judge_arg)
+                compete = CompetitionOrchestrator(
+                    cli_app, judge_provider=judge_arg, provider_overrides=overrides
+                )
                 result = compete.execute_code(objective, providers=selected, on_progress=_on_progress)
 
                 lines = [f"Code competition complete. Judge: {result.judge_provider}"]
@@ -2473,10 +2530,15 @@ class CommandHandler:
                 for entry in result.entries:
                     status = "OK" if entry.success else f"FAIL: {entry.error}"
                     diff_summary = self._diff_summary(entry.diff_stat, entry.changed_files)
-                    lines.append(
-                        f"  [{entry.provider}] {status} "
-                        f"({entry.duration_seconds:.2f}s, {entry.tokens:,} tokens) | {diff_summary}"
-                    )
+                    label = f"[{entry.provider}]"
+                    if entry.model and entry.model != entry.provider:
+                        label += f" ({entry.model})"
+                    metrics = [f"{entry.duration_seconds:.1f}s", f"{entry.tokens:,} tok"]
+                    if entry.duration_seconds > 0 and entry.tokens:
+                        metrics.append(f"{entry.tokens / entry.duration_seconds:.0f} tok/s")
+                    if entry.cost:
+                        metrics.append(f"${entry.cost:.4f}")
+                    lines.append(f"  {label} {status} ({', '.join(metrics)}) | {diff_summary}")
                     changed = ", ".join(entry.changed_files[:6]) if entry.changed_files else "no file changes"
                     lines.append(f"    Files: {changed}")
                     if entry.retained and entry.worktree_path:
