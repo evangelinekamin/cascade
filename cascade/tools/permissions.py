@@ -371,6 +371,26 @@ def _opaque_shell_reason(command: str) -> Optional[str]:
     return None
 
 
+# Verdict tiers that stay refused even in an unattended worktree lane: a worktree
+# is a git checkout on the real filesystem, not a sandbox, so system-wide
+# destruction (curl|sh, rm -rf ~) and secret exfiltration (~/.ssh, .env) must
+# never auto-run just because there is no one to answer a prompt.
+_UNATTENDED_FLOORS = ("sacred", "never-auto")
+
+
+def unattended_ask_handler(tool_name: str, arguments: dict, verdict: "Verdict") -> str:
+    """Auto-approve resolver for isolated worktree lanes (competition/solve/fanout).
+
+    These lanes run with no user to answer a modal, so a routine ask (running
+    tests, an opaque interpreter, an out-of-workspace scratch write, a package
+    fetch) is approved and the run proceeds without a popup. The two
+    non-bypassable catastrophic floors are refused instead of run.
+    """
+    if verdict.rule in _UNATTENDED_FLOORS:
+        return "deny"
+    return "allow"
+
+
 class PermissionEngine:
     """Evaluate tool calls against rules, sacred paths, and posture.
 
@@ -441,6 +461,18 @@ class PermissionEngine:
         clone._deny = self._deny
         clone._ask = self._ask
         clone.ask_handler = self.ask_handler
+        return clone
+
+    def for_unattended_workspace(self, workspace_root: str) -> "PermissionEngine":
+        """A worktree-scoped engine that auto-approves routine asks (no prompts).
+
+        Same scoping as ``for_workspace`` but with an auto-approve resolver in
+        place of the inherited interactive one: isolated lanes (competition,
+        solve, fanout) have no user to answer a modal, so routine asks are
+        approved and only the non-bypassable catastrophic floors are refused.
+        """
+        clone = self.for_workspace(workspace_root)
+        clone.ask_handler = unattended_ask_handler
         return clone
 
     # -- rule store -----------------------------------------------------

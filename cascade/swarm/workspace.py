@@ -394,14 +394,16 @@ def run_agent_in_worktree(
         if callable(cancellation_scope) and cancel_token is not None
         else nullcontext()
     )
-    # Scope the permission gate to the worktree: WorkspaceTools already
-    # confine writes here, so in-worktree edits should auto-approve while
-    # the sacred/dangerous-shell floors still catch escapes (curl|sh,
-    # rm -rf ~). Without this, the launch-cwd-rooted engine would treat
-    # every legitimate worktree write as an out-of-workspace ask and, in a
-    # headless lane, escalate to a hard stop. Restored in the finally.
+    # Scope the permission gate to the worktree AND run it unattended: this lane
+    # has no user to answer a modal, so routine asks (running tests, opaque
+    # interpreters, package fetches) auto-approve and the run proceeds without a
+    # popup, while the sacred/dangerous-shell floors still refuse escapes (curl|sh,
+    # rm -rf ~, reading ~/.ssh). Without the scoping the launch-cwd-rooted engine
+    # would treat every legitimate worktree write as an out-of-workspace ask;
+    # without the unattended handler it would prompt (there is no one to answer).
+    # Restored in the finally.
     engine = getattr(provider, "permission_engine", None)
-    scoped = engine.for_workspace(worktree_path) if engine is not None else None
+    scoped = engine.for_unattended_workspace(worktree_path) if engine is not None else None
 
     with ctx, cancel_ctx:
         if cancel_token is not None:
