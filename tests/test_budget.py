@@ -27,9 +27,15 @@ class TestWindowFor:
         assert window_for("") == 128_000
 
     def test_million_suffix_detection(self):
-        assert window_for("claude", "claude-opus-4-8[1m]") == 1_000_000
-        assert window_for("claude", "claude-opus-4-8[1M]") == 1_000_000
-        assert window_for("claude", "claude-opus-4-8") == 200_000
+        assert window_for("claude", "some-model[1m]") == 1_000_000
+        assert window_for("claude", "some-model[1M]") == 1_000_000
+
+    def test_known_model_windows(self):
+        # opus-4-8 is a 1M-context model, listed explicitly so the bare id
+        # resolves correctly (no [1m] suffix needed)...
+        assert window_for("claude", "claude-opus-4-8") == 1_000_000
+        # ...while other claude models still fall back to the 200k provider window.
+        assert window_for("claude", "claude-sonnet-5") == 200_000
 
     def test_explicit_configuration_wins(self):
         assert window_for("openai", "gpt-5.2", configured=32_768) == 32_768

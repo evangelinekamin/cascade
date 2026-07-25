@@ -34,8 +34,12 @@ PROVIDER_WINDOWS: dict[str, int] = {
 }
 
 # Exact (provider, model) overrides. Grows as models with known windows
-# are adopted; checked before the provider fallback.
-MODEL_WINDOWS: dict[tuple[str, str], int] = {}
+# are adopted; checked before the provider fallback. The "claude" provider
+# fallback stays 200k for older Opus/Sonnet, so newer large-window models are
+# listed explicitly here rather than by moving the fallback.
+MODEL_WINDOWS: dict[tuple[str, str], int] = {
+    ("claude", "claude-opus-4-8"): 1_000_000,
+}
 
 _MILLION_SUFFIX = re.compile(r"\[1m\]", re.IGNORECASE)
 

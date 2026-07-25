@@ -96,7 +96,7 @@ class TestContextCommandOccupancy:
         assert "Context window (claude · claude-opus-4-8)" in out
         assert "12,600 tok" in out  # 10k + 2k cache_read + 100 write + 500 out
         assert "cache read 2,000" in out
-        assert "compact at 171,000" in out
+        assert "compact at 971,000" in out  # opus-4-8 is a 1M-window model
 
     def test_occupancy_unknown_after_compaction(self):
         state = CascadeState()

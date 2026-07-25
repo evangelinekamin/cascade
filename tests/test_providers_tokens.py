@@ -325,7 +325,7 @@ def test_claude_ask_with_tools_compacts_each_round_using_claude_window():
             prov.ask_with_tools(_msgs("go"), _echo_tools(), max_rounds=3)
 
     assert len(budgets) == 2  # once per round
-    assert budgets[0] == int(200_000 * 0.7)  # window_for("claude") default * fraction
+    assert budgets[0] == int(1_000_000 * 0.7)  # window_for("claude","claude-opus-4-8") = 1M
 
 
 # --------------------------------------------------------------------------- #
