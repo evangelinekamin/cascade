@@ -469,7 +469,12 @@ class ClaudeProvider(BaseProvider):
                 elif block.get("type") == "tool_use":
                     tool_uses.append(block)
 
-            if not tool_uses or stop_reason != "tool_use":
+            # Execute tool_use blocks whenever present, regardless of stop_reason:
+            # Anthropic-compatible cheap endpoints (z.ai/GLM, Moonshot/Kimi) return
+            # complete tool_use with stop_reason "end_turn"/"max_tokens", and the
+            # exact-match gate dropped them -> the edits never ran ("no changes, no
+            # error"). Only a genuinely tool-less round ends the turn.
+            if not tool_uses:
                 return "".join(text_parts), tool_log
 
             # Append the assistant message with all content blocks

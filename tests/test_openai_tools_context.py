@@ -620,3 +620,33 @@ def test_loop_does_not_bounce_a_conclusive_answer():
     text, _log = _run_loop(client, tools, context_window=1_000_000)
     assert "missing null check" in text
     assert len(client.payloads) == 1  # returned without a second round
+
+
+def test_repair_json_refuses_truncated_string_value():
+    # The dangerous case: a write_file payload cut off mid-content must NOT be
+    # "repaired" into a shorter valid string (which would write a truncated file
+    # and report success). Refused -> the caller reports the error instead.
+    from cascade.providers._openai_tools import _repair_json
+
+    truncated = '{"path": "a.py", "content": "import os\ndef main():\n    pri'
+    assert _repair_json(truncated) is None
+    assert _repair_json('{"content": "line one\nline t') is None  # dangling string
+    # Safe: strings terminated, only brackets missing (repair only runs after
+    # json.loads already failed, so a complete object never reaches it).
+    assert _repair_json('{"path": "a.py"') == {"path": "a.py"}
+    assert _repair_json('{"a": [1, 2') == {"a": [1, 2]}
+    assert _repair_json("") == {}
+    assert _repair_json("garbage") is None
+
+
+def test_looks_like_narration_precision():
+    # Real narrations bounce; conclusions, "lets you..."/"going to pass", and
+    # clarifying questions do not.
+    from cascade.providers._openai_tools import _looks_like_narration
+
+    assert _looks_like_narration("I'll now modify a.py.") is True
+    assert _looks_like_narration("") is True
+    assert _looks_like_narration("The bug is a missing null check; no change needed.") is False
+    assert _looks_like_narration("This lets you configure the port.") is False
+    assert _looks_like_narration("The tests are going to pass now.") is False
+    assert _looks_like_narration("Which option do you prefer?") is False

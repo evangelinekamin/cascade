@@ -41,10 +41,12 @@ MODEL_WINDOWS: dict[tuple[str, str], int] = {
     ("claude", "claude-opus-4-8"): 1_000_000,
 }
 
-# Provider-agnostic substring windows: a model's context window is its own, not
-# the serving host's, so these apply whether the model is reached direct or via
-# OpenRouter. Fixes the 128k-for-every-openrouter-model assumption that made
-# Cascade compact 1M-window models ~8x too early. Checked after exact matches.
+# Substring windows for models reached DIRECT (the endpoint serves the model's
+# full window). NOT applied to OpenRouter: there the serving endpoint enforces
+# its own context_length -- many host DeepSeek/MiMo at 64-128k -- so trusting the
+# model's 1M there risks a hard context-length-exceeded error, where the
+# conservative default merely compacts earlier (safe). For a full-window
+# OpenRouter endpoint, set the provider's context_window in config.
 MODEL_SUBSTRING_WINDOWS: tuple[tuple[str, int], ...] = (
     ("deepseek-v4", 1_000_000),
     ("mimo-v2", 1_000_000),
@@ -73,19 +75,23 @@ def window_for(
     """Resolve the context window for a (provider, model) pair.
 
     Precedence: explicit configuration > [1m] model suffix > exact
-    (provider, model) entry > provider fallback > DEFAULT_WINDOW. The
+    (provider, model) entry > direct-provider substring window (not OpenRouter,
+    whose endpoint window varies) > provider fallback > DEFAULT_WINDOW. The
     CASCADE_MAX_CONTEXT_TOKENS environment variable caps the result.
     """
     provider = (provider or "").lower()
     model_l = (model or "").lower()
+    substring = next(
+        (w for needle, w in MODEL_SUBSTRING_WINDOWS if needle in model_l), None
+    )
     if configured:
         window = configured
     elif model and _MILLION_SUFFIX.search(model):
         window = 1_000_000
     elif (provider, model) in MODEL_WINDOWS:
         window = MODEL_WINDOWS[(provider, model)]
-    elif any(needle in model_l for needle, _ in MODEL_SUBSTRING_WINDOWS):
-        window = next(w for needle, w in MODEL_SUBSTRING_WINDOWS if needle in model_l)
+    elif substring is not None and provider != "openrouter":
+        window = substring
     else:
         window = PROVIDER_WINDOWS.get(provider, DEFAULT_WINDOW)
 

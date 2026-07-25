@@ -20,25 +20,26 @@ class ModelSettings:
     """How the tool loop should treat a given model.
 
     ``temperature`` overrides the provider default when set (cheap coders are far
-    more reliable near 0). ``nudge_on_narration`` bounces a text-only round back
-    at models prone to narrating a plan instead of calling their tools.
-    ``replay_reasoning`` re-attaches ``reasoning_content`` on replayed assistant
-    tool-call turns for models that require it (DeepSeek/Kimi lineage).
+    more reliable at low sampling for tool use). ``nudge_on_narration`` bounces a
+    text-only round back at models prone to narrating a plan instead of calling
+    their tools.
     """
 
     temperature: float | None = None
     nudge_on_narration: bool = False
-    replay_reasoning: bool = False
 
 
 _NEUTRAL = ModelSettings()
 
 # Substring -> settings, checked in order (put more specific ids first if needed).
+# Temperatures are the vendor's tool-use / coding recommendations (DeepSeek 0.0
+# for coding; Moonshot ~0.6 for Kimi tool use; Qwen 0.55) rather than their
+# creative defaults, which raise the prose-instead-of-tool-call prior.
 _REGISTRY: tuple[tuple[str, ModelSettings], ...] = (
-    ("deepseek", ModelSettings(temperature=0.0, nudge_on_narration=True, replay_reasoning=True)),
-    ("kimi", ModelSettings(temperature=1.0, nudge_on_narration=True, replay_reasoning=True)),
-    ("glm", ModelSettings(temperature=1.0, nudge_on_narration=True)),
-    ("minimax", ModelSettings(temperature=1.0, nudge_on_narration=True)),
+    ("deepseek", ModelSettings(temperature=0.0, nudge_on_narration=True)),
+    ("kimi", ModelSettings(temperature=0.6, nudge_on_narration=True)),
+    ("glm", ModelSettings(temperature=0.6, nudge_on_narration=True)),
+    ("minimax", ModelSettings(temperature=0.6, nudge_on_narration=True)),
     ("qwen", ModelSettings(temperature=0.55, nudge_on_narration=True)),
     ("mimo", ModelSettings(nudge_on_narration=True)),
     ("mercury", ModelSettings(nudge_on_narration=True)),

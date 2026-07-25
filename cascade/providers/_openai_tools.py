@@ -56,10 +56,13 @@ _NARRATION_NUDGE = (
     "already complete, say so plainly; otherwise call the appropriate tool now to "
     "make the change."
 )
-# Future-tense action language that signals an intended-but-untaken step.
+# First-person future-action language that signals an intended-but-untaken step.
+# Deliberately narrow (no bare "going to" / "let's", which appear in conclusions
+# like "this lets you..." / "the tests are going to pass") to avoid bouncing a
+# genuine final answer.
 _NARRATION_RE = re.compile(
-    r"\b(i'?ll|i will|let me|i'?m going to|i am going to|going to|now i|next[,]? i|"
-    r"first[,]? i|then i'?ll|i need to|i should|let'?s)\b",
+    r"\b(i'?ll|i will|let me|i'?m going to|i am going to|now i(?:'?ll| will| need)|"
+    r"next[,]? i|first[,]? i|then i'?ll|i need to|i should)\b",
     re.IGNORECASE,
 )
 
@@ -68,11 +71,14 @@ def _looks_like_narration(content: str) -> bool:
     """Whether a tool-less round reads as an intended-but-untaken action.
 
     An empty round (the model just stopped) counts; a conclusive answer with no
-    future-action language does not, so genuine final replies are not bounced.
+    future-action language does not; and a clarifying question is never a
+    narration -- bouncing it would pressure the model to guess instead of ask.
     """
     stripped = content.strip()
     if not stripped:
         return True
+    if stripped.endswith("?"):
+        return False
     return bool(_NARRATION_RE.search(stripped))
 
 # File-mutating tools whose repeated "path" edits count toward the cycle guard.
@@ -199,33 +205,46 @@ def _invalidates_read(tool_name: str, tool_args: dict) -> Optional[str]:
     return None
 
 
-def _repair_json(raw: str) -> Optional[dict]:
-    """Best-effort recovery of a truncated/mangled tool-argument object.
+def _unterminated_string(raw: str) -> bool:
+    """Whether *raw* ends inside an open string literal (a truncated value)."""
+    in_string = False
+    escaped = False
+    for ch in raw:
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = True
+        elif ch == '"':
+            in_string = not in_string
+    return in_string
 
-    The common failure is an output-limit truncation that cuts the JSON off
-    mid-value; closing a dangling string and the open brackets usually restores
-    a parseable object. Returns the parsed dict, or ``None`` if it still cannot
-    be read as one (so the caller reports the error rather than guessing).
+
+def _repair_json(raw: str) -> Optional[dict]:
+    """Recover a tool-argument object ONLY when doing so cannot fabricate content.
+
+    Safe: an object whose strings are all terminated but whose closing brackets
+    were cut (e.g. ``{"path": "a.py"``) -- appending ``}`` restores the true
+    value. UNSAFE and refused (returns ``None``): a dangling string, which means
+    a value was truncated mid-content -- closing the quote would invent a
+    shorter string and, for write_file, silently write a truncated file to disk
+    while reporting success. The caller reports the malformed call instead so the
+    model re-issues it.
     """
     raw = (raw or "").strip()
     if not raw:
         return {}
-    candidates = [raw]
-    if raw.count('"') % 2 == 1:  # an unterminated string
-        candidates.append(raw + '"')
-    for base in list(candidates):
-        opens = base.count("{") - base.count("}")
-        brackets = base.count("[") - base.count("]")
-        if opens > 0 or brackets > 0:
-            candidates.append(base + ("]" * max(0, brackets)) + ("}" * max(0, opens)))
-    for candidate in candidates:
-        try:
-            value = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
-    return None
+    if _unterminated_string(raw):
+        return None
+    opens = raw.count("{") - raw.count("}")
+    brackets = raw.count("[") - raw.count("]")
+    if opens <= 0 and brackets <= 0:
+        return None
+    candidate = raw + ("]" * max(0, brackets)) + ("}" * max(0, opens))
+    try:
+        value = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _edit_run_target(tool_name: str, tool_args: dict) -> Optional[tuple[str, str]]:
@@ -473,6 +492,11 @@ def openai_ask_with_tools(
                 api_messages.append({"role": "user", "content": _NARRATION_NUDGE})
                 continue
             _finalize_usage()
+            if narration_streak > 0:
+                # Bounced but the model still did not act -- flag that its
+                # description was not applied, so it doesn't read as success.
+                note = "[no changes made -- described the edit but did not perform it]"
+                return ((content.rstrip() + "\n\n" + note) if content.strip() else note), tool_log
             return content, tool_log
 
         narration_streak = 0
@@ -501,6 +525,20 @@ def openai_ask_with_tools(
                 if repaired is not None:
                     tool_args = repaired
                 else:
+                    # Repeated identical broken calls (a write that truncates the
+                    # same way each round) must trip the stall guard rather than
+                    # burn every round re-issuing it, so account for them here --
+                    # the parse failed, so the doom signature keys on raw_args.
+                    sig = (tool_name, raw_args)
+                    doom_streak = doom_streak + 1 if sig == doom_sig else 0
+                    doom_sig = sig
+                    if doom_streak >= _DOOM_ABORT:
+                        _finalize_usage()
+                        note = (
+                            f"[stalled: {tool_name} arguments were truncated "
+                            f"{doom_streak + 1}x with no progress -- handing off.]"
+                        )
+                        return (content if content.strip() else note), tool_log
                     # Never fall back to {}: running a tool with empty arguments
                     # looks like a successful no-op. Report the malformed call so
                     # the model re-issues it (common when a large write_file payload
