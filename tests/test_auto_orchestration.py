@@ -108,6 +108,7 @@ def test_auto_routing_requires_a_git_worktree(monkeypatch):
 
 def test_selector_uses_gpt_oss_on_cerebras_without_mutating_chat_provider():
     app, original = _app()
+    app.config.orchestration["local_router"] = False  # exercise the model tier
     decision = auto.select_workflow(app, "Review the config implementation", "build")
 
     routed = _FakeOpenRouter.last_instance
@@ -127,6 +128,7 @@ def test_selector_uses_gpt_oss_on_cerebras_without_mutating_chat_provider():
 def test_selector_fallback_is_conservative_about_parallelism():
     app, _original = _app()
     app.providers = {}
+    app.config.orchestration["local_router"] = False  # exercise the heuristic fallback
 
     focused = auto.select_workflow(app, "Implement a parser fix", "build")
     independent = auto.select_workflow(
@@ -137,6 +139,68 @@ def test_selector_fallback_is_conservative_about_parallelism():
 
     assert focused.workflow == WorkflowKind.SOLVE
     assert independent.workflow == WorkflowKind.FANOUT
+
+
+# --- Local first-tier router (zero-cost, abstains when unsure) -------------------
+
+
+def test_local_router_short_circuits_a_clear_edit_without_calling_the_model():
+    app, _original = _app()
+    _FakeOpenRouter.last_instance = None  # prove the model router is never built
+
+    decision = auto.select_workflow(app, "fix the login redirect bug", "build")
+
+    assert decision.workflow == WorkflowKind.SOLVE
+    assert decision.router_provider == "local"
+    assert decision.router_model == ""  # no model was consulted
+    assert decision.cost == 0.0 and decision.input_tokens == 0
+    assert _FakeOpenRouter.last_instance is None  # the API tier was skipped entirely
+
+
+def test_local_router_can_be_disabled_by_config():
+    app, _original = _app()
+    app.config.orchestration["local_router"] = False
+
+    decision = auto.select_workflow(app, "fix the login redirect bug", "build")
+
+    # With the local tier off, even a clear-cut prompt reaches the model router.
+    assert decision.router_provider == "openrouter"
+
+
+def test_local_router_abstains_on_mixed_read_and_edit():
+    # "review AND fix" is genuinely ambiguous (recon or solve?) -> defer.
+    assert auto._local_route("review the parser and fix what's broken", "build") is None
+
+
+def test_local_router_abstains_on_a_long_edit_that_might_decompose():
+    long_edit = "implement " + " and ".join(f"feature {i}" for i in range(30))
+    assert auto._local_route(long_edit, "build") is None
+
+
+def test_local_router_referential_edit_still_routes_to_solve():
+    # "fix the errors codex found" is a focused edit regardless of the referent;
+    # lane-context resolves the referent at execution time.
+    decision = auto._local_route("fix the errors codex found", "build")
+    assert decision is not None and decision.workflow == WorkflowKind.SOLVE
+
+
+def test_local_router_rule_matrix():
+    cases = {
+        "explain how the auth module works": WorkflowKind.RECON,
+        "add a dark-mode toggle to settings": WorkflowKind.SOLVE,
+        "migrate the auth flow across the whole stack": WorkflowKind.PIPELINE,
+        "build the parser and the printer in parallel independently": WorkflowKind.FANOUT,
+        "thanks, that worked": WorkflowKind.CHAT,
+    }
+    for prompt, expected in cases.items():
+        decision = auto._local_route(prompt, "build")
+        assert decision is not None, f"expected a confident route for {prompt!r}"
+        assert decision.workflow == expected, f"{prompt!r} -> {decision.workflow}"
+
+
+def test_local_router_abstains_on_vague_deixis():
+    assert auto._local_route("do option a", "build") is None
+    assert auto._local_route("the parser thing", "build") is None
 
 
 def test_recon_lane_exposes_only_read_only_tools():

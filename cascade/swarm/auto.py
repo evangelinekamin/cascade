@@ -152,6 +152,24 @@ _FAST_EDIT_RE = re.compile(
     r"\b(typo|one[- ]line|tiny|small localized|formatting only)\b",
     re.IGNORECASE,
 )
+# A strong read verb credibly means "inspect the repository" (unlike the bare
+# question words in _READ_RE, which are just as common in ordinary chat), so it
+# alone is enough for the local tier to route recon with confidence.
+_STRONG_READ_RE = re.compile(
+    r"\b(read|inspect|review|explain|trace|locate|understand|investigate|"
+    r"analy[sz]e|audit)\b",
+    re.IGNORECASE,
+)
+# Anchored greetings/acknowledgements -- the only no-verb prompts the local tier
+# will confidently call chat rather than defer.
+_CONVERSATIONAL_RE = re.compile(
+    r"^(hi|hey|hello|thanks|thank you|thx|sup|yo|ok|okay|got it|nice|cool|"
+    r"good (?:morning|evening|afternoon))\b",
+    re.IGNORECASE,
+)
+# An edit ask longer than this may decompose into pipeline/fanout; the local
+# tier defers that judgement to the model router rather than assume solve.
+_LOCAL_SOLVE_MAX_WORDS = 40
 
 
 def _is_git_worktree() -> bool:
@@ -254,16 +272,67 @@ def _heuristic_route(prompt: str, mode: str, reason_prefix: str = "") -> RouteDe
     )
 
 
+def _local_route(prompt: str, mode: str) -> Optional[RouteDecision]:
+    """A zero-cost first-tier classifier: a decision when the rule is
+    unambiguous, else ``None`` to defer to the model router.
+
+    This skips the API round-trip on the clear-cut majority -- a short edit ask
+    is a solve, a strong read verb is recon, a bare greeting is chat -- while
+    abstaining on anything genuinely ambiguous (mixed read+edit, a long or vague
+    ask), where a model's judgement earns its call. ``mode`` is accepted for
+    signature parity with the model router and reserved for future mode-aware
+    rules; the workflow kind itself does not depend on it.
+    """
+    text = prompt.strip()
+    if not text:
+        return None
+    words = len(text.split())
+    edits = bool(_EDIT_RE.search(text))
+    strong_reads = bool(_STRONG_READ_RE.search(text))
+
+    def _decide(workflow: WorkflowKind, reason: str, confidence: float,
+                tier: str = "bulk") -> RouteDecision:
+        return RouteDecision(
+            workflow=workflow,
+            reason=f"local rule: {reason}",
+            confidence=confidence,
+            worker_tier=tier,
+            router_provider="local",
+        )
+
+    if edits and strong_reads:
+        return None  # "review and refactor" -- recon or solve? defer to the model.
+    if edits:
+        if _PARALLEL_RE.search(text):
+            return _decide(WorkflowKind.FANOUT, "explicit independent parallel work", 0.85)
+        if _DEPENDENT_RE.search(text):
+            return _decide(WorkflowKind.PIPELINE, "explicit dependent multi-step change", 0.85)
+        if words <= _LOCAL_SOLVE_MAX_WORDS:
+            tier = "fast" if _FAST_EDIT_RE.search(text) else "bulk"
+            return _decide(WorkflowKind.SOLVE, "a focused code change", 0.85, tier)
+        return None  # a long edit ask may decompose; defer.
+    if strong_reads:
+        return _decide(WorkflowKind.RECON, "repository inspection with no edit", 0.8)
+    if _CONVERSATIONAL_RE.search(text):
+        return _decide(WorkflowKind.CHAT, "conversational, no repository action", 0.85)
+    return None  # weak/vague intent: let the model router decide.
+
+
 def select_workflow(
     app,
     prompt: str,
     mode: str,
     cancel_token: Optional[CancellationToken] = None,
 ) -> RouteDecision:
-    """Use the configured cheap model to select a workflow, failing conservatively."""
+    """Route a prompt to a workflow: a zero-cost local rule when it is
+    unambiguous, otherwise the configured cheap model, failing conservatively."""
     if cancel_token is not None:
         cancel_token.checkpoint()
     config = app.config.get_orchestration_config()
+    if config.get("local_router", True):
+        local = _local_route(prompt, mode)
+        if local is not None:
+            return local
     provider_name = config["router_provider"]
     model = config["router_model"]
     router = _lane_provider(

@@ -498,6 +498,7 @@ class ConfigManager:
         """Return sanitized automatic workflow-routing configuration."""
         defaults: Dict[str, Any] = {
             "enabled": True,
+            "local_router": True,
             "modes": ["design", "plan", "build", "test"],
             "router_provider": "openrouter",
             "router_model": "openai/gpt-oss-120b",
@@ -519,6 +520,7 @@ class ConfigManager:
         raw = self.data.get("orchestration", {})
         merged = {**defaults, **(raw if isinstance(raw, dict) else {})}
         merged["enabled"] = bool(merged.get("enabled", True))
+        merged["local_router"] = bool(merged.get("local_router", True))
 
         raw_modes = merged.get("modes", defaults["modes"])
         if not isinstance(raw_modes, (list, tuple)):
