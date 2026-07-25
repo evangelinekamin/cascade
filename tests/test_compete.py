@@ -258,6 +258,36 @@ class TestCompetitionOrchestrator:
             )
             shutil.rmtree(Path(winner_entry.worktree_path).parent, ignore_errors=True)
 
+    def test_code_competition_injects_per_model_guidance(self):
+        # The competition is single-shot with no verify-loop retry, so a model
+        # that narrates instead of acting silently produces "no changes" and
+        # loses. DeepSeek (documented for exactly that) must get its steering;
+        # a model without a guidance entry must not have anything appended.
+        from cascade.swarm import competition as comp
+
+        captured = {}
+
+        def fake_run(provider, prompt, worktree_path, system=None, **kw):
+            captured["system"] = system or ""
+            return "narrated a plan"
+
+        app = _mock_app({
+            "openrouter": _mock_provider("openrouter", model="deepseek/deepseek-v4-flash"),
+            "openai": _mock_provider("openai", model="gpt-5.6-terra"),
+        })
+        compete = CompetitionOrchestrator(app, judge_provider="openai")
+        manager = MagicMock()
+        manager.capture_snapshot.side_effect = Exception("no worktree")  # -> empty snapshot
+
+        with patch.object(comp, "run_agent_in_worktree", fake_run):
+            compete._execute_code_provider("openrouter", "task", "/wt", manager)
+            deepseek_system = captured["system"]
+            compete._execute_code_provider("openai", "task", "/wt", manager)
+            openai_system = captured["system"]
+
+        assert "do not merely narrate" in deepseek_system.lower()
+        assert "do not merely narrate" not in openai_system.lower()
+
 
 class TestWorktreeManager:
     def test_prepare_copies_dirty_and_untracked_state(self):

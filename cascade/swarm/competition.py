@@ -333,7 +333,18 @@ class CompetitionOrchestrator:
         start = time.monotonic()
         response = ""
         try:
-            system = self._build_competition_system(_CODE_SYSTEM)
+            # Per-model steering (the same registry solve/chat use) matters MOST
+            # here: the competition is single-shot with no verify-loop retry, so
+            # a model that narrates a plan instead of calling its edit tools --
+            # DeepSeek's documented failure mode -- silently produces "no changes"
+            # and loses. The worktree has the full WorkspaceTools (replace_in_file
+            # included), so the guidance's tool advice applies as-is.
+            from .solve import worker_guidance_for
+
+            model_id = getattr(getattr(provider, "config", None), "model", "") or ""
+            guidance = worker_guidance_for(model_id)
+            extra = f"{_CODE_SYSTEM}\n\n{guidance}" if guidance else _CODE_SYSTEM
+            system = self._build_competition_system(extra)
             prompt = self._build_code_prompt(objective, worktree_path)
             response = run_agent_in_worktree(provider, prompt, worktree_path, system=system)
             usage = provider.last_usage or Usage()
