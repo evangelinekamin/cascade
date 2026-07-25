@@ -1703,6 +1703,13 @@ class MainScreen(Screen):
         """
         if not self._queued_prompts:
             return None
+        # A slash command must run through the CommandHandler at the completion
+        # drain (which dispatches it properly), never be injected into the model
+        # as literal chat text. If the head is a command, inject nothing this
+        # round and leave the whole queue for _drain_prompt_queue -- preserving
+        # order and keeping behavior identical across provider families.
+        if self._cmd_handler and self._cmd_handler.is_command(self._queued_prompts[0]):
+            return None
         try:
             prompt = self._queued_prompts.popleft()
         except IndexError:

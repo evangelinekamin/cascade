@@ -9,6 +9,7 @@ lossy LLM summarization with structured episode records that preserve
 key decisions, artifacts, and outcomes without burning model tokens.
 """
 
+import re
 import time
 from typing import TYPE_CHECKING
 
@@ -24,6 +25,10 @@ RAW_MESSAGE_WINDOW = 40
 # carried verbatim (not just as episodes), so a cross-model hand-off -- codex's
 # found errors, a review, a plan -- is visible to the model asked to act on it.
 _STICKY_CROSS_TURNS = 2
+
+# Only these orchestration session-events are surfaced to the model as system
+# notices; every other system-role record (command output, errors) stays UI-only.
+_ORCH_NOTICE_RE = re.compile(r"^\s*\[(?:Solve|Pipeline|Fanout|Compete)\b", re.IGNORECASE)
 
 # A gap at or above this (seconds) is worth marking in the timeline so the
 # model can tell the user stepped away. Smaller consecutive gaps stay
@@ -197,14 +202,18 @@ def state_messages_to_provider(
         elif msg.role == target_provider:
             result.append({"role": "assistant", "content": marker + msg.content})
         elif msg.role == "system":
-            # Session-event notices ("[Solve] <objective>", etc.) are factual and
-            # provider-agnostic; the model should know an orchestrated action ran,
-            # regardless of cross-model policy, so it is never silently dropped.
-            result.append({
-                "role": "user",
-                "content": marker + f"[System notice]\n{msg.content}",
-            })
-            result.append({"role": "assistant", "content": "Noted."})
+            # ONLY orchestration session-events ("[Solve] <objective>", etc.) are
+            # surfaced -- factual, provider-agnostic, and short. Other system
+            # records (command output like /tree, errors, separators) are UI-only
+            # and must never leak into the model's context.
+            if _ORCH_NOTICE_RE.match(msg.content):
+                result.append({
+                    "role": "user",
+                    "content": marker + f"[System notice]\n{msg.content}",
+                })
+                result.append({"role": "assistant", "content": "Noted."})
+            else:
+                emitted = False
         elif include_cross or i in sticky_cross:
             result.append({
                 "role": "user",

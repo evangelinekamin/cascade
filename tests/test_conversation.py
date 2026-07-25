@@ -501,3 +501,19 @@ def test_system_notice_pairs_with_an_assistant_ack():
     roles = [m["role"] for m in result]
     assert roles == ["user", "assistant"]
     assert result[1]["content"] == "Noted."
+
+
+def test_non_orchestration_system_records_stay_ui_only():
+    # A /tree dump, error, or separator recorded as a system message must NOT
+    # leak into the model payload -- only [Solve]/[Pipeline]/[Fanout]/[Compete].
+    messages = _msgs(
+        ("you", "show me the tree"),
+        ("system", "repo/\n  a.py\n  b.py\n  (full /tree dump)"),
+        ("system", "Error: something failed in the UI"),
+        ("you", "ok now build it"),
+    )
+    result = state_messages_to_provider(messages, "openrouter", policy="summary")
+    blob = "\n".join(m["content"] for m in result)
+    assert "full /tree dump" not in blob
+    assert "something failed in the UI" not in blob
+    assert "[System notice]" not in blob  # neither system row was surfaced

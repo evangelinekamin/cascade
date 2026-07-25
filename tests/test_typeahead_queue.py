@@ -68,3 +68,32 @@ def test_interrupt_clears_the_queue():
     screen._post_system_message = MagicMock()
     screen._interrupt_active_run()
     assert len(screen._queued_prompts) == 0
+
+
+def test_pull_skips_a_queued_command_leaving_it_for_the_drain():
+    # A slash command typed mid-turn must NOT be injected into the model loop as
+    # chat text; _pull_queued_prompt returns None and leaves it queued for the
+    # completion drain, which dispatches it through the CommandHandler.
+    screen = MainScreen()
+    screen._cmd_handler = MagicMock()
+    screen._cmd_handler.is_command.side_effect = lambda t: t.startswith("/")
+    screen._queued_prompts.append("/solve fix the flaky test")
+
+    assert screen._pull_queued_prompt() is None
+    assert list(screen._queued_prompts) == ["/solve fix the flaky test"]  # still queued
+
+
+def test_pull_returns_a_plain_prompt_for_mid_turn_injection():
+    screen = MainScreen()
+    screen._cmd_handler = MagicMock()
+    screen._cmd_handler.is_command.side_effect = lambda t: t.startswith("/")
+    screen._reflect_injected_prompt = MagicMock()
+    screen._queued_prompts.append("also handle the retry path")
+
+    app = SimpleNamespace(call_from_thread=lambda fn, *a: fn(*a))
+    token = active_app.set(app)
+    try:
+        assert screen._pull_queued_prompt() == "also handle the retry path"
+    finally:
+        active_app.reset(token)
+    assert list(screen._queued_prompts) == []
