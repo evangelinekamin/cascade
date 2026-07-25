@@ -1,5 +1,6 @@
 """OpenRouter provider for multi-model access (Qwen, Llama, etc)."""
 
+import hashlib
 import json
 from typing import Optional, Iterator, TYPE_CHECKING
 import httpx
@@ -89,6 +90,23 @@ class OpenRouterProvider(BaseProvider):
         return fallback
 
     @staticmethod
+    def _session_key(system: Optional[str], messages: list[Message]) -> Optional[str]:
+        """A stable per-conversation id so OpenRouter pins the whole conversation
+        to one upstream host and keeps its prompt cache warm (sticky sessions).
+
+        Derived from the conversation's stable prefix -- the system prompt and the
+        first message, which do not change across the turns of one conversation --
+        so every follow-up request carries the same id and lands on the same
+        cache. Hashed, so no prompt content is exposed and it always fits the
+        256-char cap. Returns None when there is nothing to key on.
+        """
+        first = messages[0]["content"] if messages else ""
+        if not (system or first):
+            return None
+        basis = f"{system or ''}\x00{first}".encode("utf-8", "ignore")
+        return "cascade-" + hashlib.sha256(basis).hexdigest()[:32]
+
+    @staticmethod
     def _build_api_messages(
         messages: list[Message],
         system: Optional[str] = None,
@@ -120,6 +138,9 @@ class OpenRouterProvider(BaseProvider):
             payload["max_tokens"] = self.config.max_tokens
         if self.config.provider_preferences:
             payload["provider"] = self.config.provider_preferences
+        session_id = self._session_key(system, messages)
+        if session_id:
+            payload["session_id"] = session_id
 
         with self.client.stream(
             "POST", url, json=payload, headers=self._headers()
@@ -286,6 +307,7 @@ class OpenRouterProvider(BaseProvider):
         self._apply_meta()
         self._last_usage = None
         self._last_round_usage = None
+        session_id = self._session_key(system, messages)
         try:
             return openai_ask_with_tools(
                 client=self.client,
@@ -308,6 +330,7 @@ class OpenRouterProvider(BaseProvider):
                     "openrouter", self.config.model, self.config.context_window,
                 ),
                 provider_preferences=self.config.provider_preferences,
+                session_id=session_id,
                 check_cancelled=self.raise_if_cancelled,
             )
         except RuntimeError as exc:
@@ -339,6 +362,7 @@ class OpenRouterProvider(BaseProvider):
                     "openrouter", self.config.model, self.config.context_window,
                 ),
                     provider_preferences=self.config.provider_preferences,
+                    session_id=session_id,
                     check_cancelled=self.raise_if_cancelled,
                 )
             raise

@@ -199,6 +199,36 @@ def test_openrouter_stream_omits_provider_when_preferences_none():
     assert "provider" not in payload
 
 
+def test_openrouter_stream_sends_session_id_for_sticky_cache():
+    """The streaming payload carries a session_id so OpenRouter pins the
+    conversation to one host and keeps its prompt cache warm."""
+    provider = OpenRouterProvider(ProviderConfig(api_key="test-key", model="m"))
+
+    with patch.object(provider.client, "stream", return_value=_ok_stream_context()) as mock_stream:
+        list(provider.stream_single("Reply with exactly OK."))
+
+    payload = mock_stream.call_args.kwargs["json"]
+    assert payload["session_id"].startswith("cascade-")
+    assert len(payload["session_id"]) <= 256
+
+
+def test_session_key_is_stable_across_turns_and_unique_per_conversation():
+    key = OpenRouterProvider._session_key
+    system = "You are Cascade. cwd=/x mode=plan"
+    turn1 = [{"role": "user", "content": "plan it", "provider": ""}]
+    # A later turn appends assistant + user messages; the stable prefix is
+    # unchanged, so the key must not move (same warm cache).
+    turn2 = turn1 + [
+        {"role": "assistant", "content": "a plan", "provider": "openrouter"},
+        {"role": "user", "content": "now add auth", "provider": ""},
+    ]
+    assert key(system, turn1) == key(system, turn2)
+    # A different opening message is a different conversation.
+    assert key(system, [{"role": "user", "content": "other", "provider": ""}]) != key(system, turn1)
+    # Nothing to key on -> no id (so the field is simply omitted).
+    assert key(None, []) is None
+
+
 def test_openrouter_ask_with_tools_forwards_provider_preferences():
     """ask_with_tools threads the configured preferences into the shared loop."""
     prefs = {"order": ["Baidu", "Fireworks", "Alibaba"], "allow_fallbacks": True}

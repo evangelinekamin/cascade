@@ -305,6 +305,7 @@ def openai_ask_with_tools(
     permissions=None,
     context_window: int = 128000,
     provider_preferences: Optional[dict] = None,
+    session_id: Optional[str] = None,
     check_cancelled: Optional[Callable[[], None]] = None,
 ) -> tuple[str, list[dict]]:
     """OpenAI-compatible tool calling loop.
@@ -436,6 +437,10 @@ def openai_ask_with_tools(
             payload["max_tokens"] = max_tokens
         if provider_preferences:
             payload["provider"] = provider_preferences
+        # Pin the whole conversation to one upstream host so its prompt cache stays
+        # warm across the tool loop's growing rounds (OpenRouter sticky sessions).
+        if session_id:
+            payload["session_id"] = session_id
 
         try:
             response = client.post(url, json=payload, headers=headers)
