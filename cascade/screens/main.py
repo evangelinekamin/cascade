@@ -451,6 +451,17 @@ class MainScreen(Screen):
         from ..prompts.layers import PRIORITY_MODE, PRIORITY_REPL_CONTEXT
         from ..prompts.default import get_mode_directive, design_language_section
 
+        # Ground the model in its working directory: without this it has no idea
+        # what folder Cascade launched in, so it guesses paths and asks where it
+        # is. Rebuilt per request, so it always reflects the live cwd.
+        import os
+
+        pipeline = pipeline.add_layer(
+            "working_dir",
+            f"Working directory (where Cascade is running): {os.getcwd()}",
+            PRIORITY_REPL_CONTEXT,
+        )
+
         # Inject mode-specific directive
         directive = get_mode_directive(self._mode)
         if directive:

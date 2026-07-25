@@ -160,13 +160,14 @@ def test_list_sessions_for_cwd_filters_and_counts(db):
     listed = db.list_sessions_for_cwd("/proj/alpha")
     ids = [s["id"] for s in listed]
 
-    # Current dir + unknown dir are reachable; the other project's is not.
+    # STRICTLY this directory: neither another project's session nor a legacy
+    # unknown-dir (cwd '') session leaks in -- the latter used to "ghost" into
+    # every directory. Both stay reachable by id / via /history.
     assert here["id"] in ids
-    assert unknown["id"] in ids
+    assert unknown["id"] not in ids
     assert all(s["title"] != "Elsewhere" for s in listed)
     counts = {s["id"]: s["message_count"] for s in listed}
     assert counts[here["id"]] == 2
-    assert counts[unknown["id"]] == 0
 
 
 def test_list_sessions_for_cwd_newest_first(db):

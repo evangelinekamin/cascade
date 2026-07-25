@@ -184,17 +184,24 @@ class HistoryDB:
         ).fetchall()
         return [self._row_to_session(r) for r in rows]
 
-    def list_sessions_for_cwd(self, cwd: str, limit: int = 20) -> list[dict]:
-        """Recent sessions for a directory, newest first, with message_count.
+    def list_sessions_for_cwd(
+        self, cwd: str, limit: int = 20, include_unknown: bool = False
+    ) -> list[dict]:
+        """Recent sessions for THIS directory, newest first, with message_count.
 
-        Unknown-directory sessions (cwd '') are always included so
-        pre-migration rows stay reachable from any directory instead of being
-        stranded. Each returned dict carries a ``message_count`` for the picker.
+        By default scoped strictly to *cwd*: the auto ``/resume`` picker shows
+        only this directory's own sessions. Pre-migration rows (cwd '') are NOT
+        folded in by default -- doing so made every legacy session a "ghost"
+        that surfaced in every directory, drowning out the ones that belong
+        here. They stay reachable by id (``/resume <id>``) and, with
+        ``include_unknown=True``, in the explicit ``/history`` listing.
+        Each returned dict carries a ``message_count`` for the picker.
         """
+        where = "s.cwd = ?" + (" OR s.cwd = ''" if include_unknown else "")
         rows = self._conn.execute(
             "SELECT s.*, "
             "(SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count "
-            "FROM sessions s WHERE s.cwd = ? OR s.cwd = '' "
+            f"FROM sessions s WHERE {where} "
             "ORDER BY s.updated_at DESC LIMIT ?",
             (cwd, limit),
         ).fetchall()

@@ -42,7 +42,8 @@ def test_resume_no_arg_opens_picker_with_dir_sessions(tmp_path):
     assert isinstance(screen, SessionPickerScreen)
     ids = [s["id"] for s in screen._sessions]
     assert here["id"] in ids
-    assert unknown["id"] in ids
+    # The auto picker is strict: a legacy unknown-dir session no longer ghosts in.
+    assert unknown["id"] not in ids
     assert all(s["title"] != "Elsewhere" for s in screen._sessions)
     db.close()
 

@@ -1526,7 +1526,9 @@ class CommandHandler:
             except ValueError:
                 pass
 
-        sessions = self.app.db.list_sessions_for_cwd(self._current_cwd(), limit=limit)
+        sessions = self.app.db.list_sessions_for_cwd(
+            self._current_cwd(), limit=limit, include_unknown=True
+        )
         if not sessions:
             self._post_system("No sessions found for this directory.")
             return
