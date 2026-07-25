@@ -258,6 +258,45 @@ class TestCompetitionOrchestrator:
             )
             shutil.rmtree(Path(winner_entry.worktree_path).parent, ignore_errors=True)
 
+    def test_execute_code_list_mode_skips_judge_and_keeps_all_worktrees(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _init_git_repo(tmpdir)
+            providers = {
+                "claude": _CodeProvider("claude"),
+                "openai": _CodeProvider("openai"),
+                # A judge is configured but must not be consulted in list mode.
+                "gemini": _CodeProvider("gemini"),
+            }
+            app = _mock_app(providers)
+            compete = CompetitionOrchestrator(app, judge_provider="gemini")
+
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(tmpdir)
+                result = compete.execute_code(
+                    "Update app.txt", providers=["claude", "openai"], judge=False
+                )
+            finally:
+                os.chdir(previous_cwd)
+
+            # No judge, no winner -- every run retained for external review.
+            assert result.judgment is None
+            assert result.winner_provider == ""
+            assert result.judge_provider == ""
+            assert len(result.entries) == 2
+            for entry in result.entries:
+                assert entry.retained is True
+                assert entry.worktree_path
+            for entry in result.entries:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", entry.worktree_path],
+                    cwd=tmpdir,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                shutil.rmtree(Path(entry.worktree_path).parent, ignore_errors=True)
+
     def test_code_competition_injects_per_model_guidance(self):
         # The competition is single-shot with no verify-loop retry, so a model
         # that narrates instead of acting silently produces "no changes" and
@@ -545,6 +584,7 @@ class TestCompeteCommand:
             "fix bug",
             providers=["claude", "openai"],
             on_progress=instance.execute_code.call_args.kwargs["on_progress"],
+            judge=True,
         )
         assert posted[0] == (
             "Code competition dispatching: fix bug\n"
@@ -689,6 +729,36 @@ def test_models_flag_clones_openrouter_per_model():
     assert overrides[labels[0]].config.model == "deepseek/deepseek-v4-flash"
     assert overrides[labels[1]].config.model == "moonshotai/kimi-k3"
     assert overrides[labels[0]] is not base
+
+
+def test_models_flag_clears_pinned_order_for_per_model_routing():
+    from types import SimpleNamespace
+    from cascade.providers.base import ProviderConfig
+    from cascade.providers.openrouter import OpenRouterProvider
+
+    base = OpenRouterProvider(
+        ProviderConfig(
+            api_key="k",
+            model="base-model",
+            context_window=200000,
+            provider_preferences={"order": ["Baidu"], "require_parameters": True},
+        )
+    )
+    cli_app = SimpleNamespace(providers={"openrouter": base})
+    handler = CommandHandler(MagicMock())
+    handler._post_system = lambda *a, **k: None
+
+    _, overrides = handler._build_model_overrides(
+        cli_app, ["deepseek/deepseek-v4-flash", "moonshotai/kimi-k3"], "Code competition"
+    )
+    clone = overrides["deepseek-deepseek-v4-flash"]
+    # The inherited pin and window are dropped so each model's own metadata fetch
+    # picks its best endpoints; unrelated preferences survive.
+    assert clone.config.context_window is None
+    assert "order" not in (clone.config.provider_preferences or {})
+    assert clone.config.provider_preferences["require_parameters"] is True
+    # The base provider is untouched.
+    assert base.config.provider_preferences["order"] == ["Baidu"]
 
 
 def test_models_flag_needs_openrouter_and_two_models():

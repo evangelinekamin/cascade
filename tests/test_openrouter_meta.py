@@ -8,32 +8,95 @@ from cascade.providers.base import ProviderConfig
 from cascade.providers.openrouter import OpenRouterProvider
 
 
-def _ep(name, ctx, quant, price=0.0, tput=None, tools=True):
-    return Endpoint(name, ctx, quant, price, 0.0, tools, tput)
+def _ep(name, ctx, quant, price=0.0, tput=None, tools=True, cache_read=None, out=0.0):
+    return Endpoint(name, ctx, quant, price, out, tools, tput, cache_read)
 
 
-def test_analyze_prefers_unquantized_and_uses_conservative_window():
-    # StreamLake (unknown quant) is kept; fp4/fp8 are dropped, so the window is
-    # StreamLake's 128k, not DeepInfra's larger-but-quantized 163k.
+def test_analyze_ranks_unquantized_cheapest_first_and_keeps_quantized():
+    # Unquantized StreamLake is cheapest per cache-weighted token, so it leads
+    # despite being slowest. fp4/fp8 hosts are penalized, not excluded, so they
+    # remain in the order -- and the window is the conservative min across the
+    # pinned set (Novita's 64k), since a request could route there on fallback.
     eps = [
         _ep("StreamLake", 128000, "unknown", price=0.0002, tput=50),
         _ep("DeepInfra", 163840, "fp4", price=0.00032, tput=100),
         _ep("Novita", 64000, "fp8", price=0.0004, tput=200),
     ]
     meta = _analyze(eps)
-    assert meta.effective_context == 128000
-    assert meta.recommended_order == ("StreamLake",)
+    assert meta.recommended_order[0] == "StreamLake"
+    assert set(meta.recommended_order) == {"StreamLake", "DeepInfra", "Novita"}
+    assert meta.effective_context == 64000
 
 
-def test_analyze_ranks_unquantized_by_throughput_then_price():
+def test_analyze_ranks_all_unquantized_by_composite_cost_and_speed():
+    # All faithful, so the score reduces to cost (cache-weighted) and speed: C is
+    # both cheapest and fastest, B next, A (priciest, slowest) last.
     eps = [
         _ep("A", 128000, "unknown", price=0.0003, tput=50),
         _ep("B", 200000, "bf16", price=0.0002, tput=100),
         _ep("C", 150000, "fp16", price=0.0001, tput=100),
     ]
     meta = _analyze(eps)
-    assert meta.effective_context == 128000  # conservative min across eligible
-    assert meta.recommended_order == ("C", "B", "A")  # tput desc, then price asc
+    assert meta.effective_context == 128000  # conservative min across pinned set
+    assert meta.recommended_order == ("C", "B", "A")
+
+
+def test_cache_read_price_dominates_ranking():
+    # Groq lists a higher sticker (prompt) price but a deep cache-read discount;
+    # the other host is cheaper on fresh prompts but never discounts cache reads.
+    # For a 95%-cache workload Groq is far cheaper overall, so it must rank first.
+    eps = [
+        _ep("Groq", 131072, "unknown", price=0.0000005, cache_read=0.00000005, tput=500),
+        _ep("Other", 131072, "unknown", price=0.0000002, cache_read=None, tput=500),
+    ]
+    meta = _analyze(eps)
+    assert meta.recommended_order[0] == "Groq"
+
+
+def test_quantization_is_a_soft_penalty_that_a_cheaper_host_can_overcome():
+    # A much cheaper fp4 host outranks a pricier unquantized one -- the penalty is
+    # weighed, not absolute -- but both are retained.
+    eps = [
+        _ep("Unq", 128000, "bf16", price=0.0003, tput=100),
+        _ep("Quant", 128000, "fp4", price=0.0002, tput=100),
+    ]
+    meta = _analyze(eps)
+    assert meta.recommended_order == ("Quant", "Unq")
+
+
+def test_prefer_unquantized_flag_toggles_the_faithfulness_penalty():
+    # Identical cost and speed: with the penalty the unquantized host wins; with it
+    # disabled the two tie and input order stands -- proving the flag gates quant.
+    eps = [
+        _ep("Quant", 128000, "fp8", price=0.0002, tput=100),
+        _ep("Unq", 128000, "bf16", price=0.0002, tput=100),
+    ]
+    assert _analyze(eps, prefer_unquantized=True).recommended_order == ("Unq", "Quant")
+    assert _analyze(eps, prefer_unquantized=False).recommended_order == ("Quant", "Unq")
+
+
+def test_parse_endpoints_reads_cache_read_price():
+    eps = orm._parse_endpoints(
+        {
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "Groq",
+                        "context_length": 131072,
+                        "quantization": "unknown",
+                        "pricing": {
+                            "prompt": "0.0000005",
+                            "completion": "0.0000008",
+                            "input_cache_read": "0.00000005",
+                        },
+                        "supported_parameters": ["tools"],
+                    }
+                ]
+            }
+        }
+    )
+    assert eps[0].cache_read_price == 5e-8
+    assert eps[0].effective_input_price == 5e-8  # cache price wins when present
 
 
 def test_analyze_falls_back_to_quantized_when_no_unquantized_exists():

@@ -148,6 +148,11 @@ def get_matching_commands(prefix: str) -> list[CommandDef]:
 class CommandHandler:
     """Parses and dispatches slash commands from user input."""
 
+    # Above this many competitors a single judge comparing every diff is
+    # unreliable, so /compete instead keeps all worktrees and reports the raw
+    # per-model data for external review.
+    _COMPETE_JUDGE_MAX = 6
+
     def __init__(self, app) -> None:
         self.app = app
         self._shannon = None
@@ -685,6 +690,13 @@ class CommandHandler:
                 f"isn't configured. Add it with /login."
             )
             return None
+        # Each model routes to ITS OWN best endpoints, not the base provider's
+        # pinned order: drop the inherited provider order and window so every
+        # clone's live metadata fetch ranks that model's hosts on its own merits
+        # (unquantized, cheap-per-cached-token, fast). Other preferences
+        # (require_parameters, allow_fallbacks) carry through.
+        base_prefs = dict(base.config.provider_preferences or {})
+        base_prefs.pop("order", None)
         labels: list[str] = []
         overrides: dict = {}
         for model in models:
@@ -692,7 +704,14 @@ class CommandHandler:
             if safe in overrides:
                 continue
             try:
-                clone = type(base)(replace(base.config, model=model))
+                clone = type(base)(
+                    replace(
+                        base.config,
+                        model=model,
+                        context_window=None,
+                        provider_preferences=dict(base_prefs) or None,
+                    )
+                )
                 clone.hook_runner = getattr(base, "hook_runner", None)
                 clone.permission_engine = getattr(base, "permission_engine", None)
             except Exception as exc:
@@ -2450,11 +2469,18 @@ class CommandHandler:
         cli_app, selected, judge_arg, objective, overrides = request
         provider_states = {provider: "queued" for provider in selected}
         judge_status = ""
+        use_judge = len(selected) <= self._COMPETE_JUDGE_MAX
 
+        judge_line = (
+            f"Judge: {judge_arg or 'auto'}"
+            if use_judge
+            else f"Judge: skipped ({len(selected)} > {self._COMPETE_JUDGE_MAX}); "
+            "keeping all worktrees for review"
+        )
         self._post_system(
             f"Code competition dispatching: {objective}\n"
             f"Providers: {', '.join(selected)}\n"
-            f"Judge: {judge_arg or 'auto'}"
+            f"{judge_line}"
         )
         self._record_command_line(
             f"/compete-code {' '.join(args)}",
@@ -2493,39 +2519,52 @@ class CommandHandler:
                 compete = CompetitionOrchestrator(
                     cli_app, judge_provider=judge_arg, provider_overrides=overrides
                 )
-                result = compete.execute_code(objective, providers=selected, on_progress=_on_progress)
-
-                lines = [f"Code competition complete. Judge: {result.judge_provider}"]
-                winner_label = result.winner_provider or "none"
-                lines.append(f"Winner: {winner_label}")
-                lines.append(f"Total tokens: {result.total_tokens:,}")
-
-                winner_entry = next(
-                    (
-                        entry for entry in result.entries
-                        if entry.provider == result.winner_provider and entry.retained and entry.worktree_path
-                    ),
-                    None,
+                result = compete.execute_code(
+                    objective, providers=selected, on_progress=_on_progress, judge=use_judge
                 )
-                if winner_entry is not None:
-                    lines.append(f"Winner worktree: {winner_entry.worktree_path}")
-                    # Stage the winner's patch so /apply can land it on the real
-                    # working tree -- same mechanism /solve uses. A fresh manager
-                    # diffs the worktree against HEAD (the competition base).
-                    try:
-                        from .swarm.worktree import WorktreeManager
 
-                        winner_patch = WorktreeManager().diff_patch(
-                            winner_entry.worktree_path
-                        )
-                    except Exception:
-                        winner_patch = ""
-                    if winner_patch:
-                        self._last_solve_patch = winner_patch
-                        self._last_solve_changed = tuple(winner_entry.changed_files)
-                        lines.append("Run /apply to land the winner's changes here.")
+                if result.judgment is None:
+                    # List mode: too many competitors to judge well. Report the raw
+                    # per-model data below and leave every worktree in place.
+                    lines = [
+                        f"Code competition complete. {len(result.entries)} models, "
+                        f"judging skipped (> {self._COMPETE_JUDGE_MAX}); "
+                        "all worktrees kept for review."
+                    ]
+                    lines.append(f"Total tokens: {result.total_tokens:,}")
+                    lines.append("")
+                else:
+                    lines = [f"Code competition complete. Judge: {result.judge_provider}"]
+                    winner_label = result.winner_provider or "none"
+                    lines.append(f"Winner: {winner_label}")
+                    lines.append(f"Total tokens: {result.total_tokens:,}")
 
-                lines.append("")
+                    winner_entry = next(
+                        (
+                            entry for entry in result.entries
+                            if entry.provider == result.winner_provider and entry.retained and entry.worktree_path
+                        ),
+                        None,
+                    )
+                    if winner_entry is not None:
+                        lines.append(f"Winner worktree: {winner_entry.worktree_path}")
+                        # Stage the winner's patch so /apply can land it on the real
+                        # working tree -- same mechanism /solve uses. A fresh manager
+                        # diffs the worktree against HEAD (the competition base).
+                        try:
+                            from .swarm.worktree import WorktreeManager
+
+                            winner_patch = WorktreeManager().diff_patch(
+                                winner_entry.worktree_path
+                            )
+                        except Exception:
+                            winner_patch = ""
+                        if winner_patch:
+                            self._last_solve_patch = winner_patch
+                            self._last_solve_changed = tuple(winner_entry.changed_files)
+                            lines.append("Run /apply to land the winner's changes here.")
+
+                    lines.append("")
 
                 for entry in result.entries:
                     status = "OK" if entry.success else f"FAIL: {entry.error}"
@@ -2546,6 +2585,12 @@ class CommandHandler:
                     elif entry.worktree_path:
                         lines.append("    Worktree: removed")
 
+                if result.judgment is None:
+                    lines.append("")
+                    lines.append(
+                        "Judging skipped. Inspect any run with `git -C <worktree> diff`, "
+                        "or hand the worktrees to subagents to score."
+                    )
                 if result.judgment and result.judgment.rationale:
                     lines.append("")
                     lines.append(f"Judge rationale: {result.judgment.rationale}")

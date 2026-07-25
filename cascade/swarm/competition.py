@@ -468,8 +468,15 @@ class CompetitionOrchestrator:
         objective: str,
         providers: Optional[list[str]] = None,
         on_progress: ProgressCallback = None,
+        judge: bool = True,
     ) -> CompetitionResult:
-        """Run a code-edit competition in isolated git worktrees."""
+        """Run a code-edit competition in isolated git worktrees.
+
+        With ``judge=False`` the run collects every competitor's changes but skips
+        the judge and keeps all worktrees -- the mode for large model sweeps where
+        one judge comparing many diffs is unreliable and the raw per-competitor
+        data is meant to be processed externally.
+        """
         provider_names = providers or list(self._app.providers.keys())
         if len(provider_names) < 2:
             raise RuntimeError("Competition needs at least two providers")
@@ -517,6 +524,19 @@ class CompetitionOrchestrator:
                     )
 
         entries.sort(key=lambda entry: provider_names.index(entry.provider))
+
+        if not judge:
+            # Keep every worktree and hand the raw per-competitor data back for
+            # external (human or subagent) review -- no judge, no winner.
+            for entry in entries:
+                entry.retained = bool(entry.worktree_path)
+            return CompetitionResult(
+                objective=objective,
+                entries=entries,
+                judgment=None,
+                total_tokens=sum(entry.tokens for entry in entries),
+            )
+
         judgment = self._judge(
             objective,
             entries,
