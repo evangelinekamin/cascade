@@ -12,6 +12,10 @@ from ..context.budget import window_for
 if TYPE_CHECKING:
     from ..tools.schema import ToolDef
 
+# The live endpoint-metadata fetch is disabled wholesale by the test suite (which
+# has no network and asserts on unmutated config); production leaves it on.
+_META_ENABLED = True
+
 
 @register_provider("openrouter")
 class OpenRouterProvider(BaseProvider):
@@ -27,6 +31,37 @@ class OpenRouterProvider(BaseProvider):
         self.base_url = config.base_url or "https://openrouter.ai/api/v1"
         self.client = httpx.Client(timeout=60.0)
         self._last_generation_id: Optional[str] = None
+        self._meta_applied = False
+
+    def _apply_meta(self) -> None:
+        """Once per model, fold live OpenRouter endpoint metadata into the config.
+
+        Best-effort and lazy (first request): sets the real context window (the
+        conservative min across routable endpoints) when none is configured, and
+        prefers unquantized, fast, cheap endpoints when no order is pinned. Any
+        failure leaves the configured defaults untouched.
+        """
+        if self._meta_applied or not _META_ENABLED:
+            return
+        self._meta_applied = True
+        try:
+            from .openrouter_meta import model_meta
+
+            meta = model_meta(self.config.model, base_url=self.base_url)
+        except Exception:
+            meta = None
+        if meta is None:
+            return
+        if self.config.context_window is None and meta.effective_context:
+            self.config.context_window = meta.effective_context
+        prefs = dict(self.config.provider_preferences or {})
+        prefs.setdefault("require_parameters", True)
+        prefs.setdefault("allow_fallbacks", True)
+        # Respect an explicitly pinned order; otherwise route by the quality rank
+        # (unquantized > throughput > price).
+        if not prefs.get("order") and meta.recommended_order:
+            prefs["order"] = list(meta.recommended_order[:6])
+        self.config.provider_preferences = prefs
 
     @property
     def last_generation_id(self) -> Optional[str]:
@@ -143,6 +178,7 @@ class OpenRouterProvider(BaseProvider):
 
     def stream(self, messages: list[Message], system: Optional[str] = None) -> Iterator[str]:
         """Stream tokens from OpenRouter."""
+        self._apply_meta()
         self._last_usage = None
         self._last_round_usage = None
         self._last_generation_id = None
@@ -247,6 +283,7 @@ class OpenRouterProvider(BaseProvider):
         on_pending_message=None,
     ) -> tuple[str, list[dict]]:
         """OpenAI-compatible tool calling via OpenRouter."""
+        self._apply_meta()
         self._last_usage = None
         self._last_round_usage = None
         try:
