@@ -114,6 +114,9 @@ def test_stream_cli_parses_agent_message_and_usage():
 
     assert chunks == ["OK"]
     assert provider.last_usage == Usage(input=9, output=2)
+    # codex usage is session-cumulative, so it must NOT become the context
+    # anchor (that showed "ctx 7386.0k / 999%" and over-triggered compaction).
+    assert provider.last_round_usage is None
 
 
 def test_oauth_token_without_codex_binary_raises_clear_error():

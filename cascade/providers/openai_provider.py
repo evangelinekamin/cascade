@@ -564,8 +564,16 @@ class OpenAIProvider(BaseProvider):
                 elif session_id:
                     self._codex_sessions.setdefault(session_key, session_id)
                 if handler.last_usage:
+                    # codex's turn.completed usage is SESSION-CUMULATIVE, so the
+                    # final one is the whole exec's spend -- right for _last_usage
+                    # (the counter) but catastrophically wrong as the context
+                    # anchor (it showed "ctx 7386.0k / 999%" and made compaction
+                    # strip real context). codex manages its own context window
+                    # internally, so Cascade has no honest last-round size: None
+                    # -> "ctx ?", and should_compact falls back to counting our
+                    # own message chars.
                     self._last_usage = handler.last_usage
-                    self._last_round_usage = handler.last_usage
+                    self._last_round_usage = None
                 return
 
     def ask(self, messages: list[Message], system: Optional[str] = None) -> str:

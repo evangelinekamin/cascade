@@ -237,8 +237,13 @@ class ClaudeProvider(BaseProvider):
         if handler.total_usage is not None:
             # Accumulated spend across every internal turn; the base handler's
             # last_usage is the final turn only -- the context-occupancy anchor.
+            # NEVER fall back to total_usage for the anchor: it is the SUM over
+            # all rounds (each re-sends the growing context), so using it as the
+            # last-round size inflates the anchor ~Nx-rounds -- which showed as a
+            # 7.4M-token "ctx 999%" and made should_compact strip real context.
+            # If the final-turn usage is unknown, None -> honest "ctx ?".
             self._last_usage = handler.total_usage
-            self._last_round_usage = handler.last_usage or handler.total_usage
+            self._last_round_usage = handler.last_usage
         elif handler.last_usage:
             self._last_usage = handler.last_usage
             self._last_round_usage = handler.last_usage
