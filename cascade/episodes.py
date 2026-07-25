@@ -114,7 +114,14 @@ def _extract_actions(assistant_content: str, tool_log: list[dict] | None = None)
     # Tool calls are the most explicit actions
     if tool_log:
         for call in tool_log:
-            tool_name = call.get("tool_name", call.get("name", "unknown"))
+            # Real tool loops log the key "tool" (see _openai_tools.py,
+            # claude.py, gemini.py); fall back to older key names.
+            tool_name = (
+                call.get("tool")
+                or call.get("tool_name")
+                or call.get("name")
+                or "unknown"
+            )
             actions.append(f"tool:{tool_name}")
         return tuple(actions)
 

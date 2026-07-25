@@ -153,6 +153,21 @@ def _read_dedup_key(tool_name: str, tool_args: dict) -> Optional[tuple[str, str]
     return None
 
 
+def _invalidates_read(tool_name: str, tool_args: dict) -> Optional[str]:
+    """Return the path a write/append/replace targeted, else ``None``.
+
+    Editing a file makes any earlier read-dedup entry for that path stale: a
+    later read must re-fetch fresh bytes rather than be told "[already read
+    above]" pointing at the pre-edit content. Shared by the Claude and Gemini
+    native loops so all three invalidate identically.
+    """
+    if tool_name in _EDIT_TOOLS:
+        path = tool_args.get("path")
+        if isinstance(path, str) and path:
+            return path
+    return None
+
+
 def _edit_run_target(tool_name: str, tool_args: dict) -> Optional[tuple[str, str]]:
     """Classify a call for the edit-run cycle guard.
 
@@ -457,6 +472,17 @@ def openai_ask_with_tools(
                         return (content + note).strip(), tool_log
                     if dedup_key is not None:
                         seen_reads[dedup_key] = tc["id"]
+                    else:
+                        # A successful edit makes any cached read of that path
+                        # stale: drop its dedup keys so the next read re-fetches
+                        # fresh content instead of "[already read above]".
+                        edited = _invalidates_read(tool_name, tool_args)
+                        if edited is not None and seen_reads:
+                            seen_reads = {
+                                key: cid
+                                for key, cid in seen_reads.items()
+                                if key[1] != edited
+                            }
             _checkpoint()
             tool_log.append({
                 "tool": tool_name,

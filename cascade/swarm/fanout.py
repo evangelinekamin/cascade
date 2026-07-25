@@ -229,8 +229,15 @@ def plan_subtasks(
     on_tokens: TokensCallback = None,
     on_cost: Optional[Callable[[float], None]] = None,
     cancel_token: Optional[CancellationToken] = None,
+    context: str = "",
 ) -> List[FanoutTask]:
-    """Ask the *director* (a frontier model) to split the objective into subtasks."""
+    """Ask the *director* (a frontier model) to split the objective into subtasks.
+
+    ``context`` is the same bounded conversation digest the workers receive (see
+    :func:`cascade.conversation.build_lane_context`); prepended here so the
+    director can resolve a referential objective ("fix the errors codex found")
+    before splitting it into subtasks, not just each worker after the fact.
+    """
     if director is None:
         return [FanoutTask(id="sub_1", description=objective, prompt=objective)]
     if on_progress:
@@ -247,9 +254,14 @@ def plan_subtasks(
             if callable(cancellation_scope) and cancel_token is not None
             else nullcontext()
         )
+        director_prompt = (
+            f"Decompose this objective into independent parallel subtasks:\n\n{objective}"
+        )
+        if context:
+            director_prompt = f"{context}\n\n{director_prompt}"
         with scope:
             response = director.ask_single(
-                f"Decompose this objective into independent parallel subtasks:\n\n{objective}",
+                director_prompt,
                 system=_DIRECTOR_SYSTEM,
             )
         if cancel_token is not None:
@@ -406,8 +418,11 @@ def run_fanout(
     }
     if token is not None:
         plan_kwargs["cancel_token"] = token
-    if "on_cost" in inspect.signature(plan_subtasks).parameters:
+    plan_params = inspect.signature(plan_subtasks).parameters
+    if "on_cost" in plan_params:
         plan_kwargs["on_cost"] = _plan_cost
+    if "context" in plan_params:
+        plan_kwargs["context"] = context
     tasks = plan_subtasks(
         app, objective, director, director_model, **plan_kwargs,
     )

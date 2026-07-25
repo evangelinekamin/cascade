@@ -24,6 +24,7 @@ from .outcome import RunOutcome
 from .pipeline import run_pipeline
 from .solve import run_solve
 from .workspace import WorkspaceTools
+from .worktree import WorktreeManager
 
 
 class WorkflowKind(str, Enum):
@@ -56,6 +57,12 @@ class AutoResult:
     input_tokens: int = 0
     output_tokens: int = 0
     cost: float = 0.0
+    # Per-provider breakdown carried up from the underlying Solve/Pipeline/Fanout
+    # result (plus the router's own call) so an escalation's tokens/cost are
+    # credited to the model that incurred them, not lumped under the base
+    # provider. (provider, input_tokens, output_tokens) and (provider, cost).
+    tokens_by_provider: tuple[tuple[str, int, int], ...] = ()
+    cost_by_provider: tuple[tuple[str, float], ...] = ()
 
 
 ProgressCallback = Optional[Callable[[str, str], None]]
@@ -456,6 +463,73 @@ def _format_fanout(decision: RouteDecision, result) -> str:
     return "\n".join(lines)
 
 
+def _route_token_attribution(
+    decision: RouteDecision,
+) -> "tuple[tuple[str, int, int], ...]":
+    """The router call's own tokens, attributed to the provider that ran it.
+
+    Emitted only when the route actually spent tokens, so the zero-cost local /
+    heuristic / fallback routers add no phantom entry to the breakdown.
+    """
+    if decision.input_tokens or decision.output_tokens:
+        return (
+            (decision.router_provider, decision.input_tokens, decision.output_tokens),
+        )
+    return ()
+
+
+def _route_cost_attribution(
+    decision: RouteDecision,
+) -> "tuple[tuple[str, float], ...]":
+    """The router call's own cost, attributed to the provider that ran it."""
+    if decision.cost:
+        return ((decision.router_provider, decision.cost),)
+    return ()
+
+
+def _merge_token_breakdown(
+    *groups: "tuple[tuple[str, int, int], ...]",
+) -> "tuple[tuple[str, int, int], ...]":
+    """Sum per-provider token tuples across groups, preserving first-seen order."""
+    merged: dict[str, list[int]] = {}
+    for group in groups:
+        for label, ins, outs in group:
+            bucket = merged.setdefault(label, [0, 0])
+            bucket[0] += ins
+            bucket[1] += outs
+    return tuple((label, ins, outs) for label, (ins, outs) in merged.items())
+
+
+def _merge_cost_breakdown(
+    *groups: "tuple[tuple[str, float], ...]",
+) -> "tuple[tuple[str, float], ...]":
+    """Sum per-provider cost tuples across groups, preserving first-seen order."""
+    merged: dict[str, float] = {}
+    for group in groups:
+        for label, cost in group:
+            merged[label] = merged.get(label, 0.0) + cost
+    return tuple(merged.items())
+
+
+def _auto_breakdowns(
+    decision: RouteDecision, *results
+) -> "tuple[tuple[tuple[str, int, int], ...], tuple[tuple[str, float], ...]]":
+    """Merged per-provider (tokens, cost) for the route call plus each result.
+
+    ``getattr`` guards let test doubles omit the breakdown fields; real
+    Solve/Pipeline/Fanout results always carry them.
+    """
+    token_groups = [_route_token_attribution(decision)]
+    cost_groups = [_route_cost_attribution(decision)]
+    for result in results:
+        token_groups.append(tuple(getattr(result, "tokens_by_provider", ()) or ()))
+        cost_groups.append(tuple(getattr(result, "cost_by_provider", ()) or ()))
+    return (
+        _merge_token_breakdown(*token_groups),
+        _merge_cost_breakdown(*cost_groups),
+    )
+
+
 def execute_auto(
     app,
     prompt: str,
@@ -500,16 +574,20 @@ def execute_auto(
             config["recon_model"],
             config["provider_preferences"],
         )
+        verify_mode = mode == "test"
         disposable_provider = provider is not None
         if provider is None:
             # A direct-API active provider can still be constrained to read-only
-            # tools. CLI proxies are excluded because their native tool set is not
-            # controlled by WorkspaceTools.
+            # tools. A CLI proxy normally cannot -- its native tool set is not
+            # controlled by WorkspaceTools -- EXCEPT in test mode, where the
+            # _force_repo_write override below hands it a writable sandbox to
+            # actually run the project's checks, so it may serve as recon there.
             candidate = app.providers.get(active_provider)
-            if candidate is not None and not (
+            candidate_is_cli_proxy = candidate is not None and (
                 getattr(candidate, "_use_cli_proxy", False)
                 or getattr(candidate, "_use_oauth_cli", False)
-            ):
+            )
+            if candidate is not None and (verify_mode or not candidate_is_cli_proxy):
                 provider = candidate
                 provider_name = active_provider
                 disposable_provider = False
@@ -541,26 +619,64 @@ def execute_auto(
             # project's checks -- a read-only pass can only guess. So recon in
             # test mode gets run_command (permission-gated: transparent
             # test/build commands auto-approve, dangerous ones are denied) and a
-            # prompt that permits running checks but not editing source.
-            ws = WorkspaceTools(os.getcwd(), cancel_token=token)
-            verify_mode = mode == "test"
-            recon_tools = ws.build_verify() if verify_mode else ws.build_read_only()
-            recon_system = _RECON_VERIFY_SYSTEM if verify_mode else _RECON_READONLY_SYSTEM
-            if verify_mode:
-                # A CLI-proxy provider (codex) runs its own sandbox, not our
-                # tools, so read-only-tools alone won't let it execute; this
-                # flag forces its writable sandbox. Harmless on direct-API
-                # providers, which don't have it.
-                setattr(provider, "_force_repo_write", True)
-            recon_input = f"{context}\n\n{prompt}" if context else prompt
-            with scope, callback_scope:
-                response, _log = provider.ask_with_tools(
-                    [{"role": "user", "content": recon_input}],
-                    recon_tools,
-                    system=recon_system,
-                    max_rounds=config["recon_max_rounds"],
-                    on_tool_event=on_tool_event,
+            # prompt that permits running checks but not editing source. Because
+            # that run_command (and, for a CLI proxy, its writable sandbox) must
+            # never touch the user's real checkout, test-mode recon builds
+            # against a throwaway worktree at HEAD -- the same isolation /solve
+            # uses -- so run_command's isolation invariant holds. Read-only recon
+            # inspects the repository in place.
+            recon_root = os.getcwd()
+            verify_manager = None
+            worktree_scope = nullcontext()
+            force_write_present = hasattr(provider, "_force_repo_write")
+            force_write_prev = getattr(provider, "_force_repo_write", None)
+            # The try/finally spans every verify-mode side effect (the writable
+            # sandbox flag and the throwaway worktree) so both are always undone,
+            # even if setup fails before the model call.
+            try:
+                if verify_mode:
+                    verify_manager = WorktreeManager()
+                    recon_root = verify_manager.prepare("_recon").path
+                    # A CLI proxy (codex) drives its own sandbox in its cwd, not
+                    # our WorkspaceTools, so aim it at the worktree and force its
+                    # writable sandbox. Harmless on direct-API providers, which
+                    # have neither.
+                    working_directory = getattr(provider, "working_directory", None)
+                    if callable(working_directory):
+                        worktree_scope = working_directory(recon_root)
+                    setattr(provider, "_force_repo_write", True)
+                # A verify recon actually runs the project's suite, which the 120s
+                # default can easily outlast; a read-only recon runs no commands.
+                command_timeout = 600.0 if verify_mode else 120.0
+                ws = WorkspaceTools(
+                    recon_root, command_timeout=command_timeout, cancel_token=token,
                 )
+                recon_tools = ws.build_verify() if verify_mode else ws.build_read_only()
+                recon_system = (
+                    _RECON_VERIFY_SYSTEM if verify_mode else _RECON_READONLY_SYSTEM
+                )
+                recon_input = f"{context}\n\n{prompt}" if context else prompt
+                with scope, callback_scope, worktree_scope:
+                    response, _log = provider.ask_with_tools(
+                        [{"role": "user", "content": recon_input}],
+                        recon_tools,
+                        system=recon_system,
+                        max_rounds=config["recon_max_rounds"],
+                        on_tool_event=on_tool_event,
+                    )
+            finally:
+                if verify_mode:
+                    # Restore the shared provider: never leave a writable-sandbox
+                    # flag on the user's interactive provider after recon.
+                    if force_write_present:
+                        setattr(provider, "_force_repo_write", force_write_prev)
+                    else:
+                        try:
+                            delattr(provider, "_force_repo_write")
+                        except AttributeError:
+                            pass
+                    if verify_manager is not None:
+                        verify_manager.cleanup()
             _checkpoint()
             usage = provider.last_usage or Usage()
             execution_cost = usage.cost or 0.0
@@ -652,6 +768,7 @@ def execute_auto(
             context=context,
         )
         result_cost = float(getattr(result, "cost", 0.0) or 0.0)
+        tokens_bd, cost_bd = _auto_breakdowns(decision, result)
         return AutoResult(
             decision,
             result.outcome,
@@ -660,6 +777,8 @@ def execute_auto(
             route_in + result.input_tokens,
             route_out + result.output_tokens,
             route_cost + result_cost,
+            tokens_bd,
+            cost_bd,
         )
 
     if decision.workflow == WorkflowKind.PIPELINE:
@@ -673,6 +792,7 @@ def execute_auto(
             context=context,
         )
         result_cost = float(getattr(result, "cost", 0.0) or 0.0)
+        tokens_bd, cost_bd = _auto_breakdowns(decision, result)
         return AutoResult(
             decision,
             result.outcome,
@@ -681,6 +801,8 @@ def execute_auto(
             route_in + result.input_tokens,
             route_out + result.output_tokens,
             route_cost + result_cost,
+            tokens_bd,
+            cost_bd,
         )
 
     if decision.workflow == WorkflowKind.FANOUT:
@@ -708,16 +830,30 @@ def execute_auto(
                 context=context,
             )
             pipeline_cost = float(getattr(pipeline, "cost", 0.0) or 0.0)
+            # The blocked fanout still made a real director planning call; fold
+            # its own tokens/cost in so the reroute does not erase that spend.
+            # Its cost is taken from the per-provider breakdown (the authoritative
+            # record of what each model billed) rather than the flat ``cost``
+            # field, keeping the AutoResult's flat cost equal to its breakdown.
+            blocked_in = getattr(result, "input_tokens", 0) or 0
+            blocked_out = getattr(result, "output_tokens", 0) or 0
+            blocked_cost = sum(
+                c for _, c in (getattr(result, "cost_by_provider", ()) or ())
+            )
+            tokens_bd, cost_bd = _auto_breakdowns(decision, result, pipeline)
             return AutoResult(
                 decision,
                 pipeline.outcome,
                 _format_pipeline(decision, pipeline, rerouted=True),
                 pipeline.provider,
-                route_in + pipeline.input_tokens,
-                route_out + pipeline.output_tokens,
-                route_cost + pipeline_cost,
+                route_in + blocked_in + pipeline.input_tokens,
+                route_out + blocked_out + pipeline.output_tokens,
+                route_cost + blocked_cost + pipeline_cost,
+                tokens_bd,
+                cost_bd,
             )
         result_cost = float(getattr(result, "cost", 0.0) or 0.0)
+        tokens_bd, cost_bd = _auto_breakdowns(decision, result)
         return AutoResult(
             decision,
             result.outcome,
@@ -726,6 +862,8 @@ def execute_auto(
             route_in + result.input_tokens,
             route_out + result.output_tokens,
             route_cost + result_cost,
+            tokens_bd,
+            cost_bd,
         )
 
     raise ValueError("execute_auto cannot execute the chat route")

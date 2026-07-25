@@ -16,6 +16,7 @@ from ._openai_tools import (
     _CHARS_PER_TOKEN,
     _CONTEXT_BUDGET_FRACTION,
     _KEEP_RECENT_MESSAGES,
+    _invalidates_read,
     _read_dedup_key,
 )
 from .registry import register_provider
@@ -100,6 +101,21 @@ def _compact_gemini_tool_results(
         if changed:
             result[idx] = {**entry, "parts": new_parts}
     return result
+
+
+def _elided_read_indices(before: list[dict], after: list[dict]) -> set[int]:
+    """Contents indices whose functionResponse results compaction just elided.
+
+    Compaction only stubs functionResponse result strings, so an entry whose
+    ``parts`` changed had a read result evicted. Any read-dedup entry pointing
+    at that index must be dropped, else a repeat read is told "[already read
+    above]" while the bytes it named are gone.
+    """
+    return {
+        idx
+        for idx, (old, new) in enumerate(zip(before, after))
+        if old.get("parts") != new.get("parts")
+    }
 
 
 @register_provider("gemini")
@@ -341,14 +357,29 @@ class GeminiProvider(BaseProvider):
             window_for("gemini", self.config.model, self.config.context_window)
             * _CONTEXT_BUDGET_FRACTION
         )
-        seen_reads: set[tuple[str, str]] = set()
+        # dedup_key -> the contents index of the entry holding that read's
+        # functionResponse. When budget compaction later ELIDES that result, the
+        # key is dropped so a repeat read re-fetches the file instead of
+        # "[already read above]" pointing at content that is gone. Mirrors the
+        # shared OpenAI loop (which keys by tool_call_id).
+        seen_reads: dict[tuple[str, str], int] = {}
 
         text_parts = []
         for round_num in range(max_rounds):
             self.raise_if_cancelled()
+            _before = contents
             contents = _compact_gemini_tool_results(
                 contents, budget, _KEEP_RECENT_MESSAGES,
             )
+            # Drop dedup keys whose read result was just elided.
+            if seen_reads and _before is not contents:
+                elided = _elided_read_indices(_before, contents)
+                if elided:
+                    seen_reads = {
+                        key: idx
+                        for key, idx in seen_reads.items()
+                        if idx not in elided
+                    }
             url = f"{self.base_url}/{self.config.model}:generateContent"
             payload = {
                 "contents": contents,
@@ -398,6 +429,11 @@ class GeminiProvider(BaseProvider):
             # Append the model response
             contents.append({"role": "model", "parts": parts})
 
+            # This round's functionResponses land in one entry appended below;
+            # its index is the current length. Reads dedup against it so an
+            # elision of that entry can later invalidate them.
+            response_index = len(contents)
+
             # Execute each function call
             response_parts = []
             for fc in function_calls:
@@ -423,7 +459,17 @@ class GeminiProvider(BaseProvider):
                     except PermissionAbort as exc:
                         return ("".join(text_parts) + f"\n\n[stopped: {exc}]").strip(), tool_log
                     if dedup_key is not None:
-                        seen_reads.add(dedup_key)
+                        seen_reads[dedup_key] = response_index
+                    else:
+                        # A successful edit makes any cached read of that path
+                        # stale: drop its dedup keys so the next read re-fetches.
+                        edited = _invalidates_read(tool_name, tool_args)
+                        if edited is not None and seen_reads:
+                            seen_reads = {
+                                key: idx
+                                for key, idx in seen_reads.items()
+                                if key[1] != edited
+                            }
                 self.raise_if_cancelled()
                 tool_log.append({
                     "tool": tool_name,

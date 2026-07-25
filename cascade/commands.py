@@ -1866,6 +1866,34 @@ class CommandHandler:
         else:
             self._post_system(f"Apply failed: {message}")
 
+    def _lane_context(self, state, provider: str) -> str:
+        """Bounded conversation digest for a slash-lane, honoring memory policy.
+
+        Mirrors the chat path: carries the prior conversation (with the active
+        cross-model memory policy, live episodes, and compaction summary) so a
+        referential /solve, /pipeline, or /fanout can resolve its referent, and
+        so an ``off`` policy still excludes other-provider reports.
+        """
+        from .conversation import build_lane_context
+
+        if state is None:
+            return ""
+        cli_app = getattr(self.app, "cli_app", None)
+        policy = "summary"
+        if cli_app is not None:
+            try:
+                policy = str(
+                    cli_app.config.get_memory_config().get("cross_model_memory", "summary")
+                )
+            except Exception:
+                policy = "summary"
+        return build_lane_context(
+            list(state.messages), provider or "",
+            policy=policy,
+            episodes=list(getattr(state, "episodes", []) or []),
+            compaction_summary=getattr(state, "compaction_summary", "") or "",
+        )
+
     def _cmd_solve(self, args: list[str]) -> None:
         """Code a task in an isolated worktree, verified by tests (iterate to green)."""
         if not args:
@@ -1883,14 +1911,8 @@ class CommandHandler:
         # Carry the prior conversation into the otherwise history-free worktree so
         # "/solve fix the errors codex found" can resolve its referent. Built
         # before the command line is recorded, so it reflects genuine context.
-        from .conversation import build_lane_context
-
         solve_state = getattr(self.app, "state", None)
-        lane_context = (
-            build_lane_context(list(solve_state.messages), provider or "")
-            if solve_state is not None
-            else ""
-        )
+        lane_context = self._lane_context(solve_state, provider)
 
         self._post_system(f"Solving: {objective}")
         self._record_command_line(f"/solve {objective}", title=f"[Solve] {objective}")
@@ -2074,6 +2096,13 @@ class CommandHandler:
 
         provider = getattr(getattr(self.app, "state", None), "active_provider", None)
 
+        # Carry the prior conversation into the history-free worktrees so a
+        # referential objective can resolve its referent -- the director gets it
+        # too, not just the workers. Built before the command line is recorded,
+        # so it reflects genuine context.
+        pipeline_state = getattr(self.app, "state", None)
+        lane_context = self._lane_context(pipeline_state, provider)
+
         self._post_system(f"Pipeline: {objective}")
         self._record_command_line(f"/pipeline {objective}", title=f"[Pipeline] {objective}")
         progress = self._mount_progress_indicator(f"pipeline: {objective[:60]}")
@@ -2105,6 +2134,7 @@ class CommandHandler:
                 result = run_pipeline(
                     cli_app, objective, provider_name=provider,
                     on_progress=_on_progress, run_context=run_ctx,
+                    context=lane_context,
                 )
                 outcome = result.outcome
 
@@ -2167,6 +2197,13 @@ class CommandHandler:
 
         provider = getattr(getattr(self.app, "state", None), "active_provider", None)
 
+        # Carry the prior conversation into the history-free worktrees so a
+        # referential objective can resolve its referent -- the director gets it
+        # too, not just the workers. Built before the command line is recorded,
+        # so it reflects genuine context.
+        fanout_state = getattr(self.app, "state", None)
+        lane_context = self._lane_context(fanout_state, provider)
+
         self._post_system(f"Fanout: {objective}")
         self._record_command_line(f"/fanout {objective}", title=f"[Fanout] {objective}")
         progress = self._mount_progress_indicator(f"fanout: {objective[:60]}")
@@ -2197,6 +2234,7 @@ class CommandHandler:
                 result = run_fanout(
                     cli_app, objective, provider_name=provider,
                     on_progress=_on_progress, run_context=run_ctx,
+                    context=lane_context,
                 )
                 run_outcome = result.outcome
 

@@ -555,7 +555,7 @@ class ConfigManager:
         try:
             rounds = int(merged.get("recon_max_rounds", 16))
         except (TypeError, ValueError):
-            rounds = 10
+            rounds = 16
         merged["recon_max_rounds"] = max(1, min(rounds, 40))
         return merged
 

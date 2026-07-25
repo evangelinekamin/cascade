@@ -687,6 +687,9 @@ class MainScreen(Screen):
 
                 lane_context = build_lane_context(
                     list(self.app.state.messages)[:-1], provider_name,
+                    policy=self._memory_policy,
+                    episodes=list(self.app.state.episodes),
+                    compaction_summary=self.app.state.compaction_summary,
                 )
                 if managed_run:
                     self._auto_orchestration_worker(
@@ -807,6 +810,9 @@ class MainScreen(Screen):
                 response_text,
                 result.input_tokens,
                 result.output_tokens,
+                # Per-provider breakdown so an escalation's tokens are credited to
+                # the model that incurred them, not lumped under the base provider.
+                result.tokens_by_provider,
                 terminal=True,
             )
             cli_app.hook_runner.run_hooks(
@@ -1323,8 +1329,16 @@ class MainScreen(Screen):
 
     def _on_stream_done(
         self, provider: str, full_text: str, input_tokens: int, output_tokens: int,
+        token_breakdown: "tuple[tuple[str, int, int], ...]" = (),
     ) -> None:
-        """Called when streaming is complete."""
+        """Called when streaming is complete.
+
+        ``token_breakdown`` -- present on an orchestrated turn that ran across
+        more than one provider (e.g. a solve that escalated) -- credits each
+        provider its own tokens instead of lumping the whole turn under the
+        active provider. The flat totals are still used for the single-provider
+        message record.
+        """
         self._stop_activity_poll()
 
         # Remove thinking indicator
@@ -1348,7 +1362,11 @@ class MainScreen(Screen):
         # Record in state + history DB
         total = input_tokens + output_tokens
         self.app.state.add_message(provider, full_text, tokens=total)
-        self.app.state.update_tokens(provider, input_tokens, output_tokens)
+        if token_breakdown:
+            for label, in_tokens, out_tokens in token_breakdown:
+                self.app.state.update_tokens(label, in_tokens, out_tokens)
+        else:
+            self.app.state.update_tokens(provider, input_tokens, output_tokens)
         self.app.record_message(provider, full_text, token_count=total)
 
         # Update status bar

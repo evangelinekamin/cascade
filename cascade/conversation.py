@@ -14,7 +14,12 @@ import time
 from typing import TYPE_CHECKING
 
 from .context.budget import compact_threshold, current_tokens, window_for
-from .episodes import Episode, compact_to_episodes, episodes_to_context
+from .episodes import (
+    Episode,
+    _extract_outcome,
+    compact_to_episodes,
+    episodes_to_context,
+)
 
 # Raw messages kept in the provider payload; older turns must be carried
 # by compaction episodes, so exceeding this is itself a compaction trigger
@@ -25,6 +30,11 @@ RAW_MESSAGE_WINDOW = 40
 # carried verbatim (not just as episodes), so a cross-model hand-off -- codex's
 # found errors, a review, a plan -- is visible to the model asked to act on it.
 _STICKY_CROSS_TURNS = 2
+
+# A sticky cross turn rides verbatim EVERY turn, so an oversized hand-off (a
+# whole file dump, a giant review) is clipped before emission -- the head and
+# tail carry the referent while the middle is elided (see _clip).
+_STICKY_CROSS_MAX_CHARS = 4_000
 
 # Only these orchestration session-events are surfaced to the model as system
 # notices; every other system-role record (command output, errors) stays UI-only.
@@ -142,7 +152,32 @@ def state_messages_to_provider(
         if not msg.metadata.get("compacted")
     ]
 
+    # Fix the message window and which cross-provider turns ride verbatim
+    # (sticky) up front: a sticky turn's own live episode must be excluded from
+    # injection below, or the same hand-off would appear twice -- once verbatim
+    # and once as episode context.
+    window = visible_messages[-max_messages:]
+    cross_positions = [
+        i for i, m in enumerate(window)
+        if m.role not in ("you", "system", target_provider)
+    ]
+    # 'off' opts out of cross-model context entirely, so no sticky carry there.
+    sticky_cross = (
+        set(cross_positions[-_STICKY_CROSS_TURNS:]) if policy == "summary" else set()
+    )
+    # Identity of a sticky turn's mirroring live episode: same provider, same
+    # extracted outcome (episodes derive their outcome from this same content).
+    sticky_identities = {
+        (window[i].role, _extract_outcome(window[i].content)) for i in sticky_cross
+    }
+
     injectable = _injectable_episodes(episodes or [], target_provider, policy)
+    if sticky_identities:
+        injectable = [
+            ep for ep in injectable
+            if ep.source != "live"
+            or (ep.provider, ep.outcome) not in sticky_identities
+        ]
     context_parts: list[str] = []
     # The carried summary mixes providers by construction; policy "off"
     # opted out of cross-model context entirely, so it never injects there
@@ -181,15 +216,6 @@ def state_messages_to_provider(
     # still fall back to episodes. One loop covers all three policies, plus the
     # optional timeline markers keyed to the last EMITTED message's timestamp.
     include_cross = policy == "full"
-    window = visible_messages[-max_messages:]
-    cross_positions = [
-        i for i, m in enumerate(window)
-        if m.role not in ("you", "system", target_provider)
-    ]
-    # 'off' opts out of cross-model context entirely, so no sticky carry there.
-    sticky_cross = (
-        set(cross_positions[-_STICKY_CROSS_TURNS:]) if policy == "summary" else set()
-    )
     prev_ts = 0.0
     for i, msg in enumerate(window):
         marker = (
@@ -215,9 +241,15 @@ def state_messages_to_provider(
             else:
                 emitted = False
         elif include_cross or i in sticky_cross:
+            # A sticky turn rides verbatim every turn, so clip an oversized
+            # hand-off; 'full' carries the turn as-is (the user opted in).
+            content = (
+                _clip(msg.content, _STICKY_CROSS_MAX_CHARS)
+                if i in sticky_cross else msg.content
+            )
             result.append({
                 "role": "user",
-                "content": marker + f"[Response from {msg.role}]\n{msg.content}",
+                "content": marker + f"[Response from {msg.role}]\n{content}",
             })
             result.append({"role": "assistant", "content": "Noted."})
         else:
@@ -228,11 +260,21 @@ def state_messages_to_provider(
         if emitted and msg.timestamp > 0:
             prev_ts = msg.timestamp
 
-    # Enforce character budget by trimming oldest messages
+    # Enforce character budget by trimming oldest messages. System-notice and
+    # cross-provider turns are emitted as (user, "Noted.") PAIRS, so popping the
+    # user half alone would strand its ack -- pop the ack with it so the payload
+    # never opens on a dangling assistant "Noted.".
     total_chars = sum(len(m["content"]) for m in result)
     while total_chars > max_chars and len(result) > 2:
         removed = result.pop(0)
         total_chars -= len(removed["content"])
+        if (
+            result
+            and result[0]["role"] == "assistant"
+            and result[0]["content"] == "Noted."
+        ):
+            stray = result.pop(0)
+            total_chars -= len(stray["content"])
 
     return result
 
@@ -255,10 +297,44 @@ def _clip(text: str, cap: int) -> str:
     return text[:head].rstrip() + "\n[...]\n" + text[-(cap - head):].lstrip()
 
 
+def _recover_compacted_referent(
+    episodes: list["Episode"],
+    compaction_summary: str,
+    target_provider: str,
+    policy: str,
+    cap: int,
+) -> str:
+    """A bounded, clearly-labeled excerpt of a referent lost to compaction.
+
+    When no report survives among the visible messages (they were compacted
+    away), the referent of "fix what X found" would otherwise vanish. Recover
+    it from the most recent relevant episode's outcome, or failing that a
+    bounded slice of the carried compaction summary. "off" never surfaces
+    another model's content -- so only same-provider/orchestration episodes,
+    and never the provider-mixed summary.
+    """
+    for ep in reversed(episodes):
+        if (
+            policy == "off"
+            and ep.provider != target_provider
+            and ep.source != "orchestration"
+        ):
+            continue
+        outcome = ep.outcome.strip()
+        if outcome:
+            return f"[Compacted earlier context] {ep.provider}: {_clip(outcome, cap)}"
+    if compaction_summary.strip() and policy != "off":
+        return "[Compacted earlier context]\n" + _clip(compaction_summary, cap)
+    return ""
+
+
 def build_lane_context(
     history: list["ChatMessage"],
     target_provider: str = "",
     *,
+    policy: str = "summary",
+    episodes: list["Episode"] | None = None,
+    compaction_summary: str = "",
     max_chars: int = _LANE_CONTEXT_MAX_CHARS,
     max_user_turns: int = _LANE_CONTEXT_USER_TURNS,
 ) -> str:
@@ -272,21 +348,28 @@ def build_lane_context(
     reference material, not fresh instructions. Returns "" when there is nothing
     worth carrying (e.g. a fresh first prompt).
 
+    *policy* mirrors cross_model_memory: under "off" the digest excludes
+    other-model reports entirely, carrying only user turns and same-provider
+    reports. *episodes* and *compaction_summary* let the digest recover a
+    referent that compaction dropped from the visible window -- when no report
+    survives, a bounded, labeled excerpt from an episode (or the summary) is
+    prepended so "fix what X found" still resolves.
+
     *history* is the conversation BEFORE the current task prompt (the caller
     slices off the just-submitted turn); *target_provider* names the lane's
     provider, used to tell same- from cross-provider reports apart.
     """
     msgs = [m for m in history if not m.metadata.get("compacted")]
-    if not msgs:
-        return ""
 
     keep: set[int] = set()
     # Most recent cross-provider report -- the usual referent of "what X found".
-    for i in range(len(msgs) - 1, -1, -1):
-        role = msgs[i].role
-        if role not in ("you", "system") and role != target_provider:
-            keep.add(i)
-            break
+    # "off" opts out of cross-model context, so it never carries other models.
+    if policy != "off":
+        for i in range(len(msgs) - 1, -1, -1):
+            role = msgs[i].role
+            if role not in ("you", "system") and role != target_provider:
+                keep.add(i)
+                break
     # Most recent same-provider report -- the referent of "what you suggested".
     if target_provider:
         for i in range(len(msgs) - 1, -1, -1):
@@ -294,8 +377,9 @@ def build_lane_context(
                 keep.add(i)
                 break
     # No assistant turn matched (e.g. provider names differ from history): fall
-    # back to the single most recent report of any kind.
-    if not keep:
+    # back to the single most recent report of any kind -- but not under "off",
+    # which must never surface another model's report.
+    if not keep and policy != "off":
         for i in range(len(msgs) - 1, -1, -1):
             if msgs[i].role not in ("you", "system"):
                 keep.add(i)
@@ -303,8 +387,6 @@ def build_lane_context(
     # Recent user turns frame the ongoing task.
     for i in [j for j, m in enumerate(msgs) if m.role == "you"][-max_user_turns:]:
         keep.add(i)
-    if not keep:
-        return ""
 
     # Reports get the bulk of the budget (they are the referent); user turns are
     # short imperatives. Split the report budget so multiple reports both fit.
@@ -317,6 +399,19 @@ def build_lane_context(
         m = msgs[i]
         cap = 400 if m.role == "you" else report_budget
         lines.append(f"{m.role}: {_clip(m.content, cap)}")
+
+    # No report survived among the visible turns (compacted away): recover the
+    # referent from an episode outcome or the summary, prepended as the oldest
+    # reference so the lane can still resolve what the task points at.
+    if not report_idx:
+        recovered = _recover_compacted_referent(
+            episodes or [], compaction_summary, target_provider, policy, report_budget,
+        )
+        if recovered:
+            lines.insert(0, recovered)
+
+    if not lines:
+        return ""
 
     body = "\n\n".join(lines)
     if len(body) > max_chars:  # safety net; per-item budgets already fit

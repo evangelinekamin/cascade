@@ -91,7 +91,12 @@ _SYNTHETIC_CONTEXT_PREFIXES = (
     "[Context from previous model interactions]",
     "[Conversation summary]",
     "[Response from ",
+    "[System notice]",
 )
+
+# Leading timeline marker like "[12:05]" (optionally followed by newline)
+# that may precede a synthetic-context tag in the transcript.
+_TIMELINE_MARKER_RE = re.compile(r"^\[\d{1,2}:\d{2}\]\s*")
 
 _FILENAME_INDEX_TTL_SECONDS = 30.0
 
@@ -402,6 +407,9 @@ class OpenAIProvider(BaseProvider):
     def _has_synthetic_context(messages: list[Message]) -> bool:
         for message in messages[:-1]:
             content = str(message.get("content", "")).lstrip()
+            # Strip a leading timeline marker (e.g. "[12:05]\n") so a synthetic
+            # tag surfaced with a timestamp is still recognized.
+            content = _TIMELINE_MARKER_RE.sub("", content)
             if any(content.startswith(prefix) for prefix in _SYNTHETIC_CONTEXT_PREFIXES):
                 return True
         return False

@@ -29,8 +29,8 @@ class TestEpisodeGeneration:
 
     def test_episode_with_tools(self):
         tool_log = [
-            {"tool_name": "read_file", "result": "ok"},
-            {"tool_name": "write_file", "result": "ok"},
+            {"tool": "read_file", "result": "ok"},
+            {"tool": "write_file", "result": "ok"},
         ]
         ep = generate_episode(
             user_content="Update the config",

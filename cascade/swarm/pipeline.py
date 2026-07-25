@@ -165,8 +165,15 @@ def plan_steps(
     on_tokens: TokensCallback = None,
     on_cost: Optional[Callable[[float], None]] = None,
     cancel_token: Optional[CancellationToken] = None,
+    context: str = "",
 ) -> List[PipelineTask]:
-    """Ask the director (on its frontier model) to decompose the objective."""
+    """Ask the director (on its frontier model) to decompose the objective.
+
+    ``context`` is the same bounded conversation digest the workers receive (see
+    :func:`cascade.conversation.build_lane_context`); prepended here so the
+    director can resolve a referential objective ("fix the errors codex found")
+    before splitting it into steps, not just each worker after the fact.
+    """
     if app.providers.get(provider_name) is None:
         return [PipelineTask(id="step_1", description=objective, prompt=objective)]
     director, director_name, director_model = _director_for(app, provider_name)
@@ -187,9 +194,12 @@ def plan_steps(
             if callable(cancellation_scope) and cancel_token is not None
             else nullcontext()
         )
+        planner_prompt = f"Decompose this objective into ordered coding steps:\n\n{objective}"
+        if context:
+            planner_prompt = f"{context}\n\n{planner_prompt}"
         with scope:
             response = director.ask_single(
-                f"Decompose this objective into ordered coding steps:\n\n{objective}",
+                planner_prompt,
                 system=_PLANNER_SYSTEM,
             )
         if cancel_token is not None:
@@ -316,8 +326,11 @@ def run_pipeline(
     }
     if token is not None:
         plan_kwargs["cancel_token"] = token
-    if "on_cost" in inspect.signature(plan_steps).parameters:
+    plan_params = inspect.signature(plan_steps).parameters
+    if "on_cost" in plan_params:
         plan_kwargs["on_cost"] = _plan_cost
+    if "context" in plan_params:
+        plan_kwargs["context"] = context
     tasks = plan_steps(app, objective, provider_name, **plan_kwargs)
     if run_context is not None:
         for index, task in enumerate(tasks):

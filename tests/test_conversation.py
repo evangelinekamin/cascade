@@ -51,12 +51,20 @@ def test_live_same_provider_episodes_are_not_injected():
 
 
 def test_live_other_provider_episodes_are_injected():
-    """Cross-provider handoff: the raw window drops other providers' turns."""
+    """Cross-provider handoff: an older cross turn (beyond the sticky window)
+    drops out of the raw window and is carried by its live episode instead.
+
+    The most-recent cross turns ride verbatim (sticky), so only cross turns
+    older than the sticky window rely on episode injection -- injecting a
+    sticky turn's own episode would double it (see finding K)."""
     from cascade.episodes import generate_episode
 
     messages = _msgs(
         ("you", "Plan the refactor"),
-        ("claude", "Plan: split the module."),
+        ("claude", "Plan: split the module."),   # older cross -> episode-only
+        ("you", "review it"),
+        ("gemini", "review pass one"),            # sticky cross (verbatim)
+        ("openrouter", "review pass two"),        # sticky cross (verbatim)
         ("you", "Implement it"),
     )
     episodes = [generate_episode("Plan the refactor", "Plan: split the module.", "claude")]

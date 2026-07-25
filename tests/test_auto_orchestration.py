@@ -86,6 +86,41 @@ def _app():
     ), original
 
 
+class _FakeWorktreeManager:
+    """A WorktreeManager stand-in that hands back a fixed path, doing no git."""
+
+    def __init__(self, path):
+        self._path = path
+        self.cleaned = False
+        self.prepared = []
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def prepare(self, provider):
+        self.prepared.append(provider)
+        return SimpleNamespace(provider=provider, path=self._path)
+
+    def cleanup(self, keep_provider=""):
+        self.cleaned = True
+
+
+def _fake_worktree_manager(path):
+    """Return (manager, roots) -- the fake manager and a dict the spy fills."""
+    return _FakeWorktreeManager(path), {}
+
+
+def _spy_workspace_tools(roots):
+    """A WorkspaceTools factory that records the root it was constructed with."""
+    real = auto.WorkspaceTools
+
+    def _factory(root, **kwargs):
+        roots["ws"] = root
+        return real(root, **kwargs)
+
+    return _factory
+
+
 def test_auto_routing_is_limited_to_configured_modes(monkeypatch):
     monkeypatch.setattr(auto, "_is_git_worktree", lambda: True)
     app, _original = _app()
@@ -225,9 +260,16 @@ def test_recon_lane_exposes_only_read_only_tools():
     assert "Found it" in result.text
 
 
-def test_recon_in_test_mode_can_run_checks_but_not_write():
+def test_recon_in_test_mode_can_run_checks_but_not_write(monkeypatch, tmp_path):
     app, _original = _app()
     decision = RouteDecision(WorkflowKind.RECON, "verify it works", 0.9)
+
+    # Test-mode recon must operate on a throwaway worktree, never the real cwd.
+    fake_worktree = tmp_path / "recon_wt"
+    fake_worktree.mkdir()
+    manager, roots = _fake_worktree_manager(str(fake_worktree))
+    monkeypatch.setattr(auto, "WorktreeManager", manager)
+    monkeypatch.setattr(auto, "WorkspaceTools", _spy_workspace_tools(roots))
 
     result = auto.execute_auto(
         app, "does this project work?", "openai", decision, mode="test",
@@ -239,6 +281,9 @@ def test_recon_in_test_mode_can_run_checks_but_not_write():
     assert "run_command" in provider.tools
     # ...but must not modify source (no write/edit tools).
     assert "write_file" not in provider.tools
+    # ...and those checks run in the isolated worktree, not the user's checkout.
+    assert roots["ws"] == str(fake_worktree)
+    assert manager.cleaned is True
     _messages, kwargs = provider.tool_call
     system = kwargs["system"].lower()
     assert "may run" in system
@@ -434,6 +479,7 @@ def test_normal_design_mode_prompt_dispatches_selected_workflow(monkeypatch):
     app.cli_app = cli_app
     app.state.messages = []
     app.state.episodes = []
+    app.state.compaction_summary = ""  # a real string, as in production
     app.call_from_thread.side_effect = lambda fn, *args: fn(*args)
 
     screen = MainScreen(

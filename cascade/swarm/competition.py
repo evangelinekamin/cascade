@@ -273,7 +273,26 @@ class CompetitionOrchestrator:
                     base = built
             except Exception:
                 base = ""
-        parts = [part.strip() for part in (base, extra) if part and part.strip()]
+        # Design language rides the competition lanes the same way it rides the
+        # chat pipeline (MainScreen._build_system_prompt): a config that forces
+        # design.md ON must reach the competitors too, not just chat. The base
+        # pipeline is mode-agnostic and omits it, so assemble it here explicitly.
+        design = ""
+        try:
+            from ..prompts.default import design_language_section
+
+            prompt_cfg = self._app.config.get_prompt_config()
+            mode = getattr(getattr(self._app, "state", None), "mode", None)
+            design = design_language_section(
+                prompt_cfg.get("include_design_language"),
+                mode,
+                prompt_cfg.get("design_md_path") or None,
+            )
+        except Exception:
+            design = ""
+        parts = [
+            part.strip() for part in (base, design, extra) if part and part.strip()
+        ]
         if not parts:
             return None
         return "\n\n".join(parts)

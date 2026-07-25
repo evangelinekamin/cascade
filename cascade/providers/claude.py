@@ -12,6 +12,7 @@ from ._openai_tools import (
     _CHARS_PER_TOKEN,
     _CONTEXT_BUDGET_FRACTION,
     _KEEP_RECENT_MESSAGES,
+    _invalidates_read,
     _read_dedup_key,
 )
 from .registry import register_provider
@@ -139,6 +140,33 @@ def _compact_anthropic_tool_results(
         if changed:
             result[idx] = {**message, "content": new_blocks}
     return result
+
+
+def _elided_read_ids(before: list[dict], after: list[dict]) -> set[str]:
+    """tool_use ids whose tool_result content was elided by compaction.
+
+    Compares the pre/post message lists block-by-block: a tool_result whose
+    inner content string changed was stubbed to fit budget, so any read-dedup
+    entry pointing at it must be dropped -- otherwise a repeat read is told
+    "[already read above]" while the bytes it named are gone.
+    """
+    ids: set[str] = set()
+    for old, new in zip(before, after):
+        old_blocks = old.get("content")
+        new_blocks = new.get("content")
+        if not isinstance(old_blocks, list) or not isinstance(new_blocks, list):
+            continue
+        for ob, nb in zip(old_blocks, new_blocks):
+            if (
+                isinstance(ob, dict)
+                and isinstance(nb, dict)
+                and ob.get("type") == "tool_result"
+                and ob.get("content") != nb.get("content")
+            ):
+                tid = nb.get("tool_use_id")
+                if tid:
+                    ids.add(tid)
+    return ids
 
 
 @register_provider("claude")
@@ -377,14 +405,28 @@ class ClaudeProvider(BaseProvider):
             window_for("claude", self.config.model, self.config.context_window)
             * _CONTEXT_BUDGET_FRACTION
         )
-        seen_reads: set[tuple[str, str]] = set()
+        # dedup_key -> the tool_use id whose tool_result holds that read. When
+        # budget compaction later ELIDES that result, the key is dropped so a
+        # repeat read re-fetches the file instead of "[already read above]"
+        # pointing at content that is gone. Mirrors the shared OpenAI loop.
+        seen_reads: dict[tuple[str, str], str] = {}
 
         text_parts = []
         for round_num in range(max_rounds):
             self.raise_if_cancelled()
+            _before = api_messages
             api_messages = _compact_anthropic_tool_results(
                 api_messages, budget, _KEEP_RECENT_MESSAGES,
             )
+            # Drop dedup keys whose read result was just elided.
+            if seen_reads and _before is not api_messages:
+                elided_ids = _elided_read_ids(_before, api_messages)
+                if elided_ids:
+                    seen_reads = {
+                        key: tid
+                        for key, tid in seen_reads.items()
+                        if tid not in elided_ids
+                    }
             payload = {
                 "model": self.config.model,
                 "max_tokens": self.config.max_tokens or 2048,
@@ -459,7 +501,17 @@ class ClaudeProvider(BaseProvider):
                     except PermissionAbort as exc:
                         return ("".join(text_parts) + f"\n\n[stopped: {exc}]").strip(), tool_log
                     if dedup_key is not None:
-                        seen_reads.add(dedup_key)
+                        seen_reads[dedup_key] = tool_id
+                    else:
+                        # A successful edit makes any cached read of that path
+                        # stale: drop its dedup keys so the next read re-fetches.
+                        edited = _invalidates_read(tool_name, tool_input)
+                        if edited is not None and seen_reads:
+                            seen_reads = {
+                                key: tid
+                                for key, tid in seen_reads.items()
+                                if key[1] != edited
+                            }
                 self.raise_if_cancelled()
                 tool_log.append({
                     "tool": tool_name,
