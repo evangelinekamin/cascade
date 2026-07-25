@@ -287,6 +287,14 @@ class TestCompetitionOrchestrator:
             for entry in result.entries:
                 assert entry.retained is True
                 assert entry.worktree_path
+
+            # A machine-readable manifest is written into the run root for
+            # downstream (subagent) processing.
+            assert result.run_root and Path(result.run_root).is_dir()
+            assert result.manifest_path and Path(result.manifest_path).is_file()
+            manifest = json.loads(Path(result.manifest_path).read_text())
+            assert {c["label"] for c in manifest["competitors"]} == {"claude", "openai"}
+            assert all("worktree_path" in c and "model" in c for c in manifest["competitors"])
             for entry in result.entries:
                 subprocess.run(
                     ["git", "worktree", "remove", "--force", entry.worktree_path],
@@ -759,6 +767,44 @@ def test_models_flag_clears_pinned_order_for_per_model_routing():
     assert clone.config.provider_preferences["require_parameters"] is True
     # The base provider is untouched.
     assert base.config.provider_preferences["order"] == ["Baidu"]
+
+
+def test_models_flag_disables_fallback_so_a_model_fails_as_itself():
+    from types import SimpleNamespace
+    from cascade.providers.base import ProviderConfig
+    from cascade.providers.openrouter import OpenRouterProvider
+
+    base = OpenRouterProvider(ProviderConfig(api_key="k", model="base-model"))
+    cli_app = SimpleNamespace(providers={"openrouter": base})
+    handler = CommandHandler(MagicMock())
+    handler._post_system = lambda *a, **k: None
+
+    _, overrides = handler._build_model_overrides(
+        cli_app, ["z-ai/glm-5.2", "minimax/minimax-m3"], "Code competition"
+    )
+    clone = overrides["z-ai-glm-5.2"]
+    # A rate-limited competitor must FAIL as itself, never silently retry on the
+    # default fallback model and be scored under the requested name.
+    assert clone.config.fallback_model == "z-ai/glm-5.2"
+    assert clone.get_fallback_model() is None
+
+
+def test_models_flag_disambiguates_label_collisions_instead_of_dropping():
+    from types import SimpleNamespace
+    from cascade.providers.base import ProviderConfig
+    from cascade.providers.openrouter import OpenRouterProvider
+
+    base = OpenRouterProvider(ProviderConfig(api_key="k", model="base-model"))
+    cli_app = SimpleNamespace(providers={"openrouter": base})
+    handler = CommandHandler(MagicMock())
+    handler._post_system = lambda *a, **k: None
+
+    # Two distinct ids that normalize to the same filesystem-safe label.
+    labels, overrides = handler._build_model_overrides(
+        cli_app, ["a/b:c", "a/b-c"], "Code competition"
+    )
+    assert len(overrides) == 2  # both kept as competitors, neither silently merged
+    assert sorted(o.config.model for o in overrides.values()) == ["a/b-c", "a/b:c"]
 
 
 def test_models_flag_needs_openrouter_and_two_models():

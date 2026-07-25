@@ -699,10 +699,19 @@ class CommandHandler:
         base_prefs.pop("order", None)
         labels: list[str] = []
         overrides: dict = {}
+        seen_models: set[str] = set()
         for model in models:
+            if model in seen_models:
+                continue  # exact-duplicate id typed twice -- dedup silently
+            seen_models.add(model)
             safe = re.sub(r"[^A-Za-z0-9._-]+", "-", model).strip("-") or "model"
+            # Distinct ids can normalize to the same filesystem-safe label; keep
+            # every requested model as its own competitor rather than dropping one.
             if safe in overrides:
-                continue
+                base_safe, suffix = safe, 2
+                while safe in overrides:
+                    safe = f"{base_safe}-{suffix}"
+                    suffix += 1
             try:
                 clone = type(base)(
                     replace(
@@ -710,6 +719,11 @@ class CommandHandler:
                         model=model,
                         context_window=None,
                         provider_preferences=dict(base_prefs) or None,
+                        # A benchmark competitor must run as itself or FAIL -- never
+                        # silently retry on the default fallback model (which would
+                        # be scored under the requested model's name). Pinning the
+                        # fallback to the model itself disables the swap.
+                        fallback_model=model,
                     )
                 )
                 clone.hook_runner = getattr(base, "hook_runner", None)
@@ -2587,10 +2601,17 @@ class CommandHandler:
 
                 if result.judgment is None:
                     lines.append("")
+                    if result.manifest_path:
+                        lines.append(f"Per-model data (JSON): {result.manifest_path}")
                     lines.append(
-                        "Judging skipped. Inspect any run with `git -C <worktree> diff`, "
-                        "or hand the worktrees to subagents to score."
+                        "Inspect any run with `git -C <worktree> diff`, or hand the "
+                        "manifest / worktrees to subagents to score."
                     )
+                    if result.run_root:
+                        lines.append(
+                            f"When done, remove all worktrees: "
+                            f"rm -rf {result.run_root} && git worktree prune"
+                        )
                 if result.judgment and result.judgment.rationale:
                     lines.append("")
                     lines.append(f"Judge rationale: {result.judgment.rationale}")

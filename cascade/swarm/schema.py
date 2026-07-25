@@ -48,3 +48,7 @@ class CompetitionResult:
     winner_response: str = ""
     total_tokens: int = 0
     judge_provider: str = ""
+    # List mode (many competitors, no judge): where the retained worktrees live
+    # and the JSON manifest of per-competitor results, for downstream processing.
+    run_root: str = ""
+    manifest_path: str = ""

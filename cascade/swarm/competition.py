@@ -6,6 +6,7 @@ import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Callable, Optional, TYPE_CHECKING
 
 from .schema import CompetitionEntry, CompetitionJudgment, CompetitionResult
@@ -387,16 +388,63 @@ class CompetitionOrchestrator:
             )
         except Exception as exc:
             snapshot = self._safe_snapshot(manager, worktree_path)
+            # A model that consumed tokens over several rounds and then errored
+            # should still report that spend, not zero.
+            usage = getattr(provider, "last_usage", None) or Usage()
             return CompetitionEntry(
                 provider=provider_name,
                 response=response,
-                tokens=0,
+                tokens=usage.total,
                 duration_seconds=time.monotonic() - start,
                 success=False,
                 error=str(exc),
                 worktree_path=worktree_path,
+                model=getattr(getattr(provider, "config", None), "model", "") or "",
+                cost=float(usage.cost or 0.0),
                 **self._snapshot_fields(snapshot),
             )
+
+    @staticmethod
+    def _write_manifest(
+        manager: WorktreeManager,
+        objective: str,
+        entries: list[CompetitionEntry],
+    ) -> str:
+        """Write a per-competitor JSON manifest into the run root.
+
+        List mode exists to be processed downstream (by hand or by subagents); a
+        structured manifest beside the retained worktrees is that processable
+        form -- requested label, actual model, success/error, tokens, cost, diff
+        metadata, worktree path, and the agent's own summary. Best-effort: a
+        write failure just yields no path.
+        """
+        payload = {
+            "objective": objective,
+            "run_root": manager.temp_root,
+            "competitors": [
+                {
+                    "label": e.provider,
+                    "model": e.model,
+                    "success": e.success,
+                    "error": e.error,
+                    "tokens": e.tokens,
+                    "cost": e.cost,
+                    "duration_seconds": round(e.duration_seconds, 2),
+                    "changed_files": list(e.changed_files),
+                    "diff_stat": e.diff_stat,
+                    "worktree_path": e.worktree_path,
+                    "response": e.response,
+                }
+                for e in entries
+            ],
+        }
+        path = str(Path(manager.temp_root, "competition.json"))
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+        except OSError:
+            return ""
+        return path
 
     @staticmethod
     def _apply_retention(entries: list[CompetitionEntry], winner_provider: str) -> None:
@@ -514,27 +562,47 @@ class CompetitionOrchestrator:
                 for provider_name, worktree_path in prepared_paths.items()
             }
             for future in as_completed(futures):
-                entry = future.result()
+                # A lane's own errors are already caught inside the worker and
+                # returned as a FAIL entry; this guard is the backstop for
+                # anything that escapes it (e.g. a progress-callback fault) so one
+                # lane can never abort a large batch of competitors.
+                try:
+                    entry = future.result()
+                except Exception as exc:
+                    entry = CompetitionEntry(
+                        provider=futures[future],
+                        response="",
+                        success=False,
+                        error=f"lane crashed: {exc}",
+                    )
                 entries.append(entry)
                 if on_progress:
-                    status = "done" if entry.success else f"failed: {entry.error}"
-                    on_progress(
-                        "result",
-                        f"[{entry.provider}] {status} ({entry.duration_seconds:.1f}s)",
-                    )
+                    try:
+                        status = "done" if entry.success else f"failed: {entry.error}"
+                        on_progress(
+                            "result",
+                            f"[{entry.provider}] {status} ({entry.duration_seconds:.1f}s)",
+                        )
+                    except Exception:
+                        pass
 
         entries.sort(key=lambda entry: provider_names.index(entry.provider))
 
         if not judge:
             # Keep every worktree and hand the raw per-competitor data back for
-            # external (human or subagent) review -- no judge, no winner.
+            # external (human or subagent) review -- no judge, no winner. A
+            # machine-readable manifest in the run root makes that processing
+            # step (the point of list mode) trivial.
             for entry in entries:
                 entry.retained = bool(entry.worktree_path)
+            manifest_path = self._write_manifest(manager, objective, entries)
             return CompetitionResult(
                 objective=objective,
                 entries=entries,
                 judgment=None,
                 total_tokens=sum(entry.tokens for entry in entries),
+                manifest_path=manifest_path,
+                run_root=manager.temp_root,
             )
 
         judgment = self._judge(
