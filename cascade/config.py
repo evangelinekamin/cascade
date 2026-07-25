@@ -85,9 +85,13 @@ class ConfigManager:
                     # Pin good-quant fast upstream hosts. Throughput-sorted
                     # routing silently truncates completions, so prefer known
                     # solid-quant providers and still allow fallbacks.
+                    # require_parameters keeps OpenRouter off hosts that don't
+                    # honor tool_choice/tools -- a common silent cause of a model
+                    # that "can't" tool-call on some endpoints but works on others.
                     "provider_preferences": {
                         "order": ["Baidu", "Fireworks", "Alibaba"],
                         "allow_fallbacks": True,
+                        "require_parameters": True,
                     },
                 },
                 "openai": {

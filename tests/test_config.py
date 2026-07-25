@@ -288,6 +288,7 @@ def test_default_template_openrouter_pins_good_quant_hosts():
         assert prefs == {
             "order": ["Baidu", "Fireworks", "Alibaba"],
             "allow_fallbacks": True,
+            "require_parameters": True,
         }
 
 
@@ -305,6 +306,7 @@ def test_get_provider_config_reads_provider_preferences():
         assert config.provider_preferences == {
             "order": ["Baidu", "Fireworks", "Alibaba"],
             "allow_fallbacks": True,
+            "require_parameters": True,
         }
 
 
