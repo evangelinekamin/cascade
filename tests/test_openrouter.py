@@ -212,6 +212,34 @@ def test_openrouter_stream_sends_session_id_for_sticky_cache():
     assert len(payload["session_id"]) <= 256
 
 
+def test_http_error_text_surfaces_openrouter_body_reason():
+    """A 404's real reason lives in the JSON body, not httpx's status line."""
+    from cascade.providers._openai_tools import _http_error_text
+
+    req = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    resp = httpx.Response(
+        404,
+        json={"error": {
+            "message": "No endpoints found matching your data policy",
+            "metadata": {"error_type": "no_endpoints"},
+        }},
+        request=req,
+    )
+    msg = _http_error_text(httpx.HTTPStatusError("404", request=req, response=resp))
+    assert "404" in msg
+    assert "No endpoints found matching your data policy" in msg
+    assert "no_endpoints" in msg
+
+
+def test_http_error_text_falls_back_to_status_line_without_body():
+    from cascade.providers._openai_tools import _http_error_text
+
+    req = httpx.Request("POST", "https://example.test/x")
+    resp = httpx.Response(500, text="", request=req)
+    msg = _http_error_text(httpx.HTTPStatusError("500 Server Error", request=req, response=resp))
+    assert "500" in msg
+
+
 def test_session_key_is_stable_across_turns_and_unique_per_conversation():
     key = OpenRouterProvider._session_key
     system = "You are Cascade. cwd=/x mode=plan"

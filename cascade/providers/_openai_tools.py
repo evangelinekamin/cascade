@@ -286,6 +286,31 @@ def _api_error_text(error: object) -> str:
     return message
 
 
+def _http_error_text(exc: "httpx.HTTPStatusError") -> str:
+    """Message for a failed HTTP request that INCLUDES the provider's response body.
+
+    httpx's own string is just the status line and URL; OpenRouter puts the real
+    reason in the JSON body -- e.g. "No endpoints found matching your data policy"
+    or a model/provider availability note -- which is exactly what makes a 404
+    diagnosable. Falls back to the bare status line when there is no usable body.
+    """
+    base = str(exc)
+    response = getattr(exc, "response", None)
+    if response is None:
+        return base
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict) and body.get("error"):
+        return f"{base} -- {_api_error_text(body['error'])}"
+    try:
+        text = (response.text or "").strip()
+    except Exception:
+        text = ""
+    return f"{base} -- {text[:300]}" if text else base
+
+
 def openai_ask_with_tools(
     client: httpx.Client,
     url: str,
@@ -448,7 +473,7 @@ def openai_ask_with_tools(
             data = response.json()
             _capture_usage(data)
         except httpx.HTTPStatusError as exc:
-            raise RuntimeError(str(exc)) from exc
+            raise RuntimeError(_http_error_text(exc)) from exc
         except httpx.RequestError as exc:
             raise RuntimeError(str(exc)) from exc
         except Exception as exc:

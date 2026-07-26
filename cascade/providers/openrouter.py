@@ -6,7 +6,7 @@ from typing import Optional, Iterator, TYPE_CHECKING
 import httpx
 from .base import BaseProvider, ProviderConfig, Message, ToolEventCallback
 from .registry import register_provider
-from ._openai_tools import openai_ask_with_tools
+from ._openai_tools import openai_ask_with_tools, _http_error_text
 from .usage import Usage
 from ..context.budget import window_for
 
@@ -147,6 +147,13 @@ class OpenRouterProvider(BaseProvider):
         ) as response, self.cancellation_callback(
             getattr(response, "close", lambda: None)
         ):
+            # On an error status the body carries OpenRouter's real reason; load
+            # it before raising so it is not lost with the unread stream.
+            if getattr(response, "status_code", 200) >= 400:
+                try:
+                    response.read()
+                except Exception:
+                    pass
             response.raise_for_status()
             self._last_generation_id = getattr(response, "headers", {}).get(
                 "X-Generation-Id"
@@ -212,10 +219,10 @@ class OpenRouterProvider(BaseProvider):
                     yield from self._stream_with_model(fallback_model, messages, system)
                     return
                 except httpx.HTTPStatusError as fallback_exc:
-                    raise RuntimeError(str(fallback_exc)) from fallback_exc
+                    raise RuntimeError(_http_error_text(fallback_exc)) from fallback_exc
                 except httpx.RequestError as fallback_exc:
                     raise RuntimeError(str(fallback_exc)) from fallback_exc
-            raise RuntimeError(str(exc)) from exc
+            raise RuntimeError(_http_error_text(exc)) from exc
         except httpx.RequestError as exc:
             raise RuntimeError(str(exc)) from exc
 
@@ -261,7 +268,9 @@ class OpenRouterProvider(BaseProvider):
         try:
             response = self.client.post(url, json=payload, headers=self._headers())
             response.raise_for_status()
-        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(_http_error_text(exc)) from exc
+        except httpx.RequestError as exc:
             raise RuntimeError(str(exc)) from exc
 
         self._last_generation_id = getattr(response, "headers", {}).get(
