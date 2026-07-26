@@ -26,6 +26,10 @@ class CompetitionEntry:
     retained: bool = False
     model: str = ""
     cost: float = 0.0
+    # Cache-hit accounting from the run's Usage, carried through to the manifest
+    # so /score can compute cache_hit_pct without re-running anything.
+    cache_read: int = 0
+    prompt_total: int = 0
 
 
 @dataclass(frozen=True)

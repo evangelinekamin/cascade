@@ -9,8 +9,12 @@ import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .theme import MODES, PALETTE, PROVIDERS
+
+if TYPE_CHECKING:
+    from .swarm.scoring import Leaderboard
 
 
 def _solve_token_lines(result) -> list[str]:
@@ -122,6 +126,11 @@ COMMANDS: tuple[CommandDef, ...] = (
         "compete-chat",
         "/compete-chat [--providers a,b] [--judge x] <prompt>",
         "Run a chat prompt across providers and pick a winner (no code changes)",
+    ),
+    CommandDef(
+        "score",
+        '/score <manifest-or-run-root>... [--verify "<cmd>"]',
+        "Score a --list competition's worktrees into a ranked leaderboard",
     ),
     CommandDef("episodes", "/episodes", "Show episode history"),
     CommandDef("tree", "/tree", "Show session branch tree"),
@@ -263,6 +272,7 @@ class CommandHandler:
             "compete": self._cmd_compete_code,       # it obviously competes on code
             "compete-code": self._cmd_compete_code,  # alias / muscle memory
             "compete-chat": self._cmd_compete,       # the no-code chat competition
+            "score": self._cmd_score,
             "episodes": self._cmd_episodes,
             "tree": self._cmd_tree,
             "branch": self._cmd_branch,
@@ -2659,6 +2669,153 @@ class CommandHandler:
                 _call_ui(self._clear_progress_indicator, progress)
                 _call_ui(self._post_system, f"Code competition error: {e}")
                 _call_ui(self._record_history_message, "system", f"Code competition error: {e}")
+
+        screen = self.app.screen
+        self._launch_lane(_worker, screen, exclusive=False)
+
+    @staticmethod
+    def _parse_score_args(args: list[str]) -> "tuple[list[str], str | None] | None":
+        """Parse positional manifest/run-root paths plus an optional --verify override.
+
+        Paths may be empty -- /score then falls back to auto-discovery -- so
+        only a dangling ``--verify`` with no value is malformed (returns None).
+        """
+        paths: list[str] = []
+        verify_override: str | None = None
+        index = 0
+        while index < len(args):
+            token = args[index]
+            key, _, inline = token.partition("=")
+            if key == "--verify":
+                if inline:
+                    verify_override = inline
+                    index += 1
+                else:
+                    index += 1
+                    if index >= len(args):
+                        return None
+                    verify_override = args[index]
+                    index += 1
+                continue
+            paths.append(token)
+            index += 1
+        return paths, verify_override
+
+    @staticmethod
+    def _render_leaderboard(leaderboard: "Leaderboard") -> str:
+        """A markdown leaderboard table: Rank, Model, Gate, Quality, Cache%, ..."""
+        lines = [
+            f"Leaderboard ({len(leaderboard.rows)} competitor(s)):",
+            "",
+            "| Rank | Model | Gate | Quality | Cache% | $Cost | Tok/s | Files | Notes |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for index, row in enumerate(leaderboard.rows, start=1):
+            quality = f"{row.quality_total}/15" if row.quality_total is not None else "-"
+            rank = f"{index} (DQ)" if row.disqualified else str(index)
+            notes = "; ".join(n for n in (row.quality_summary, *row.notes) if n)
+            # A pipe or newline in the LLM summary would break the markdown row.
+            notes = notes.replace("|", "/").replace("\n", " ")
+            lines.append(
+                f"| {rank} | {row.model or row.label} | {row.gate} | {quality} | "
+                f"{row.cache_hit_pct:.1f}% | ${row.cost:.4f} | {row.tok_per_s:.0f} | "
+                f"{len(row.changed_files)} | {notes} |"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _write_scores_json(leaderboard: "Leaderboard") -> str:
+        """Write the leaderboard as JSON next to the first manifest; "" on failure."""
+        if not leaderboard.manifest_paths:
+            return ""
+        from dataclasses import asdict
+
+        out_path = Path(leaderboard.manifest_paths[0]).with_name("scores.json")
+        payload = {
+            "manifest_paths": list(leaderboard.manifest_paths),
+            "rows": [asdict(row) for row in leaderboard.rows],
+        }
+        try:
+            out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError:
+            return ""
+        return str(out_path)
+
+    def _cmd_score(self, args: list[str]) -> None:
+        """Score a --list competition run's worktrees into a ranked leaderboard."""
+        parsed = self._parse_score_args(args)
+        if parsed is None:
+            self._post_system('Usage: /score <manifest-or-run-root>... [--verify "<cmd>"]')
+            return
+        paths, verify_override = parsed
+
+        cli_app = getattr(self.app, "cli_app", None)
+        if cli_app is None:
+            self._post_system("Score requires CLI app.")
+            return
+
+        if not paths:
+            from .swarm.scoring import discover_latest_manifest
+
+            discovered = discover_latest_manifest()
+            if not discovered:
+                self._post_system(
+                    "No manifest path given and none found under the worktree "
+                    "cache root. Run /compete --list first, or pass a "
+                    "manifest/run-root path."
+                )
+                return
+            paths = [discovered]
+
+        from .swarm import CompetitionOrchestrator
+
+        try:
+            judge_name = CompetitionOrchestrator(cli_app)._judge_provider
+        except Exception as exc:
+            self._post_system(f"Score requires a judge provider: {exc}")
+            return
+        judge_provider = cli_app.providers.get(judge_name)
+        if judge_provider is None:
+            self._post_system(f"Judge provider '{judge_name}' is not available.")
+            return
+
+        self._post_system(f"Scoring: {', '.join(paths)}\nJudge: {judge_name}")
+        self._record_command_line(f"/score {' '.join(args)}", title="[Score] competition")
+        progress = self._mount_progress_indicator(f"scoring {len(paths)} manifest(s)")
+
+        def _call_ui(fn, *call_args) -> None:
+            caller = getattr(self.app, "call_from_thread", None)
+            if callable(caller):
+                caller(fn, *call_args)
+            else:
+                fn(*call_args)
+
+        def _worker() -> None:
+            try:
+                from .swarm.scoring import CompetitionScorer
+
+                scorer = CompetitionScorer(
+                    paths, judge_provider, verify_command_override=verify_override,
+                )
+                leaderboard = scorer.score()
+
+                if not leaderboard.manifest_paths:
+                    final = f"No readable manifest found at: {', '.join(paths)}"
+                elif not leaderboard.rows:
+                    final = "Manifest(s) loaded but contained no competitors."
+                else:
+                    final = self._render_leaderboard(leaderboard)
+                    scores_path = self._write_scores_json(leaderboard)
+                    if scores_path:
+                        final += f"\n\nScores written to: {scores_path}"
+
+                _call_ui(self._clear_progress_indicator, progress)
+                _call_ui(self._post_system, final)
+                _call_ui(self._record_history_message, "system", final)
+            except Exception as e:
+                _call_ui(self._clear_progress_indicator, progress)
+                _call_ui(self._post_system, f"Score error: {e}")
+                _call_ui(self._record_history_message, "system", f"Score error: {e}")
 
         screen = self.app.screen
         self._launch_lane(_worker, screen, exclusive=False)

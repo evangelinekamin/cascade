@@ -373,6 +373,8 @@ class CompetitionOrchestrator:
                     worktree_path=worktree_path,
                     model=model,
                     cost=cost,
+                    cache_read=usage.cache_read,
+                    prompt_total=usage.prompt_total,
                     **self._snapshot_fields(snapshot),
                 )
             return CompetitionEntry(
@@ -384,6 +386,8 @@ class CompetitionOrchestrator:
                 worktree_path=worktree_path,
                 model=model,
                 cost=cost,
+                cache_read=usage.cache_read,
+                prompt_total=usage.prompt_total,
                 **self._snapshot_fields(snapshot),
             )
         except Exception as exc:
@@ -401,6 +405,8 @@ class CompetitionOrchestrator:
                 worktree_path=worktree_path,
                 model=getattr(getattr(provider, "config", None), "model", "") or "",
                 cost=float(usage.cost or 0.0),
+                cache_read=usage.cache_read,
+                prompt_total=usage.prompt_total,
                 **self._snapshot_fields(snapshot),
             )
 
@@ -434,6 +440,8 @@ class CompetitionOrchestrator:
                     "diff_stat": e.diff_stat,
                     "worktree_path": e.worktree_path,
                     "response": e.response,
+                    "cache_read": e.cache_read,
+                    "prompt_total": e.prompt_total,
                 }
                 for e in entries
             ],
