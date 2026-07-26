@@ -31,7 +31,7 @@ _DEFAULT_FALLBACK_MODELS = {
 
 # Speed-over-quality one-shot models reachable via /ultrafast and /fast.
 _DEFAULT_FAST_MODELS = {
-    "openrouter": "inception/mercury-2",
+    "openrouter": "stepfun/step-3.7-flash",
 }
 
 

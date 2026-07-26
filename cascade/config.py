@@ -78,9 +78,11 @@ class ConfigManager:
                     "api_key": "${OPENROUTER_API_KEY}",
                     "model": "qwen/qwen3.5-9b",
                     "fallback_model": "minimax/minimax-m2.5",
-                    # Speed-over-quality one-shot tier (/ultrafast, /fast): a very
-                    # fast, deliberately flaky diffusion LM.
-                    "fast_model": "inception/mercury-2",
+                    # Speed-over-quality one-shot tier (/ultrafast, /fast): fast,
+                    # cheap, and -- unlike the old mercury-2 default (9% cache-hit)
+                    # -- it caches well (~93%), so it stays cheap under Cascade's
+                    # cache-heavy traffic instead of cold-prefilling every turn.
+                    "fast_model": "stepfun/step-3.7-flash",
                     "temperature": 0.7,
                     # Pin good-quant fast upstream hosts. Throughput-sorted
                     # routing silently truncates completions, so prefer known
@@ -179,7 +181,7 @@ class ConfigManager:
                 "recon_provider": "openrouter",
                 "recon_model": "openai/gpt-oss-120b",
                 "fast_provider": "openrouter",
-                "fast_model": "inception/mercury-2",
+                "fast_model": "stepfun/step-3.7-flash",
                 "fast_provider_preferences": {
                     "allow_fallbacks": True,
                     "require_parameters": True,
@@ -235,7 +237,7 @@ class ConfigManager:
         entry.setdefault("model", default_models.get(provider_name, ""))
         if provider_name == "openrouter":
             entry.setdefault("fallback_model", "minimax/minimax-m2.5")
-            entry.setdefault("fast_model", "inception/mercury-2")
+            entry.setdefault("fast_model", "stepfun/step-3.7-flash")
         entry.setdefault("temperature", 0.7)
 
     def get_provider_config(self, provider_name: str) -> Optional[ProviderConfig]:
@@ -509,7 +511,7 @@ class ConfigManager:
             "recon_provider": "openrouter",
             "recon_model": "openai/gpt-oss-120b",
             "fast_provider": "openrouter",
-            "fast_model": "inception/mercury-2",
+            "fast_model": "stepfun/step-3.7-flash",
             "fast_provider_preferences": {
                 "allow_fallbacks": True,
                 "require_parameters": True,

@@ -549,7 +549,7 @@ def _make_ultrafast_app(tmp_path):
     return app, openrouter
 
 
-def test_ultrafast_command_switches_to_mercury(tmp_path):
+def test_ultrafast_command_switches_to_fast_model(tmp_path):
     app, openrouter = _make_ultrafast_app(tmp_path)
 
     handler = CommandHandler(app)
@@ -557,9 +557,9 @@ def test_ultrafast_command_switches_to_mercury(tmp_path):
 
     assert app.state.active_provider == "openrouter"
     assert app.state.fast_mode is True
-    assert openrouter.config.model == "inception/mercury-2"
+    assert openrouter.config.model == "stepfun/step-3.7-flash"
     app.notify.assert_called_once()
-    assert "inception/mercury-2" in app.notify.call_args.args[0]
+    assert "stepfun/step-3.7-flash" in app.notify.call_args.args[0]
 
 
 def test_ultrafast_command_dispatches_through_handle(tmp_path):
@@ -571,7 +571,7 @@ def test_ultrafast_command_dispatches_through_handle(tmp_path):
     assert handled is True
     assert app.state.active_provider == "openrouter"
     assert app.state.fast_mode is True
-    assert openrouter.config.model == "inception/mercury-2"
+    assert openrouter.config.model == "stepfun/step-3.7-flash"
 
 
 def test_ultrafast_command_reports_when_openrouter_missing():

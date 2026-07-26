@@ -88,7 +88,7 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("exit", "/exit", "Exit cascade"),
     CommandDef("quit", "/quit", "Exit cascade"),
     CommandDef("fast", "/fast", "Toggle fast model for current provider"),
-    CommandDef("ultrafast", "/ultrafast", "Switch to the ultrafast model (mercury-2 via openrouter)"),
+    CommandDef("ultrafast", "/ultrafast", "Switch to the ultrafast model (step-3.7-flash via openrouter)"),
     CommandDef("model", "/model <provider|reset>", "Switch active provider"),
     CommandDef("mode", "/mode <name>", "Switch mode (design, plan, build, test)"),
     CommandDef("mode-provider", "/mode-provider <mode> <provider>", "Assign a provider to a mode"),
@@ -877,8 +877,8 @@ class CommandHandler:
         """Switch to the ultrafast model for quick, speed-over-quality one-shots.
 
         Reuses the provider-switch plumbing: jumps to the ultrafast provider
-        (openrouter) with its fast_model (mercury-2) engaged. Deliberately fast
-        and flaky -- a speed-not-reliability mode.
+        (openrouter) with its fast_model (step-3.7-flash) engaged -- a
+        speed-over-quality one-shot mode that still caches well.
         """
         provider_name = _ULTRAFAST_PROVIDER
         cli_app = getattr(self.app, "cli_app", None)

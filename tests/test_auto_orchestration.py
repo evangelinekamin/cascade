@@ -23,7 +23,7 @@ class _Config:
             "recon_provider": "openrouter",
             "recon_model": "openai/gpt-oss-120b",
             "fast_provider": "openrouter",
-            "fast_model": "inception/mercury-2",
+            "fast_model": "stepfun/step-3.7-flash",
             "fast_provider_preferences": {
                 "allow_fallbacks": True,
                 "require_parameters": True,
@@ -47,7 +47,7 @@ class _Config:
 
     def get_model_for(self, provider, mode_name=None, fast=False):
         if provider == "openrouter" and fast:
-            return "inception/mercury-2"
+            return "stepfun/step-3.7-flash"
         return f"{provider}-frontier"
 
 
@@ -356,13 +356,13 @@ def test_focused_solve_forwards_conversation_context(monkeypatch):
     assert called.call_args.kwargs["context"] == "codex: CTX_REFERENT list of errors"
 
 
-def test_fast_solve_starts_on_mercury_then_escalates_to_active_frontier(monkeypatch):
+def test_fast_solve_starts_on_fast_model_then_escalates_to_active_frontier(monkeypatch):
     app, _original = _app()
     solve_result = SimpleNamespace(
         outcome=RunOutcome.SUCCEEDED,
         iterations=1,
         provider="openrouter",
-        models_used=("inception/mercury-2",),
+        models_used=("stepfun/step-3.7-flash",),
         error="",
         diff_stat="1 file changed",
         changed_files=("a.py",),
@@ -383,7 +383,7 @@ def test_fast_solve_starts_on_mercury_then_escalates_to_active_frontier(monkeypa
 
     kwargs = called.call_args.kwargs
     assert kwargs["provider_name"] == "openrouter"
-    assert kwargs["bulk_model_override"] == "inception/mercury-2"
+    assert kwargs["bulk_model_override"] == "stepfun/step-3.7-flash"
     assert kwargs["provider_preferences_override"] == {
         "allow_fallbacks": True,
         "require_parameters": True,

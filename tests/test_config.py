@@ -60,18 +60,18 @@ def test_get_model_for_respects_mode_override():
 
 
 def test_openrouter_default_exposes_ultrafast_fast_model():
-    """OpenRouter ships a fast_model so /ultrafast and /fast can reach mercury-2."""
+    """OpenRouter ships a fast_model so /ultrafast and /fast reach step-3.7-flash."""
     with tempfile.TemporaryDirectory() as tmpdir:
         config_path = Path(tmpdir) / "config.yaml"
         manager = ConfigManager(str(config_path))
 
         assert (
             manager.data["providers"]["openrouter"]["fast_model"]
-            == "inception/mercury-2"
+            == "stepfun/step-3.7-flash"
         )
         assert (
             manager.get_model_for("openrouter", "test", fast=True)
-            == "inception/mercury-2"
+            == "stepfun/step-3.7-flash"
         )
 
 
@@ -84,7 +84,7 @@ def test_apply_credential_openrouter_sets_ultrafast_fast_model():
         manager.apply_credential("openrouter", "sk-or-test-token")
 
         entry = manager.data["providers"]["openrouter"]
-        assert entry["fast_model"] == "inception/mercury-2"
+        assert entry["fast_model"] == "stepfun/step-3.7-flash"
 
 
 def test_get_available_modes_uses_configured_mode_providers():
@@ -325,14 +325,14 @@ def test_provider_config_defaults_provider_preferences_to_none():
 def test_get_bulk_model_defaults_to_frontier_model_not_fast_model():
     """/solve's bulk tier uses the provider model, never the /ultrafast fast_model.
 
-    A fresh openrouter config ships fast_model=inception/mercury-2 for /ultrafast;
-    that flaky speed model must not silently become /solve's builder.
+    A fresh openrouter config ships fast_model=stepfun/step-3.7-flash for /ultrafast;
+    that speed tier must not silently become /solve's builder.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         config_path = Path(tmpdir) / "config.yaml"
         manager = ConfigManager(str(config_path))
 
-        assert manager.data["providers"]["openrouter"]["fast_model"] == "inception/mercury-2"
+        assert manager.data["providers"]["openrouter"]["fast_model"] == "stepfun/step-3.7-flash"
         assert manager.get_bulk_model("openrouter") == "qwen/qwen3.5-9b"
 
 
@@ -400,7 +400,7 @@ def test_orchestration_defaults_use_cerebras_through_openrouter():
         assert cfg["recon_provider"] == "openrouter"
         assert cfg["recon_model"] == "openai/gpt-oss-120b"
         assert cfg["fast_provider"] == "openrouter"
-        assert cfg["fast_model"] == "inception/mercury-2"
+        assert cfg["fast_model"] == "stepfun/step-3.7-flash"
         assert cfg["fast_provider_preferences"] == {
             "allow_fallbacks": True,
             "require_parameters": True,
