@@ -8,8 +8,29 @@ from cascade.providers.base import ProviderConfig
 from cascade.providers.openrouter import OpenRouterProvider
 
 
-def _ep(name, ctx, quant, price=0.0, tput=None, tools=True, cache_read=None, out=0.0):
-    return Endpoint(name, ctx, quant, price, out, tools, tput, cache_read)
+def _ep(name, ctx, quant, price=0.0, tput=None, tools=True, cache_read=None, out=0.0, temp=True):
+    return Endpoint(name, ctx, quant, price, out, tools, tput, cache_read, temp)
+
+
+def test_analyze_flags_no_temperature_support_when_no_endpoint_accepts_it():
+    # A reasoning model: none of its endpoints accept `temperature`.
+    reasoning = [_ep("OpenAI", 1_000_000, "unknown", temp=False)]
+    assert _analyze(reasoning).supports_temperature is False
+    # A normal model with a temperature-capable endpoint.
+    normal = [_ep("DeepInfra", 128000, "bf16", temp=True)]
+    assert _analyze(normal).supports_temperature is True
+
+
+def test_parse_endpoints_reads_temperature_support():
+    eps = orm._parse_endpoints(
+        {"data": {"endpoints": [
+            {"provider_name": "OpenAI", "context_length": 1000000, "quantization": "unknown",
+             "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+             "supported_parameters": ["tools", "tool_choice", "reasoning"]},
+        ]}}
+    )
+    assert eps[0].supports_tools is True
+    assert eps[0].supports_temperature is False
 
 
 def test_analyze_ranks_unquantized_cheapest_first_and_keeps_quantized():
@@ -158,6 +179,15 @@ def test_apply_meta_respects_explicit_config():
         prov._apply_meta()
     assert prov.config.context_window == 999  # explicit window not overridden
     assert prov.config.provider_preferences["order"] == ["Baidu"]  # explicit order kept
+
+
+def test_apply_meta_disables_temperature_for_a_reasoning_model():
+    prov = OpenRouterProvider(ProviderConfig(api_key="k", model="openai/gpt-5.6-luna"))
+    fake = ModelMeta(1_000_000, ("OpenAI",), (), supports_temperature=False)
+    with patch("cascade.providers.openrouter_meta.model_meta", return_value=fake):
+        prov._apply_meta()
+    assert prov._send_temperature is False
+    assert prov._temperature_to_send() is None
 
 
 def test_apply_meta_runs_once():

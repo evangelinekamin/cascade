@@ -2609,8 +2609,13 @@ class CommandHandler:
                     if entry.model and entry.model != entry.provider:
                         label += f" ({entry.model})"
                     metrics = [f"{entry.duration_seconds:.1f}s", f"{entry.tokens:,} tok"]
-                    if entry.duration_seconds > 0 and entry.tokens:
-                        metrics.append(f"{entry.tokens / entry.duration_seconds:.0f} tok/s")
+                    # tok/s from OUTPUT tokens only (total - prompt); counting the
+                    # prompt, which dwarfs output for a coding agent, inflates it.
+                    output_tok = (
+                        entry.tokens - entry.prompt_total if entry.prompt_total > 0 else None
+                    )
+                    if entry.duration_seconds > 0 and output_tok:
+                        metrics.append(f"{output_tok / entry.duration_seconds:.0f} tok/s")
                     if entry.cost:
                         metrics.append(f"${entry.cost:.4f}")
                     lines.append(f"  {label} {status} ({', '.join(metrics)}) | {diff_summary}")

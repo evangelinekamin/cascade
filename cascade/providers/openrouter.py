@@ -33,6 +33,9 @@ class OpenRouterProvider(BaseProvider):
         self.client = httpx.Client(timeout=60.0)
         self._last_generation_id: Optional[str] = None
         self._meta_applied = False
+        # Cleared when the model's endpoints reject `temperature` (a reasoning
+        # model): sending it with require_parameters filters out every endpoint.
+        self._send_temperature = True
 
     def _apply_meta(self) -> None:
         """Once per model, fold live OpenRouter endpoint metadata into the config.
@@ -53,6 +56,7 @@ class OpenRouterProvider(BaseProvider):
             meta = None
         if meta is None:
             return
+        self._send_temperature = meta.supports_temperature
         if self.config.context_window is None and meta.effective_context:
             self.config.context_window = meta.effective_context
         prefs = dict(self.config.provider_preferences or {})
@@ -88,6 +92,11 @@ class OpenRouterProvider(BaseProvider):
         if not fallback or fallback == self.config.model:
             return None
         return fallback
+
+    def _temperature_to_send(self) -> Optional[float]:
+        """The request temperature, or None to omit it when the model's endpoints
+        reject it (a reasoning model -- sending it would filter out every one)."""
+        return self.config.temperature if self._send_temperature else None
 
     @staticmethod
     def _session_key(system: Optional[str], messages: list[Message]) -> Optional[str]:
@@ -132,8 +141,9 @@ class OpenRouterProvider(BaseProvider):
             "messages": self._build_api_messages(messages, system),
             "stream": True,
             "stream_options": {"include_usage": True},
-            "temperature": self.config.temperature,
         }
+        if self._send_temperature:
+            payload["temperature"] = self.config.temperature
         if self.config.max_tokens:
             payload["max_tokens"] = self.config.max_tokens
         if self.config.provider_preferences:
@@ -240,6 +250,7 @@ class OpenRouterProvider(BaseProvider):
         decisions where a single validated object is more useful than incremental
         text. Provider preferences (including ``require_parameters``) are preserved.
         """
+        self._apply_meta()
         url = f"{self.base_url}/chat/completions"
         payload = {
             "model": self.config.model,
@@ -247,7 +258,6 @@ class OpenRouterProvider(BaseProvider):
                 [{"role": "user", "content": prompt}], system
             ),
             "stream": False,
-            "temperature": self.config.temperature,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -257,6 +267,8 @@ class OpenRouterProvider(BaseProvider):
                 },
             },
         }
+        if self._send_temperature:
+            payload["temperature"] = self.config.temperature
         if self.config.max_tokens:
             payload["max_tokens"] = self.config.max_tokens
         if self.config.provider_preferences:
@@ -323,7 +335,7 @@ class OpenRouterProvider(BaseProvider):
                 url=f"{self.base_url}/chat/completions",
                 headers=self._headers(),
                 model=self.config.model,
-                temperature=self.config.temperature,
+                temperature=self._temperature_to_send(),
                 max_tokens=self.config.max_tokens,
                 messages=messages,
                 tools=tools,
@@ -355,7 +367,7 @@ class OpenRouterProvider(BaseProvider):
                     url=f"{self.base_url}/chat/completions",
                     headers=self._headers(),
                     model=fallback_model,
-                    temperature=self.config.temperature,
+                    temperature=self._temperature_to_send(),
                     max_tokens=self.config.max_tokens,
                     messages=messages,
                     tools=tools,

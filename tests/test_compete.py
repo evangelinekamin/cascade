@@ -559,6 +559,7 @@ class TestCompeteCommand:
                     provider="openai",
                     response="openai summary",
                     tokens=140,
+                    prompt_total=40,  # output = 100 -> 100 tok/s over 1.0s
                     duration_seconds=1.0,
                     changed_files=["app.txt", "tests.txt"],
                     diff_stat=" app.txt | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)",
@@ -603,7 +604,7 @@ class TestCompeteCommand:
         app.record_message.assert_any_call("user", "/compete-code --providers claude,openai --judge gemini fix bug", token_count=0)
         app.record_message.assert_any_call("system", posted[-1], token_count=0)
         assert "Winner worktree: /tmp/cascade-compete/openai" in posted[-1]
-        assert "[openai] OK (1.0s, 140 tok, 140 tok/s) | 1 file changed, 1 insertion(+), 1 deletion(-)" in posted[-1]
+        assert "[openai] OK (1.0s, 140 tok, 100 tok/s) | 1 file changed, 1 insertion(+), 1 deletion(-)" in posted[-1]
         assert "Files: app.txt, tests.txt" in posted[-1]
 
     def test_compete_code_command_shows_no_diff_failures(self):
@@ -630,6 +631,7 @@ class TestCompeteCommand:
                     provider="claude",
                     response="claude summary",
                     tokens=150,
+                    prompt_total=30,  # output = 120 -> 100 tok/s over 1.2s
                     duration_seconds=1.2,
                     success=False,
                     error="no changes produced",
@@ -660,7 +662,7 @@ class TestCompeteCommand:
             instance.execute_code.return_value = fake_result
             handler._cmd_compete_code(["fix", "bug"])
 
-        assert "[claude] FAIL: no changes produced (1.2s, 150 tok, 125 tok/s) | no diff" in posted[-1]
+        assert "[claude] FAIL: no changes produced (1.2s, 150 tok, 100 tok/s) | no diff" in posted[-1]
 
     def test_compete_command_rejects_unknown_provider(self):
         app = MagicMock()

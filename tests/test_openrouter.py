@@ -212,6 +212,18 @@ def test_openrouter_stream_sends_session_id_for_sticky_cache():
     assert len(payload["session_id"]) <= 256
 
 
+def test_stream_omits_temperature_for_a_reasoning_model():
+    """When the model's endpoints reject temperature, it must not be sent --
+    otherwise require_parameters filters out every endpoint (a 404)."""
+    provider = OpenRouterProvider(ProviderConfig(api_key="k", model="openai/gpt-5.6-luna"))
+    provider._send_temperature = False  # what _apply_meta sets for a reasoning model
+
+    with patch.object(provider.client, "stream", return_value=_ok_stream_context()) as mock_stream:
+        list(provider.stream_single("hi"))
+
+    assert "temperature" not in mock_stream.call_args.kwargs["json"]
+
+
 def test_http_error_text_surfaces_openrouter_body_reason():
     """A 404's real reason lives in the JSON body, not httpx's status line."""
     from cascade.providers._openai_tools import _http_error_text

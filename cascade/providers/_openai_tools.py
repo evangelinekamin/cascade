@@ -316,7 +316,7 @@ def openai_ask_with_tools(
     url: str,
     headers: dict,
     model: str,
-    temperature: float,
+    temperature: Optional[float],
     max_tokens: Optional[int],
     messages: list["Message"],
     tools: dict[str, "ToolDef"],
@@ -455,9 +455,12 @@ def openai_ask_with_tools(
         payload = {
             "model": model,
             "messages": api_messages,
-            "temperature": temperature,
             "tools": tool_defs,
         }
+        # Omitted (None) for reasoning models whose endpoints reject temperature;
+        # sending it with require_parameters would filter out every endpoint.
+        if temperature is not None:
+            payload["temperature"] = temperature
         if max_tokens:
             payload["max_tokens"] = max_tokens
         if provider_preferences:

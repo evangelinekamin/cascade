@@ -80,6 +80,7 @@ class Endpoint:
     supports_tools: bool
     throughput: float | None
     cache_read_price: float | None = None
+    supports_temperature: bool = True
 
     @property
     def unquantized(self) -> bool:
@@ -104,6 +105,9 @@ class ModelMeta:
     effective_context: int | None
     recommended_order: tuple[str, ...]
     endpoints: tuple[Endpoint, ...]
+    # False when NO routable endpoint accepts `temperature` (a reasoning model):
+    # sending it anyway, with require_parameters, filters out every endpoint.
+    supports_temperature: bool = True
 
 
 def _parse_endpoints(data: dict) -> list[Endpoint]:
@@ -123,6 +127,7 @@ def _parse_endpoints(data: dict) -> list[Endpoint]:
         except (TypeError, ValueError):
             throughput = None
         cache_read = pricing.get("input_cache_read")
+        supported = e.get("supported_parameters") or []
         out.append(
             Endpoint(
                 provider_name=str(e.get("provider_name") or ""),
@@ -130,9 +135,10 @@ def _parse_endpoints(data: dict) -> list[Endpoint]:
                 quantization=str(e.get("quantization") or "").lower(),
                 prompt_price=_as_float(pricing.get("prompt")),
                 completion_price=_as_float(pricing.get("completion")),
-                supports_tools="tools" in (e.get("supported_parameters") or []),
+                supports_tools="tools" in supported,
                 throughput=throughput,
                 cache_read_price=_as_float(cache_read) if cache_read is not None else None,
+                supports_temperature="temperature" in supported,
             )
         )
     return out
@@ -200,7 +206,8 @@ def _analyze(endpoints: list[Endpoint], *, prefer_unquantized: bool = True) -> M
     top = ranked[:_ORDER_LIMIT]
     effective = min(e.context_length for e in top)
     order = tuple(dict.fromkeys(e.provider_name for e in top if e.provider_name))
-    return ModelMeta(effective, order, tuple(endpoints))
+    supports_temperature = any(e.supports_temperature for e in pool)
+    return ModelMeta(effective, order, tuple(endpoints), supports_temperature)
 
 
 def model_meta(
