@@ -44,8 +44,31 @@ __all__ = [
 ]
 
 _GATE_TIMEOUT_DEFAULT = 300
-_DIFF_CHAR_CAP_DEFAULT = 12_000
+# Big enough to hold a real implementation diff. The old 12k cap was smaller than
+# a single generated lockfile, so the judge saw only the lockfile (which sorts
+# first alphabetically) and nothing of the model's actual source.
+_DIFF_CHAR_CAP_DEFAULT = 80_000
 _GATE_TAIL_CHARS = 2_000
+
+# Auto-generated / vendored files excluded from the judged diff: they are noise
+# the model didn't hand-write, and a lockfile alone can dwarf the real source.
+_DIFF_EXCLUDES = (
+    ":(exclude)package-lock.json",
+    ":(exclude)npm-shrinkwrap.json",
+    ":(exclude)yarn.lock",
+    ":(exclude)pnpm-lock.yaml",
+    ":(exclude)bun.lockb",
+    ":(exclude)Cargo.lock",
+    ":(exclude)poetry.lock",
+    ":(exclude)Pipfile.lock",
+    ":(exclude)composer.lock",
+    ":(exclude)Gemfile.lock",
+    ":(exclude)go.sum",
+    ":(exclude)*.lock",
+    ":(exclude)**/node_modules/**",
+    ":(exclude)**/dist/**",
+    ":(exclude)**/build/**",
+)
 
 _QUALITY_JUDGE_SYSTEM = """\
 You are a strict evaluator scoring one coding agent's diff against its task.
@@ -424,7 +447,7 @@ class CompetitionScorer:
             return ""
         try:
             result = subprocess.run(
-                ["git", "diff", "HEAD"],
+                ["git", "diff", "HEAD", "--", ".", *_DIFF_EXCLUDES],
                 cwd=worktree_path,
                 capture_output=True,
                 text=True,
