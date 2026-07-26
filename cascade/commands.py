@@ -2713,12 +2713,14 @@ class CommandHandler:
         for index, row in enumerate(leaderboard.rows, start=1):
             quality = f"{row.quality_total}/15" if row.quality_total is not None else "-"
             rank = f"{index} (DQ)" if row.disqualified else str(index)
+            cache = f"{row.cache_hit_pct:.1f}%" if row.cache_hit_pct is not None else "n/a"
+            tok_s = f"{row.tok_per_s:.0f}" if row.tok_per_s is not None else "n/a"
             notes = "; ".join(n for n in (row.quality_summary, *row.notes) if n)
             # A pipe or newline in the LLM summary would break the markdown row.
             notes = notes.replace("|", "/").replace("\n", " ")
             lines.append(
                 f"| {rank} | {row.model or row.label} | {row.gate} | {quality} | "
-                f"{row.cache_hit_pct:.1f}% | ${row.cost:.4f} | {row.tok_per_s:.0f} | "
+                f"{cache} | ${row.cost:.4f} | {tok_s} | "
                 f"{len(row.changed_files)} | {notes} |"
             )
         return "\n".join(lines)

@@ -228,6 +228,19 @@ def _parse_quality_payload(payload: object) -> _QualityScore:
     )
 
 
+def _output_tokens(total: int, prompt_total: int) -> Optional[int]:
+    """The generated-output token count, or None when the split is unknown.
+
+    ``total`` counts the whole request (prompt + output); subtracting the prompt
+    isolates the output. A manifest that never recorded ``prompt_total`` (from
+    before cache accounting) leaves the split unknowable, so return None rather
+    than pass off the full total -- prompt-inclusive -- as output.
+    """
+    if prompt_total <= 0:
+        return None
+    return max(0, total - prompt_total)
+
+
 def _read_handoff(worktree_path: str) -> str:
     """Best-effort contents of a worktree's handoff.md, or "" if absent/unreadable."""
     if not worktree_path:
@@ -300,7 +313,10 @@ class CompetitionScorer:
                 quality_summary="",
                 cost=competitor.cost,
                 tokens=competitor.tokens,
-                tok_per_s=tokens_per_second(competitor.tokens, competitor.duration_seconds),
+                tok_per_s=tokens_per_second(
+                    _output_tokens(competitor.tokens, competitor.prompt_total),
+                    competitor.duration_seconds,
+                ),
                 cache_hit_pct=cache_hit_pct(competitor.cache_read, competitor.prompt_total),
                 disqualified=True,
                 changed_files=competitor.changed_files,
@@ -334,7 +350,10 @@ class CompetitionScorer:
             quality_summary=quality.summary,
             cost=competitor.cost,
             tokens=competitor.tokens,
-            tok_per_s=tokens_per_second(competitor.tokens, competitor.duration_seconds),
+            tok_per_s=tokens_per_second(
+                _output_tokens(competitor.tokens, competitor.prompt_total),
+                competitor.duration_seconds,
+            ),
             cache_hit_pct=pct,
             disqualified=disqualified,
             changed_files=competitor.changed_files,

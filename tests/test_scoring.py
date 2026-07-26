@@ -64,25 +64,30 @@ class TestCacheHitPct:
     def test_normal_ratio(self):
         assert cache_hit_pct(50, 100) == 50.0
 
-    def test_zero_prompt_total_is_zero_not_a_crash(self):
-        assert cache_hit_pct(0, 0) == 0.0
+    def test_unknown_when_prompt_total_missing(self):
+        # A manifest from before cache accounting: unknown, not a proven zero.
+        assert cache_hit_pct(0, 0) is None
 
     def test_full_cache_hit(self):
         assert cache_hit_pct(100, 100) == 100.0
 
-    def test_negative_prompt_total_guarded_like_zero(self):
-        assert cache_hit_pct(5, -1) == 0.0
+    def test_negative_prompt_total_guarded_like_missing(self):
+        assert cache_hit_pct(5, -1) is None
 
 
 class TestTokensPerSecond:
-    def test_normal_rate(self):
+    def test_normal_rate_uses_output_tokens(self):
         assert tokens_per_second(100, 2.0) == 50.0
 
-    def test_zero_duration_guards_div_by_zero(self):
-        assert tokens_per_second(500, 0.0) == 0.0
+    def test_unknown_output_is_none(self):
+        # Output split not recoverable (pre-cache-accounting manifest).
+        assert tokens_per_second(None, 2.0) is None
 
-    def test_negative_duration_guards_div_by_zero(self):
-        assert tokens_per_second(500, -1.0) == 0.0
+    def test_zero_duration_is_none(self):
+        assert tokens_per_second(500, 0.0) is None
+
+    def test_negative_duration_is_none(self):
+        assert tokens_per_second(500, -1.0) is None
 
 
 # --- Disqualification ----------------------------------------------------------
@@ -116,6 +121,14 @@ class TestDisqualification:
         dq, notes = disqualification(50.0, True, ())
         assert dq is False
         assert notes == ()
+
+    def test_unknown_cache_rate_does_not_disqualify(self):
+        # None cache-hit (unknown) must never disqualify -- only the no-op trigger
+        # can, and only when the run actually produced nothing.
+        assert disqualification(None, True, ("a.py",)) == (False, ())
+        dq, notes = disqualification(None, False, ())
+        assert dq is True
+        assert notes == ("no-op: produced no changes",)
 
 
 # --- Ranking ---------------------------------------------------------------------
