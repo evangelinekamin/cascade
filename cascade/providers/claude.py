@@ -250,25 +250,18 @@ class ClaudeProvider(BaseProvider):
 
         prompt = self._condense_for_cli(messages)
         workdir = self.get_working_directory()
-        # LIMITATION: a CLI-proxy provider runs its OWN tools inside the
-        # subprocess, which cascade's permission engine cannot see or gate.
-        # The sacred-path / dangerous-shell floors therefore do NOT apply to
-        # proxy tool calls -- only the coarse posture->CLI-mode mapping
-        # below does. The structural floors are enforced on the direct-API
-        # providers (openrouter/openai/local/...), Eve's post-08/05 daily
-        # drivers. Non-interactive `claude -p` cannot prompt, so posture
-        # maps onto its permission modes.
+        # A CLI proxy owns its tools internally, so map Cascade's popup-free
+        # posture to Claude's native modes. Auto uses Claude's background
+        # classifier; yolo is the explicit unchecked escape hatch.
         posture = getattr(
             getattr(self, "permission_engine", None), "posture", "auto",
         )
-        # -p is non-interactive: it cannot prompt for approval, so "safe"
-        # (mutations must be asked) maps to plan, not acceptEdits -- the
-        # latter would silently auto-approve every edit, inverting safe.
         proxy_mode = {
-            "auto": "bypassPermissions",
-            "safe": "plan",
+            "auto": "auto",
+            "yolo": "bypassPermissions",
+            "safe": "auto",
             "readonly": "plan",
-        }.get(posture, "bypassPermissions")
+        }.get(posture, "auto")
         cmd = [
             self._claude_bin, "-p", prompt,
             "--output-format", "stream-json",
@@ -276,6 +269,20 @@ class ClaudeProvider(BaseProvider):
             "--add-dir", workdir,
             "--permission-mode", proxy_mode,
         ]
+        if proxy_mode == "auto":
+            # Prefer Claude's OS sandbox when available, but keep the classifier
+            # usable on machines without bubblewrap/Seatbelt support.
+            cmd.extend([
+                "--settings",
+                json.dumps({
+                    "sandbox": {
+                        "enabled": True,
+                        "failIfUnavailable": False,
+                        "autoAllowBashIfSandboxed": True,
+                        "allowUnsandboxedCommands": False,
+                    },
+                }),
+            ])
         if self.config.model:
             cmd.extend(["--model", self.config.model])
         if system:
@@ -402,13 +409,21 @@ class ClaudeProvider(BaseProvider):
         self._last_usage = None
         self._last_round_usage = None
 
-        from ..tools.executor import ToolExecutor
-        from ..tools.permissions import PermissionAbort
+        from ..tools.executor import ConcurrentToolExecutor
+        from ..tools.permissions import (
+            PermissionAbort,
+            permission_context_from_messages,
+        )
 
-        executor = ToolExecutor(
+        executor = ConcurrentToolExecutor(
             tools,
             hook_runner=self.hook_runner,
             permissions=self.permission_engine,
+            permission_context=permission_context_from_messages(
+                messages,
+                provider="claude",
+                model=self.config.model,
+            ),
         )
         tool_defs = [
             {
@@ -500,9 +515,6 @@ class ClaudeProvider(BaseProvider):
                 self._last_usage = prev.add(round_usage)
                 self._last_round_usage = round_usage
 
-            # Check stop reason
-            stop_reason = data.get("stop_reason", "end_turn")
-
             # Extract text and tool_use blocks
             text_parts = []
             tool_uses = []
@@ -522,6 +534,86 @@ class ClaudeProvider(BaseProvider):
 
             # Append the assistant message with all content blocks
             api_messages.append({"role": "assistant", "content": data["content"]})
+
+            # Models often request several independent reads in one response.
+            # Batch only when every call is explicitly concurrency-safe and no
+            # same-round read would bypass the de-duplication contract.
+            batch_calls = [
+                (tool_use["name"], tool_use.get("input", {}))
+                for tool_use in tool_uses
+            ]
+            batch_keys = [
+                _read_dedup_key(tool_name, tool_input)
+                for tool_name, tool_input in batch_calls
+            ]
+            concrete_keys = [key for key in batch_keys if key is not None]
+            can_batch = (
+                len(batch_calls) > 1
+                and all(
+                    (tool := executor.get_tool(tool_name)) is not None
+                    and tool.concurrency_safe
+                    for tool_name, _tool_input in batch_calls
+                )
+                and not any(key in seen_reads for key in concrete_keys)
+                and len(concrete_keys) == len(set(concrete_keys))
+            )
+            if can_batch:
+                for tool_name, tool_input in batch_calls:
+                    if on_tool_event:
+                        on_tool_event(ToolEvent(
+                            kind="tool_start",
+                            tool_name=tool_name,
+                            round_num=round_num,
+                            max_rounds=max_rounds,
+                            tool_input=tool_input,
+                        ))
+                try:
+                    batch_results = executor.execute_batch(batch_calls)
+                except PermissionAbort as exc:
+                    return (
+                        "".join(text_parts) + f"\n\n[stopped: {exc}]"
+                    ).strip(), tool_log
+
+                tool_results = []
+                for tool_use, tool_input, dedup_key, result in zip(
+                    tool_uses,
+                    (call[1] for call in batch_calls),
+                    batch_keys,
+                    batch_results,
+                ):
+                    self.raise_if_cancelled()
+                    tool_name = tool_use["name"]
+                    if dedup_key is not None:
+                        seen_reads[dedup_key] = tool_use["id"]
+                    else:
+                        edited = _invalidates_read(tool_name, tool_input)
+                        if edited is not None and seen_reads:
+                            seen_reads = {
+                                key: tid
+                                for key, tid in seen_reads.items()
+                                if key[1] != edited
+                            }
+                    tool_log.append({
+                        "tool": tool_name,
+                        "input": tool_input,
+                        "output": result,
+                    })
+                    if on_tool_event:
+                        on_tool_event(ToolEvent(
+                            kind="tool_done",
+                            tool_name=tool_name,
+                            round_num=round_num,
+                            max_rounds=max_rounds,
+                            tool_input=tool_input,
+                            tool_output=result,
+                        ))
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use["id"],
+                        "content": result,
+                    })
+                api_messages.append({"role": "user", "content": tool_results})
+                continue
 
             # Execute each tool call and build tool_result messages
             tool_results = []

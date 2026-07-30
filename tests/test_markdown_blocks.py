@@ -1,6 +1,6 @@
 """Block-aware markdown: tables, blockquotes, link URLs (reviewer-flagged)."""
 
-from cascade.widgets.message import render_content, _render_table, _split_table_row
+from cascade.widgets.message import render_content, _split_table_row
 
 
 class TestTables:
@@ -75,7 +75,7 @@ class TestTableWidth:
         # header, rule, and rows should share a consistent left-column width;
         # assert the first column's cells all start the second column at the
         # same display offset.
-        assert all("名前" in lines[0] or True for _ in [0])  # rendered without error
+        assert len(widths) == 1
         # The wide CJK cell and the ASCII cell occupy the same column width.
         assert cell_len("名前") == 4  # sanity: 2 wide chars = 4 cols
 

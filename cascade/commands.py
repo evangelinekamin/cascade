@@ -104,14 +104,17 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("init", "/init [type]", "Initialize .cascade/ project config"),
     CommandDef("upload", "/upload [stop|status]", "Start drag-and-drop upload server"),
     CommandDef("context", "/context [clear]", "Show or clear uploaded context"),
+    CommandDef("status", "/status", "Show model, context, permissions, route, and last run"),
+    CommandDef("doctor", "/doctor [refresh]", "Check local CLI and provider capabilities"),
     CommandDef("login", "/login [provider]", "Sync provider auth from installed CLIs"),
     CommandDef("config", "/config reload", "Reload config from disk"),
     CommandDef("clear", "/clear", "Clear chat history from screen"),
     CommandDef("compact", "/compact", "Compact conversation memory now"),
     CommandDef("permissions", "/permissions [posture <p>]", "Permission posture + audit trail"),
+    CommandDef("hooks", "/hooks", "Show registered hooks and recent outcomes"),
     CommandDef("history", "/history [limit]", "List this directory's recent sessions"),
     CommandDef("resume", "/resume [id]", "Resume a session (opens a picker if no id)"),
-    CommandDef("export", "/export [id]", "Export session messages to a file"),
+    CommandDef("export", "/export [id] [--json]", "Export messages and reproducible run receipts"),
     CommandDef("solve", "/solve <task>", "Code a task in an isolated worktree, verified by tests"),
     CommandDef("apply", "/apply", "Land the last passing /solve's changes on your working tree"),
     CommandDef("pipeline", "/pipeline <objective>", "Decompose a build into ordered steps, each verified by tests"),
@@ -140,6 +143,26 @@ COMMANDS: tuple[CommandDef, ...] = (
     CommandDef("help", "/help", "Show available commands"),
 )
 
+# The normal interface is ordinary language plus a small set of memorable
+# controls. The complete registry remains available for explicit power-user
+# overrides and `/help all`.
+_PRIMARY_COMMAND_NAMES = frozenset({
+    "help",
+    "status",
+    "model",
+    "mode",
+    "fast",
+    "context",
+    "login",
+    "doctor",
+    "history",
+    "resume",
+    "export",
+    "apply",
+    "init",
+    "exit",
+})
+
 _PROGRESS_DETAIL_RE = re.compile(r"^\[(?P<provider>[^\]]+)\]\s*(?P<message>.*)$")
 
 # Provider that /ultrafast jumps to. The concrete model slug lives in that
@@ -149,9 +172,13 @@ _ULTRAFAST_PROVIDER = "openrouter"
 
 
 def get_matching_commands(prefix: str) -> list[CommandDef]:
-    """Return commands whose name starts with prefix (without the /)."""
+    """Autocomplete the intentionally small everyday command surface."""
     prefix = prefix.lower()
-    return [c for c in COMMANDS if c.name.startswith(prefix) and c.name != "quit"]
+    return [
+        c
+        for c in COMMANDS
+        if c.name in _PRIMARY_COMMAND_NAMES and c.name.startswith(prefix)
+    ]
 
 
 class CommandHandler:
@@ -256,11 +283,14 @@ class CommandHandler:
             "init": self._cmd_init,
             "upload": self._cmd_upload,
             "context": self._cmd_context,
+            "status": self._cmd_status,
+            "doctor": self._cmd_doctor,
             "login": self._cmd_login,
             "config": self._cmd_config,
             "clear": self._cmd_clear,
             "compact": self._cmd_compact,
             "permissions": self._cmd_permissions,
+            "hooks": self._cmd_hooks,
             "history": self._cmd_history,
             "resume": self._cmd_resume,
             "export": self._cmd_export,
@@ -987,12 +1017,21 @@ class CommandHandler:
         self.app.notify(f"Saved {mode_name} mode model: {raw_model}")
 
     def _cmd_help(self, args: list[str]) -> None:
+        show_all = bool(args and args[0].lower() in {"all", "advanced"})
         lines = []
         for c in COMMANDS:
-            if c.name == "quit":
+            if c.name == "quit" or (not show_all and c.name not in _PRIMARY_COMMAND_NAMES):
                 continue
             lines.append(f"  {c.usage:<22s} {c.description}")
-        self._post_system("Commands:\n" + "\n".join(lines))
+        intro = (
+            "Just describe the outcome you want; Cascade automatically chooses "
+            "chat, repository inspection, a verified solve, a sequential pipeline, "
+            "or safe parallel fanout.\n\nEveryday commands:\n"
+            if not show_all
+            else "All commands (advanced workflows are optional overrides):\n"
+        )
+        suffix = "\n\nUse /help all for advanced/debug overrides." if not show_all else ""
+        self._post_system(intro + "\n".join(lines) + suffix)
 
     def _provider_list_text(self, header: str = "Available providers:") -> str:
         """Formatted provider -> active-model list, or a 'none' notice."""
@@ -1345,6 +1384,78 @@ class CommandHandler:
             lines.append(f"  [{s['type']}] {s['label']} ({s['size']} chars)")
         self._post_system("\n".join(lines))
 
+    def _cmd_status(self, args: list[str]) -> None:
+        """One compact answer for the state users otherwise hunt across commands."""
+        del args
+        cli_app = getattr(self.app, "cli_app", None)
+        state = self.app.state
+        provider_name = str(getattr(state, "active_provider", "") or "")
+        prov = cli_app.providers.get(provider_name) if cli_app else None
+        model = str(getattr(getattr(prov, "config", None), "model", "") or "unknown")
+        mode = str(getattr(state, "mode", "") or "unknown")
+        lines = [
+            f"Status: {provider_name or 'no provider'} · {model} · {mode} mode",
+        ]
+        if cli_app is not None:
+            try:
+                lines.extend(self._context_occupancy_lines(cli_app)[1:3])
+            except Exception:
+                pass
+            engine = getattr(cli_app, "permission_engine", None)
+            if engine is not None:
+                lines.append(
+                    f"  permissions: {engine.posture} · popup-free"
+                    f" · {engine.total_denials} denied"
+                )
+
+        screen = getattr(self.app, "screen", None)
+        decision = getattr(screen, "_last_route_decision", None)
+        if decision is not None:
+            router = decision.router_model or decision.router_provider
+            lines.append(
+                f"  last route: {decision.workflow.value}"
+                f" ({decision.confidence:.0%}, {router})"
+            )
+            lines.append(f"    why: {decision.reason}")
+            if decision.history_hint:
+                lines.append(f"    history tie-breaker: {decision.history_hint}")
+
+        ledger = getattr(self.app, "run_ledger", None)
+        if ledger is not None:
+            session = getattr(self.app, "_db_session", None)
+            session_id = session.get("id", "") if isinstance(session, dict) else ""
+            try:
+                runs = ledger.list_runs(
+                    session_id=session_id if session_id else None, limit=1
+                )
+            except Exception:
+                runs = []
+            if runs:
+                run = runs[0]
+                lines.append(
+                    f"  last run: {run['status']} · {run['workflow']}"
+                    f" · {run['input_tokens'] + run['output_tokens']:,} tok"
+                    f" · cost {float(run['cost']):.6f}"
+                )
+                if run.get("worktree_path"):
+                    lines.append(f"    worktree: {run['worktree_path']}")
+                if run.get("error"):
+                    lines.append(f"    error: {run['error']}")
+        self._post_system("\n".join(lines))
+
+    def _cmd_doctor(self, args: list[str]) -> None:
+        cli_app = getattr(self.app, "cli_app", None)
+        if cli_app is None:
+            self._post_system("No Cascade core is available.")
+            return
+        from .capabilities import format_doctor, run_doctor
+
+        report = run_doctor(
+            cli_app.config,
+            refresh=bool(args and args[0].lower() == "refresh"),
+        )
+        self._post_system(format_doctor(report))
+
     def _cmd_login(self, args: list[str]) -> None:
         """Sync provider credentials from installed CLI tools."""
         cli_app = getattr(self.app, "cli_app", None)
@@ -1462,8 +1573,10 @@ class CommandHandler:
         from .auth import detect_all
         cli_app.credentials = detect_all()
         cli_app._apply_detected_credentials()
-        # Rebuild hooks from the fresh config BEFORE provider init so the
-        # trailing _wire_provider_hooks attaches the new runner.
+        # Rebuild policy + hooks from the fresh config BEFORE provider init so
+        # the trailing _wire_provider_hooks attaches both new objects.
+        if hasattr(cli_app, "_build_permission_engine"):
+            cli_app.permission_engine = cli_app._build_permission_engine()
         if hasattr(cli_app, "_build_hook_runner"):
             cli_app.hook_runner = cli_app._build_hook_runner()
         cli_app._init_providers()
@@ -1514,7 +1627,7 @@ class CommandHandler:
     def _cmd_permissions(self, args: list[str]) -> None:
         """Show the permission posture and audit trail, or switch posture.
 
-        Usage: /permissions [posture auto|safe|readonly]
+        Usage: /permissions [posture auto|yolo|safe|readonly]
         """
         cli_app = getattr(self.app, "cli_app", None)
         engine = getattr(cli_app, "permission_engine", None) if cli_app else None
@@ -1524,20 +1637,21 @@ class CommandHandler:
 
         if len(args) >= 2 and args[0].lower() == "posture":
             new_posture = args[1].lower()
-            if new_posture not in ("auto", "safe", "readonly"):
-                self._post_system("Posture must be auto, safe, or readonly.")
+            if new_posture not in ("auto", "yolo", "safe", "readonly"):
+                self._post_system(
+                    "Posture must be auto, yolo, safe, or readonly."
+                )
                 return
             engine.posture = new_posture
-            # The setter revokes session grants so a looser posture's "always"
-            # cannot outrank the new one.
             self._post_system(
-                f"Permission posture: {new_posture} (this session; "
+                f"Permission posture: {new_posture} · popup-free "
+                "(this session; "
                 "set permissions.posture in config to persist)"
             )
             return
 
         lines = [
-            f"Permission posture: {engine.posture}",
+            f"Permission posture: {engine.posture} · popup-free",
             f"Denials: {engine.total_denials} total"
             f" · {engine.consecutive_denials} consecutive",
         ]
@@ -1549,6 +1663,42 @@ class CommandHandler:
                 lines.append(f"  [{decision}] {tool_name}{arg}  ({rule})")
         else:
             lines.append("No tool calls gated yet this session.")
+        self._post_system("\n".join(lines))
+
+    def _cmd_hooks(self, args: list[str]) -> None:
+        """Show hook configuration and recent execution diagnostics."""
+        cli_app = getattr(self.app, "cli_app", None)
+        runner = getattr(cli_app, "hook_runner", None) if cli_app else None
+        if runner is None:
+            self._post_system("Hook runner not available.")
+            return
+
+        state = "enabled" if runner.enabled else "disabled"
+        definitions = runner.describe()
+        lines = [f"Hooks: {state} · {len(definitions)} registered"]
+        for hook in definitions:
+            status = "on" if hook["enabled"] else "off"
+            policy = "closed" if hook["fail_closed"] else "open"
+            matcher = f" · if {hook['if']}" if hook["if"] else ""
+            lines.append(
+                f"  [{status}] {hook['name']} · {hook['event']} · "
+                f"{hook['type']} · p{hook['priority']} · fail-{policy}{matcher}"
+            )
+
+        recent = runner.recent_results[-10:]
+        if recent:
+            lines.extend(("", "Recent outcomes:"))
+            for result in recent:
+                if result.get("blocked"):
+                    status = "blocked"
+                elif result.get("success"):
+                    status = "ok"
+                else:
+                    status = "failed"
+                lines.append(
+                    f"  [{status}] {result.get('event', '?')} · "
+                    f"{result.get('name', '?')} · {result.get('duration', 0):.3f}s"
+                )
         self._post_system("\n".join(lines))
 
     def _cmd_compact(self, args: list[str]) -> None:
@@ -1847,8 +1997,12 @@ class CommandHandler:
         )
 
     def _cmd_export(self, args: list[str]) -> None:
-        """Export session messages to a Markdown file."""
-        if not args:
+        """Export transcript plus durable run/task receipts."""
+        import json
+
+        as_json = "--json" in args
+        positional = [arg for arg in args if arg != "--json"]
+        if not positional:
             session = self.app._db_session
             if session is None:
                 ensure_session = getattr(self.app, "ensure_session", None)
@@ -1862,7 +2016,7 @@ class CommandHandler:
                 return
             session_id = session["id"]
         else:
-            session_id = args[0]
+            session_id = positional[0]
 
         session = self.app.db.get_session(session_id)
         if session is None:
@@ -1874,13 +2028,10 @@ class CommandHandler:
             self._post_system(f"No messages found for session {session_id}.")
             return
 
-        title = session.get("title", "untitled")
         provider = session.get("provider", "assistant")
         model = session.get("model", "")
         model_label = model or provider
-        out_path = Path.cwd() / f"cascade-session-{session_id}.md"
-
-        lines = [f"# Cascade Session: {title}", f"Model: {model_label}", ""]
+        normalized_messages = []
         for msg in messages:
             provider_label = self._history_provider_for_message(msg, provider)
             if provider_label == "user":
@@ -1889,14 +2040,41 @@ class CommandHandler:
                 role = model_label
             else:
                 role = provider_label
-            ts = msg.get("timestamp", "")[:19]
-            lines.append(f"## {role} ({ts})")
-            lines.append("")
-            lines.append(msg["content"])
-            lines.append("")
+            normalized_messages.append(
+                {
+                    "role": role,
+                    "timestamp": msg.get("timestamp", ""),
+                    "content": msg["content"],
+                }
+            )
 
-        out_path.write_text("\n".join(lines), encoding="utf-8")
-        self._post_system(f"Exported {len(messages)} messages to {out_path}")
+        ledger = getattr(self.app, "run_ledger", None)
+        runs = ledger.list_runs(session_id=session_id, limit=200) if ledger else []
+        tasks_by_run = {
+            run["id"]: ledger.list_tasks(run["id"]) for run in runs
+        } if ledger else {}
+        from .receipts import build_receipt_payload, format_receipt_markdown
+
+        payload = build_receipt_payload(
+            session, normalized_messages, runs, tasks_by_run
+        )
+        suffix = "json" if as_json else "md"
+        out_path = Path.cwd() / f"cascade-session-{session_id}.{suffix}"
+        output = (
+            json.dumps(payload, indent=2, sort_keys=True) + "\n"
+            if as_json
+            else format_receipt_markdown(payload)
+        )
+        out_path.write_text(output, encoding="utf-8")
+        receipt_count = len(runs)
+        if receipt_count:
+            notice = (
+                f"Exported {len(messages)} messages and {receipt_count} run receipt(s) "
+                f"to {out_path}"
+            )
+        else:
+            notice = f"Exported {len(messages)} messages to {out_path}"
+        self._post_system(notice)
 
     def _cmd_mark(self, args: list[str]) -> None:
         label = " ".join(args) if args else datetime.datetime.now().strftime("%I:%M %p")

@@ -57,7 +57,9 @@ def load_hooks_from_config(hooks_data: list[dict[str, Any]]) -> tuple[HookDefini
         name = entry.get("name")
         event_str = entry.get("event")
 
-        if not all((name, event_str)):
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not isinstance(event_str, str) or not event_str:
             continue
 
         event = EVENT_MAP.get(event_str)
@@ -66,6 +68,8 @@ def load_hooks_from_config(hooks_data: list[dict[str, Any]]) -> tuple[HookDefini
 
         command = entry.get("command", "")
         module_path = entry.get("module", "")
+        if not isinstance(command, str) or not isinstance(module_path, str):
+            continue
         handler = None
 
         # Python module hook
@@ -81,18 +85,34 @@ def load_hooks_from_config(hooks_data: list[dict[str, Any]]) -> tuple[HookDefini
         # CC-style tool pattern filter
         tool_filter = None
         if_pattern = entry.get("if", "")
+        if not isinstance(if_pattern, str):
+            continue
         if if_pattern:
             tool_filter = compile_matcher(if_pattern)
 
+        timeout = entry.get("timeout", 30)
+        priority = entry.get("priority", 100)
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+            timeout = 30
+        if not isinstance(priority, int) or isinstance(priority, bool):
+            priority = 100
+        fail_closed = entry.get("fail_closed")
+        if fail_closed is not None and not isinstance(fail_closed, bool):
+            fail_closed = None
+        enabled = entry.get("enabled", True)
+        if not isinstance(enabled, bool):
+            enabled = True
+
         hooks.append(HookDefinition(
-            name=name,
+            name=name.strip(),
             event=event,
             command=command,
             handler=handler,
-            timeout=entry.get("timeout", 30),
-            enabled=entry.get("enabled", True),
-            priority=entry.get("priority", 100),
+            timeout=timeout,
+            enabled=enabled,
+            priority=priority,
             tool_filter=tool_filter,
+            fail_closed=fail_closed,
         ))
 
     return tuple(hooks)

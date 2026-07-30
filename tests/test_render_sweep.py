@@ -88,7 +88,6 @@ from cascade.widgets.tool_call import (
 from cascade.screens.exit import ExitScreen
 from cascade.screens.log_viewer import LogViewerScreen
 from cascade.screens.main import MainScreen
-from cascade.screens.permission import PermissionScreen
 from cascade.screens.session_picker import SessionPickerScreen
 
 
@@ -171,7 +170,6 @@ SCREEN_FACTORY: dict[str, Callable[[], Screen]] = {
         ["+ added", "- removed", "@@ hunk @@", "diff --git a b", "[editing] file.py", "plain line"],
     ),
     "MainScreen": lambda: MainScreen(active_provider="gemini", mode="design"),
-    "PermissionScreen": lambda: PermissionScreen("write_file", {"path": "src/config.ts"}, "workspace write"),
     "SessionPickerScreen": lambda: SessionPickerScreen([
         {"id": "night-river", "title": "Fix the parser", "provider": "claude",
          "model": "claude-opus-4-8", "message_count": 12,
@@ -271,7 +269,7 @@ def test_discovery_found_the_known_classes() -> None:
     # Guards discovery itself: if the walk silently stopped finding classes the
     # per-class sweeps would vacuously pass. These anchors must always be seen.
     assert {"WriteBlock", "DiffBlock", "StatusBar", "StreamMessage"} <= set(WIDGET_CLASSES)
-    assert {"PermissionScreen", "MainScreen", "ExitScreen"} <= set(SCREEN_CLASSES)
+    assert {"MainScreen", "ExitScreen"} <= set(SCREEN_CLASSES)
 
 
 # ---------------------------------------------------------------------------

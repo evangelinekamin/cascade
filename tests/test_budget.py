@@ -1,7 +1,5 @@
 """Golden tests for the token-accounting authority (context/budget.py)."""
 
-import pytest
-
 from cascade.context.budget import (
     ENV_WINDOW_CAP,
     compact_threshold,

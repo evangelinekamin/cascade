@@ -308,7 +308,9 @@ class OpenAIProvider(BaseProvider):
         if raw:
             root = Path(raw).expanduser()
         else:
-            root = Path.home() / ".cache" / "cascade" / "codex-workspaces"
+            from ..runtime import user_cache_path
+
+            root = user_cache_path("codex-workspaces")
         root.mkdir(parents=True, exist_ok=True)
         return root
 
@@ -499,6 +501,11 @@ class OpenAIProvider(BaseProvider):
         workspace_mode: str,
         session_id: str | None = None,
     ) -> list[str]:
+        posture = getattr(
+            getattr(self, "permission_engine", None),
+            "posture",
+            "auto",
+        )
         if session_id:
             cmd = [self._codex_bin, "exec", "resume", session_id, "--json"]
             if workspace_mode == "focused":
@@ -507,9 +514,17 @@ class OpenAIProvider(BaseProvider):
             cmd = [self._codex_bin, "exec", "--json", "--cd", workdir]
             if workspace_mode == "focused":
                 cmd.extend(["--skip-git-repo-check", "--sandbox", "read-only"])
+            elif workspace_mode == "repo-read" or posture in {"safe", "readonly"}:
+                cmd.extend(["--sandbox", "read-only"])
             elif workspace_mode == "repo-write":
                 cmd.extend(["--sandbox", "workspace-write"])
 
+        if posture == "yolo":
+            cmd.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            # Do not inherit a user config that asks for terminal approval.
+            # `codex exec` receives denials as tool results and replans.
+            cmd.extend(["-c", 'approval_policy="never"'])
         if self.config.model:
             cmd.extend(["--model", self.config.model])
         cmd.append(prompt)
@@ -526,6 +541,14 @@ class OpenAIProvider(BaseProvider):
             return
 
         with self._cli_workspace(messages, system) as (full_prompt, workdir, workspace_mode, session_key):
+            posture = getattr(
+                getattr(self, "permission_engine", None),
+                "posture",
+                "auto",
+            )
+            # A resumed process inherits the original sandbox. Never resume a
+            # session created under a different permission posture.
+            session_key = f"{session_key}:permissions={posture}"
             attempts = 2 if self._reuse_cli_sessions else 1
             for attempt in range(attempts):
                 session_id = (

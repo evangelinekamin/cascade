@@ -1,194 +1,139 @@
-# Development Guide - Cascade
+# Developing Cascade
 
-## Project Structure
-
-```
-cascade/
-├── cascade/                    # Main package
-│   ├── __init__.py            # Package exports
-│   ├── cli.py                 # Click CLI with commands (7.1 KB)
-│   ├── config.py              # YAML configuration management (3.7 KB)
-│   ├── providers/             # AI provider implementations
-│   │   ├── base.py            # BaseProvider abstract class (1.2 KB)
-│   │   ├── gemini.py          # Google Gemini API (3.2 KB)
-│   │   └── claude.py          # Anthropic Claude API (2.6 KB)
-│   ├── ui/                    # Terminal UI components
-│   │   ├── theme.py           # Deep Stream color theme (1.2 KB)
-│   │   └── output.py          # Rich rendering functions (3.9 KB)
-│   └── plugins/               # Extensible plugin system
-│       └── file_ops.py        # File operations plugin (1.5 KB)
-├── tests/                     # Test suite (12 tests, all passing)
-│   ├── test_config.py
-│   ├── test_plugins.py
-│   └── test_providers.py
-├── setup.py                   # Package configuration
-├── README.md                  # User documentation
-└── DEVELOPMENT.md             # This file
-```
-
-**Total:** 685 lines of production code + tests + docs
+Cascade is a Python 3.10+ terminal coding agent. The `cascade` entry point
+starts the Textual application; `cascade-cli` exposes one-shot and diagnostic
+commands.
 
 ## Architecture
 
-### Provider System
+The important package boundaries are:
 
-All AI providers extend `BaseProvider`:
+- `cascade/screens`, `cascade/widgets`, `cascade/app.py`: Textual application
+  and UI state.
+- `cascade/providers`: provider adapters and native tool-calling loops.
+- `cascade/tools`: schema generation, permissions, execution, output
+  filtering, and loop guardrails.
+- `cascade/hooks`: lifecycle events, matchers, configuration loading, and
+  Python/subprocess hook execution.
+- `cascade/context`, `cascade/episodes.py`, `cascade/conversation.py`: context
+  budgets, episode compaction, and cross-provider memory.
+- `cascade/agents`: named agents and sequential workflows.
+- `cascade/swarm`: automatic routing, isolated solve/competition/pipeline/
+  fan-out workflows, verification, cancellation, and durable run records.
+- `cascade/evaluation.py`, `cascade/harness.py`: real repository evaluations
+  and deterministic local harness measurements.
+- `cascade/capabilities.py`, `cascade/receipts.py`: cached runtime diagnostics
+  and portable session/run evidence.
+- `cascade/history`: SQLite-backed sessions, branching, and generated IDs.
+- `cascade/plugins`: built-in file, execution, reflection, and web tools.
 
-```python
-class BaseProvider(ABC):
-    def ask(self, prompt, system=None) -> str
-    def stream(self, prompt, system=None) -> Iterator[str]
-    def compare(self, prompt, system=None) -> dict
-```
+`CascadeCore` in `cascade/cli.py` owns configuration, providers, hooks,
+permissions, tools, agents, and workflows. Provider clones used by agent and
+swarm lanes must inherit both the shared hook runner and permission engine.
 
-Current implementations:
-- **GeminiProvider** - Google Gemini API with streaming
-- **ClaudeProvider** - Anthropic Claude API with streaming
+## Lifecycle and tool invariants
 
-Adding new providers is simple — implement the 3 methods.
+Keep these properties intact when extending the agent harness:
 
-### CLI Commands
+1. Permission rules inspect the original tool call before hooks run.
+2. If a hook transforms tool arguments, permissions inspect the transformed
+   call again.
+3. `tool_result` fires for success, denial, validation failure, unknown tool,
+   and handler failure.
+4. Hook transforms chain in priority order; a later hook sees the previous
+   transform.
+5. Policy hooks on `tool_call` fail closed unless explicitly configured
+   otherwise. Observability hooks fail open.
+6. Tool results remain ordered, bounded, and JSON-encoded at provider
+   boundaries.
+7. Provider loops may batch only tools marked concurrency-safe. Unknown,
+   destructive, and overlapping-path mutations remain serial barriers.
+   Worker pools are bounded, and background permission reviews stay
+   serialized even when the approved handlers can overlap.
+8. Named agents and named/automatic workflows emit their lifecycle boundary
+   events, including an error event when execution raises.
+9. Context compaction uses structured episodes. Do not add a second,
+   independent summarization path.
+10. Permission resolution never opens a UI prompt. Explicit denies and the
+    root/home deletion circuit breaker precede yolo; ambiguous auto/safe
+    actions use a fresh tool-less reviewer and fail closed if it is unavailable.
 
-Implemented via Click with proper error handling:
+The public subprocess hook protocol is documented in the README. Python hooks
+receive `HookContext` and return `HookResult`. Do not run subprocess hooks on
+Textual's event thread; timeout handling must terminate the subprocess group,
+not only the shell parent.
 
-1. **ask** - Single prompt with optional streaming
-2. **compare** - Compare multiple provider responses side-by-side
-3. **chat** - Interactive conversation mode
-4. **analyze** - AI analysis of files
-5. **config** - View configuration
+## Adding a provider
 
-### Configuration
+Implement the relevant `BaseProvider` methods in `cascade/providers`, register
+the provider through the registry decorator, and preserve the shared
+`hook_runner`, `permission_engine`, usage accounting, cancellation, and
+provider-specific tool-call IDs when cloning or recursing.
 
-YAML-based at `~/.config/cascade/config.yaml`:
-- Per-provider settings (model, temperature, max_tokens)
-- Environment variable substitution (${VAR_NAME})
-- Default provider selection
+## Adding a tool
 
-### UI Theming
+Expose a typed Python callable through a plugin `get_tools()` method.
+`callable_to_tool_def` derives a closed JSON schema from its signature.
+Use `Literal` for constrained strings, mark read-only operations
+`concurrency_safe=True` only when overlap is genuinely safe, and keep returned
+payloads compact enough for an agent context window. Calls returned in one
+provider turn are executed as a safe batch when every tool opts in; result
+messages are still appended in the model's original order.
 
-Deep Stream colors consistently applied:
-- **Cyan #00f2ff** - Primary, responses
-- **Violet #7000ff** - Secondary, thinking/analysis
-- **#00ff88** - Accent highlights
-- **#ff0055** - Error states
+## Harness benchmark
 
-Using Rich library for:
-- Beautiful panels and borders
-- Syntax highlighting for code
-- Real-time streaming output
-- Side-by-side comparisons
+`cascade-cli benchmark` is deterministic, offline, and provider-independent.
+It is the quick feedback loop for batching, hook overhead, ordering, error
+counts, and schema size:
 
-## Testing
-
-All 12 tests pass. Three test modules:
-
-**test_config.py:**
-- Config file creation
-- Default provider resolution
-- Environment variable expansion
-
-**test_plugins.py:**
-- File write/read
-- File append
-- Directory listing
-
-**test_providers.py:**
-- Provider config creation
-- BaseProvider interface
-- Mock provider implementation
-
-Run tests:
 ```bash
-python3 -m pytest tests/ -v
+cascade-cli benchmark --output .cascade/benchmark.json
+cascade-cli benchmark --baseline .cascade/benchmark.json --json
 ```
 
-## Making Changes
+Do not interpret zero-delay wall-clock changes as meaningful performance
+results. Use the default synthetic delay (or a representative explicit
+`--delay`) and compare several repeats on the same machine.
 
-### Adding a New Provider
+## Real task evaluation
 
-1. Create `cascade/providers/myprovider.py`
-2. Inherit from `BaseProvider`
-3. Implement `ask()`, `stream()`, `compare()`
-4. Register in `cascade/providers/__init__.py`
-5. Add to config defaults
+`cascade-cli eval` is the quality loop for model, prompt, router, and
+orchestration changes. A manifest task must name a local fixture, an ordinary
+user prompt, independent verification commands, and optionally expected files.
+Fixtures should be small enough to run repeatedly but representative of real
+repository work:
 
-Example:
-```python
-from .base import BaseProvider, ProviderConfig
-
-class MyProvider(BaseProvider):
-    def ask(self, prompt, system=None):
-        # Implementation
-        pass
-    
-    def stream(self, prompt, system=None):
-        # Implement streaming
-        pass
-    
-    def compare(self, prompt, system=None):
-        return {"provider": self.name, "response": "..."}
+```bash
+cascade-cli eval examples/eval.example.yaml --provider openai \
+  --output .cascade/eval-openai.json
+cascade-cli eval examples/eval.example.yaml --provider openai \
+  --task search-cache-lru-ttl
 ```
 
-### Adding a Plugin
+Do not use the agent's own claim as the pass condition. Evaluation always runs
+the manifest checks in the returned worktree, and automatically rejects changes
+to conventional test files, `conftest.py`, and `pytest.ini`. Use
+`protected_files` in a manifest for any additional grader assets. Keep task
+prompts provider-neutral so route and model comparisons remain meaningful.
 
-1. Create `cascade/plugins/myplugin.py`
-2. Implement static methods for operations
-3. Register in `cascade/plugins/__init__.py`
-4. Use in CLI via `CascadeApp`
+## Verification
 
-### Extending the CLI
+Run the complete suite:
 
-Add commands to `cascade/cli.py`:
-
-```python
-@cli.command()
-@click.argument("arg")
-@click.option("--opt", help="Option")
-def mycommand(arg, opt):
-    """Command description."""
-    app = get_app()
-    # Use app.providers, app.config, app.file_ops
+```bash
+python3 -m pytest -q
 ```
 
-## Dependencies
+Useful focused checks:
 
-Minimal, production-grade libraries:
-
-```
-click>=8.0          # CLI framework
-rich>=13.0          # Beautiful terminal output
-pyyaml>=6.0         # Config parsing
-httpx>=0.24.0       # HTTP client (async-capable)
-pygments>=2.14.0    # Code syntax highlighting
+```bash
+python3 -m pytest -q tests/test_hooks_v2.py tests/test_tools.py
+python3 -m pytest -q tests/test_tool_calling.py tests/test_harness.py
+python3 -m compileall -q cascade tests
+ruff check cascade tests
 ```
 
-## Performance Notes
-
-- **Streaming** - Implemented with async-capable httpx
-- **Memory** - Configuration cached, minimal overhead
-- **Latency** - Passes through API latency, no additional delays
-- **Startup** - ~50ms before first API call
-
-## Design Decisions
-
-1. **YAML over JSON** - Human-editable config
-2. **Single config file** - Simpler than per-provider configs
-3. **BaseProvider ABC** - Enforces interface consistency
-4. **Plugin system** - Room for expansion without bloating core
-5. **Rich for UI** - Terminal experience over web UI
-6. **Click for CLI** - Industry standard, great DX
-7. **No async/await** - Keep it simple, APIs handle concurrency
-8. **httpx over requests** - Modern, better streaming support
-
-## Future Enhancements (Phase 2+)
-
-- [ ] Ollama local provider
-- [ ] Together AI provider
-- [ ] Qwen provider
-- [ ] Conversation history/memory
-- [ ] Prompt templates
-- [ ] Export to Markdown
-- [ ] Batch operations
-- [ ] Performance benchmarking
-- [ ] Custom color themes
-- [ ] Shell integration (!!cascade)
+The repository predates the current Ruff configuration and still has broad
+style debt. For focused changes, at minimum keep touched files free of syntax,
+undefined-name, and unused-import failures, and avoid mixing unrelated
+formatting into functional patches.

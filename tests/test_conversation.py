@@ -1,12 +1,9 @@
 """Tests for conversation history conversion and context window management."""
 
-from unittest.mock import MagicMock
-
 from cascade.conversation import (
     state_messages_to_provider,
     estimate_tokens,
     needs_compaction,
-    compact_messages,
     compact_messages_with_episodes,
 )
 from cascade.state import CascadeState, ChatMessage
@@ -198,60 +195,6 @@ def test_needs_compaction_unknown_provider_uses_default():
     # unknown provider defaults to 128_000 tokens -> threshold 96_000 -> 384_000 chars
     messages = [{"role": "user", "content": "x" * 400_000}]
     assert needs_compaction(messages, "unknown_provider") is True
-
-
-def test_compact_messages_short_history_unchanged():
-    messages = [
-        {"role": "user", "content": "Hello"},
-        {"role": "assistant", "content": "Hi!"},
-    ]
-    mock_provider = MagicMock()
-    result = compact_messages(messages, mock_provider, keep_recent=6)
-    assert result == messages
-    mock_provider.ask_single.assert_not_called()
-
-
-def test_compact_messages_summarizes_old_keeps_recent():
-    messages = [
-        {"role": "user", "content": f"msg_{i}"}
-        for i in range(10)
-    ]
-    mock_provider = MagicMock()
-    mock_provider.ask_single.return_value = "Summary of earlier conversation."
-
-    result = compact_messages(messages, mock_provider, keep_recent=4)
-
-    # Should have: summary user msg + ack + 4 recent = 6 messages
-    assert len(result) == 6
-    assert "[Conversation summary]" in result[0]["content"]
-    assert "Summary of earlier conversation." in result[0]["content"]
-    assert result[1]["role"] == "assistant"
-    assert result[1]["content"] == "Understood, I have the context. Continuing."
-    # Last 4 messages preserved
-    for i, msg in enumerate(result[2:]):
-        assert msg["content"] == f"msg_{i + 6}"
-
-    mock_provider.ask_single.assert_called_once()
-
-
-def test_compact_messages_truncates_old_content_in_transcript():
-    long_content = "x" * 2000
-    messages = [
-        {"role": "user", "content": long_content},
-        {"role": "assistant", "content": long_content},
-        {"role": "user", "content": "recent1"},
-        {"role": "assistant", "content": "recent2"},
-    ]
-    mock_provider = MagicMock()
-    mock_provider.ask_single.return_value = "Summary."
-
-    compact_messages(messages, mock_provider, keep_recent=2)
-
-    # The transcript passed to ask_single should have truncated content
-    call_args = mock_provider.ask_single.call_args
-    prompt = call_args[0][0]
-    # Each old message content is truncated to 1000 chars
-    assert "x" * 1001 not in prompt
 
 
 def test_episode_compaction_marks_messages_so_it_does_not_repeat():

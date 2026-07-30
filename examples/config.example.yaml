@@ -20,7 +20,7 @@ providers:
     enabled: true
     api_key: ${OPENROUTER_API_KEY}
     model: qwen/qwen3.5-9b
-    fast_model: inception/mercury-2
+    fast_model: stepfun/step-3.7-flash
     fallback_model: minimax/minimax-m2.5
     temperature: 0.7
 
@@ -38,7 +38,7 @@ orchestration:
   recon_provider: openrouter
   recon_model: openai/gpt-oss-120b
   fast_provider: openrouter
-  fast_model: inception/mercury-2
+  fast_model: stepfun/step-3.7-flash
   provider_preferences:
     order: [cerebras]
     allow_fallbacks: true
@@ -50,6 +50,34 @@ orchestration:
   fast_provider_preferences:
     allow_fallbacks: true
     require_parameters: true
+
+# Hooks receive structured JSON on stdin. Tool-call hooks fail closed by
+# default, so a timeout or crash cannot silently bypass a policy hook.
+hooks:
+  - name: audit-shell
+    event: tool_call
+    if: "Bash(*)"
+    command: "python3 ~/.config/cascade/hooks/audit_shell.py"
+    timeout: 10
+    priority: 100
+
+# Cascade never displays a permission popup. `auto` immediately runs routine
+# reads, workspace edits, and transparent dev commands, then sends ambiguous
+# action metadata to a fresh tool-less model for allow/deny classification.
+# Other postures: yolo (unchecked except explicit denies and root/home delete),
+# safe (review every mutation), readonly (deny every mutation).
+permissions:
+  posture: auto
+  allow: []
+  deny: []
+  # Legacy key name: matching actions are background-reviewed, not prompted.
+  ask: []
+  reviewer:
+    enabled: true
+    # Leave blank to reuse the orchestration/default direct API provider.
+    provider: ""
+    model: ""
+    timeout: 10
 
 # Before using Cascade, set your API keys:
 #

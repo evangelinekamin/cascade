@@ -1,14 +1,17 @@
 """Cascade CLI - Beautiful multi-model AI assistant."""
 
 import click
+import json
 import os
+import subprocess
 import sys
+import time
 from typing import Optional
 
 from .auth import detect_all
 from .config import ConfigManager
 from .context import ProjectContext
-from .hooks import HookEvent, HookRunner, load_hooks_from_config
+from .hooks import HookContext, HookEvent, HookRunner, load_hooks_from_config
 from .prompts import build_default_prompt, PromptPipeline
 from .prompts.layers import (
     PRIORITY_DEFAULT,
@@ -55,6 +58,7 @@ class CascadeCore:
         self.tool_registry = self._build_tool_registry()
         self.context_builder = ContextBuilder()
         self.last_response_meta: Optional[ProviderResponse] = None
+        self.last_tool_log: tuple[dict, ...] = ()
 
         # Agent & workflow system
         self.agents = load_agents_from_dict(self.project.agents)
@@ -88,34 +92,111 @@ class CascadeCore:
         self._wire_provider_hooks()
 
     def _build_permission_engine(self):
-        """Build the shared permission gate from config + project overlay.
-
-        Lists concatenate (project rules extend user rules); a project
-        posture, when present, wins. .cascade/permissions.yaml finally has
-        a consumer.
-        """
+        """Build the popup-free broker with conservative project inheritance."""
         from .tools.permissions import PermissionEngine
+        from .tools.reviewer import ModelPermissionReviewer
 
         cfg = self.config.get_permissions_config()
         project = self.project.permissions if isinstance(self.project.permissions, dict) else {}
-        # Project posture, if present, wins -- but a typo must fail CLOSED
-        # (to safe) rather than silently opening full auto. PermissionEngine
-        # normalizes again, so this is belt-and-suspenders.
-        raw_posture = project.get("posture") or cfg["posture"]
-        posture = PermissionEngine.normalize_posture(raw_posture)
+        posture = PermissionEngine.normalize_posture(cfg.get("posture"))
+        # Checked-in policy may tighten the user's posture, never loosen it.
+        posture_rank = {"yolo": 0, "auto": 1, "safe": 2, "readonly": 3}
+        project_posture = str(project.get("posture") or "").lower()
+        if (
+            project_posture in posture_rank
+            and posture_rank[project_posture] > posture_rank[posture]
+        ):
+            posture = project_posture
 
-        def _merged(key: str) -> tuple:
+        def _project_tightens(key: str) -> tuple:
             extra = project.get(key)
             extra = [str(v) for v in extra] if isinstance(extra, list) else []
             return tuple(cfg[key] + extra)
 
+        reviewer_cfg = cfg.get("reviewer")
+        reviewer_cfg = reviewer_cfg if isinstance(reviewer_cfg, dict) else {}
+        self._permission_reviewer_config = dict(reviewer_cfg)
+        review_handler = None
+        if reviewer_cfg.get("enabled", True):
+            review_handler = ModelPermissionReviewer(
+                self._new_permission_reviewer_provider,
+                timeout=float(reviewer_cfg.get("timeout", 10.0)),
+            )
+
         return PermissionEngine(
             posture=posture,
-            allow=_merged("allow"),
-            deny=_merged("deny"),
-            ask=_merged("ask"),
+            # A repository cannot teach the broker to trust itself.
+            allow=tuple(cfg["allow"]),
+            deny=_project_tightens("deny"),
+            ask=_project_tightens("ask"),
             workspace_root=os.getcwd(),
+            review_handler=review_handler,
         )
+
+    def _new_permission_reviewer_provider(self):
+        """Create a fresh direct provider for one non-agentic safety review."""
+        from dataclasses import replace
+
+        reviewer_cfg = getattr(self, "_permission_reviewer_config", {})
+        requested_provider = str(reviewer_cfg.get("provider") or "")
+        requested_model = str(reviewer_cfg.get("model") or "")
+        try:
+            orchestration = self.config.get_orchestration_config()
+        except Exception:
+            orchestration = {}
+        if not isinstance(orchestration, dict):
+            orchestration = {}
+        router_provider = str(orchestration.get("router_provider") or "")
+        router_model = str(orchestration.get("router_model") or "")
+        try:
+            default_provider = str(self.config.get_default_provider() or "")
+        except Exception:
+            default_provider = ""
+        providers = getattr(self, "providers", {})
+
+        candidates = []
+        for name in (
+            requested_provider,
+            router_provider,
+            default_provider,
+            "openrouter",
+            "openai",
+            *providers.keys(),
+        ):
+            if name and name not in candidates:
+                candidates.append(name)
+
+        for name in candidates:
+            base = providers.get(name)
+            if base is None:
+                continue
+            if (
+                getattr(base, "_use_cli_proxy", False)
+                or getattr(base, "_use_oauth_cli", False)
+            ):
+                continue
+            model = (
+                requested_model
+                if requested_model and name == requested_provider
+                else router_model
+                if router_model and name == router_provider
+                else base.config.model
+            )
+            try:
+                config = replace(
+                    base.config,
+                    model=model,
+                    temperature=0.0,
+                    max_tokens=200,
+                )
+                reviewer = type(base)(config)
+            except Exception:
+                continue
+            reviewer.name = name
+            reviewer.hook_runner = None
+            reviewer.permission_engine = None
+            return reviewer
+        return None
 
     def _wire_provider_hooks(self) -> None:
         """Attach the hook runner + permission gate to every provider."""
@@ -321,9 +402,26 @@ class CascadeCore:
         system: Optional[str] = None,
         stream: bool = False,
         context_text: Optional[str] = None,
+        render: bool = True,
     ) -> str:
         """Ask a single question with full system prompt, tools, and hooks."""
         prov = self.get_provider(provider)
+
+        input_hook = self.hook_runner.emit(
+            HookEvent.INPUT_RECEIVED,
+            HookContext(
+                event=HookEvent.INPUT_RECEIVED.value,
+                provider=prov.name,
+                prompt=prompt,
+            ),
+        )
+        if input_hook is not None:
+            if input_hook.block:
+                raise RuntimeError(f"Input blocked by hook: {input_hook.reason}")
+            if input_hook.transformed_value is not None:
+                if not isinstance(input_hook.transformed_value, str):
+                    raise RuntimeError("Input hook returned an invalid prompt (expected text)")
+                prompt = input_hook.transformed_value
 
         # Build the system prompt from pipeline
         pipeline = self.prompt_pipeline
@@ -336,27 +434,79 @@ class CascadeCore:
             pipeline = pipeline.add_layer("user_override", system, PRIORITY_USER_OVERRIDE)
 
         final_system = pipeline.build() or None
+        context_hook = self.hook_runner.emit(
+            HookEvent.CONTEXT_BUILD,
+            HookContext(
+                event=HookEvent.CONTEXT_BUILD.value,
+                provider=prov.name,
+                prompt=prompt,
+                system_prompt=final_system or "",
+            ),
+        )
+        if context_hook is not None:
+            if context_hook.block:
+                raise RuntimeError(f"Context blocked by hook: {context_hook.reason}")
+            if context_hook.transformed_value is not None:
+                final_system = str(context_hook.transformed_value)
 
         # Run BEFORE_ASK hooks
-        self.hook_runner.run_hooks(HookEvent.BEFORE_ASK, context={
+        before_results = self.hook_runner.run_hooks(HookEvent.BEFORE_ASK, context={
             "prompt": prompt,
             "provider": prov.name,
         })
+        blocked = next((result for result in before_results if result.get("blocked")), None)
+        if blocked is not None:
+            raise RuntimeError(f"Request blocked by hook: {blocked.get('output', '')}")
 
         # Build messages list (CLI mode uses single-turn by default;
         # conversation context is already in the system prompt pipeline)
         messages = [{"role": "user", "content": prompt}]
+        request_hook = self.hook_runner.emit(
+            HookEvent.BEFORE_PROVIDER_REQUEST,
+            HookContext(
+                event=HookEvent.BEFORE_PROVIDER_REQUEST.value,
+                provider=prov.name,
+                prompt=prompt,
+                messages=tuple(messages),
+                system_prompt=final_system or "",
+            ),
+        )
+        if request_hook is not None:
+            if request_hook.block:
+                raise RuntimeError(f"Request blocked by hook: {request_hook.reason}")
+            if request_hook.transformed_value is not None:
+                transformed = request_hook.transformed_value
+                if not (
+                    isinstance(transformed, (list, tuple))
+                    and all(isinstance(message, dict) for message in transformed)
+                ):
+                    raise RuntimeError(
+                        "Request hook returned invalid messages (expected a list of objects)"
+                    )
+                messages = [dict(message) for message in transformed]
 
         # Ask with or without tools
         tool_log = []
-        if self.tool_registry and not stream:
-            response, tool_log = prov.ask_with_tools(
-                messages, self.tool_registry, system=final_system,
+        try:
+            if self.tool_registry and not stream:
+                response, tool_log = prov.ask_with_tools(
+                    messages, self.tool_registry, system=final_system,
+                )
+            elif stream:
+                response = stream_response(prov.stream(messages, final_system), prov.name)
+            else:
+                response = prov.ask(messages, final_system)
+        except Exception as exc:
+            self.hook_runner.emit(
+                HookEvent.ON_ERROR,
+                HookContext(
+                    event=HookEvent.ON_ERROR.value,
+                    provider=prov.name,
+                    prompt=prompt,
+                    error=str(exc),
+                ),
             )
-        elif stream:
-            response = stream_response(prov.stream(messages, final_system), prov.name)
-        else:
-            response = prov.ask(messages, final_system)
+            raise
 
         # Capture response metadata from provider
         usage = prov.last_usage or Usage()
@@ -367,20 +517,146 @@ class CascadeCore:
             model=prov.config.model,
             provider=prov.name,
         )
+        self.last_tool_log = tuple(dict(entry) for entry in tool_log)
 
-        if not stream:
+        if not stream and render:
             render_response(response, provider=prov.name)
 
         self.record_turn(prov.name, prompt, response)
 
         # Run AFTER_RESPONSE hooks
-        self.hook_runner.run_hooks(HookEvent.AFTER_RESPONSE, context={
-            "response_length": str(len(response)),
-            "provider": prov.name,
-            "tool_calls": str(len(tool_log)),
-        })
+        self.hook_runner.emit(
+            HookEvent.AFTER_RESPONSE,
+            HookContext(
+                event=HookEvent.AFTER_RESPONSE.value,
+                provider=prov.name,
+                prompt=prompt,
+                response=response,
+                tool_log=tuple(dict(entry) for entry in tool_log),
+            ),
+        )
 
         return response
+
+    def run_automatic(
+        self,
+        prompt: str,
+        *,
+        provider: Optional[str] = None,
+        mode: str = "build",
+    ) -> dict:
+        """Run an ordinary prompt through the same automatic router as the TUI."""
+        from .harness import summarize_run
+        from .prompts.default import get_mode_directive
+        from .swarm.auto import WorkflowKind, execute_auto, select_workflow
+
+        provider_name = provider or self.config.get_default_provider()
+        prov = self.get_provider(provider_name)
+        started = time.perf_counter()
+        decision = select_workflow(self, prompt, mode)
+        if decision.workflow == WorkflowKind.CHAT:
+            response = self.ask(
+                prompt,
+                provider=provider_name,
+                system=get_mode_directive(mode),
+                render=False,
+            )
+            meta = self.last_response_meta or ProviderResponse(
+                text=response,
+                provider=prov.name,
+                model=prov.config.model,
+            )
+            usage = prov.last_usage or Usage()
+            metrics = summarize_run(
+                self.last_tool_log,
+                usage,
+                time.perf_counter() - started,
+            )
+            changed_files: list[str] = []
+            diff_stat = ""
+            try:
+                status = subprocess.run(
+                    ["git", "status", "--short"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if status.returncode == 0:
+                    changed_files = [
+                        line[3:].split(" -> ")[-1]
+                        for line in status.stdout.splitlines()
+                        if len(line) > 3
+                    ]
+                diff = subprocess.run(
+                    ["git", "diff", "--stat"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if diff.returncode == 0:
+                    diff_stat = diff.stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                pass
+            return {
+                "schema_version": 1,
+                "objective": prompt,
+                "outcome": "succeeded" if response.strip() else "failed",
+                "workflow": decision.workflow.value,
+                "route_reason": decision.reason,
+                "route_confidence": decision.confidence,
+                "router_provider": decision.router_provider,
+                "router_model": decision.router_model,
+                "history_hint": decision.history_hint,
+                "provider": provider_name,
+                "model": meta.model,
+                "text": response,
+                "worktree_path": os.getcwd(),
+                "changed_files": changed_files,
+                "diff_stat": diff_stat,
+                "verification_kind": "",
+                "iterations": 1,
+                "duration_seconds": metrics.duration_seconds,
+                "tool_metrics_available": True,
+                "tool_calls": metrics.tool_calls,
+                "tool_errors": metrics.tool_errors,
+                "duplicate_reads": metrics.duplicate_reads,
+                "input_tokens": metrics.input_tokens,
+                "output_tokens": metrics.output_tokens,
+                "cost": metrics.cost or 0.0,
+            }
+
+        result = execute_auto(self, prompt, provider_name, decision, mode=mode)
+        return {
+            "schema_version": 1,
+            "objective": prompt,
+            "outcome": result.outcome.value,
+            "workflow": result.decision.workflow.value,
+            "route_reason": result.decision.reason,
+            "route_confidence": result.decision.confidence,
+            "router_provider": result.decision.router_provider,
+            "router_model": result.decision.router_model,
+            "history_hint": result.decision.history_hint,
+            "provider": result.execution_provider,
+            "model": " -> ".join(dict.fromkeys(result.models_used)),
+            "text": result.text,
+            "worktree_path": result.worktree_path,
+            "changed_files": list(result.changed_files),
+            "diff_stat": result.diff_stat,
+            "verification_kind": result.verification_kind,
+            "iterations": result.iterations,
+            "duration_seconds": time.perf_counter() - started,
+            # Native CLI proxies own their internal tool loop; until a provider
+            # emits structured tool events, zero would be a false measurement.
+            "tool_metrics_available": False,
+            "tool_calls": None,
+            "tool_errors": None,
+            "duplicate_reads": None,
+            "input_tokens": result.input_tokens,
+            "output_tokens": result.output_tokens,
+            "cost": result.cost,
+            "tokens_by_provider": [list(item) for item in result.tokens_by_provider],
+            "cost_by_provider": [list(item) for item in result.cost_by_provider],
+        }
 
     def run_agent(self, name: str, prompt: str) -> str:
         """Run a named agent by name. Raises KeyError if not found."""
@@ -549,6 +825,209 @@ def setup():
 
     wizard = SetupWizard()
     wizard.run()
+
+
+@cli.command(name="run")
+@click.argument("prompt", nargs=-1, required=True)
+@click.option("--provider", "-p", help="Provider to use for implementation.")
+@click.option(
+    "--mode",
+    type=click.Choice(["design", "plan", "build", "test"]),
+    default="build",
+    show_default=True,
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit a machine-readable run receipt.")
+def run_prompt(prompt, provider, mode, as_json):
+    """Run one prompt with automatic chat/recon/solve/pipeline/fanout routing."""
+    app = get_app()
+    try:
+        result = app.run_automatic(" ".join(prompt), provider=provider, mode=mode)
+    except Exception as exc:
+        if as_json:
+            click.echo(json.dumps({"outcome": "failed", "error": str(exc)}))
+        raise click.ClickException(str(exc)) from exc
+    if as_json:
+        click.echo(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        console.print(result["text"])
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable diagnostics.")
+@click.option("--refresh", is_flag=True, help="Re-probe CLIs instead of using the cache.")
+def doctor(as_json, refresh):
+    """Check provider CLIs, auth configuration, Git, and permission capabilities."""
+    from .capabilities import format_doctor, run_doctor
+
+    app = get_app()
+    report = run_doctor(app.config, refresh=refresh)
+    if as_json:
+        click.echo(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        console.print(format_doctor(report))
+
+
+@cli.command(name="eval")
+@click.argument("manifest", type=click.Path(exists=True, dir_okay=False, path_type=str))
+@click.option("--provider", "-p", default="", help="Provider under evaluation.")
+@click.option(
+    "--mode",
+    type=click.Choice(["design", "plan", "build", "test"]),
+    default="build",
+    show_default=True,
+)
+@click.option("--output", type=click.Path(dir_okay=False, path_type=str))
+@click.option("--keep", is_flag=True, help="Keep fixture/worktree paths for debugging.")
+@click.option(
+    "--task",
+    "task_ids",
+    multiple=True,
+    help="Run only this task ID; repeat to select several.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Print the complete JSON report.")
+def evaluate(manifest, provider, mode, output, keep, task_ids, as_json):
+    """Run a manifest of real repository tasks and independently verify them."""
+    from pathlib import Path
+
+    from .evaluation import load_eval_manifest, run_evaluation, select_eval_tasks
+
+    try:
+        tasks = select_eval_tasks(load_eval_manifest(manifest), task_ids)
+        report = run_evaluation(
+            tasks,
+            manifest=str(Path(manifest).resolve()),
+            provider=provider,
+            mode=mode,
+            keep=keep,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    payload = report.to_dict()
+    encoded = json.dumps(payload, indent=2, sort_keys=True)
+    if output:
+        try:
+            destination = Path(output)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(encoded + "\n", encoding="utf-8")
+        except OSError as exc:
+            raise click.ClickException(f"Could not write evaluation report: {exc}") from exc
+    if as_json:
+        click.echo(encoded)
+    else:
+        console.print(
+            f"Evaluation: {report.passed}/{report.total} passed "
+            f"({report.pass_rate:.0%})"
+        )
+        for result in report.results:
+            mark = "PASS" if result.passed else "FAIL"
+            detail = result.error or result.workflow or result.outcome
+            console.print(f"  {mark} {result.id}: {detail}")
+        if output:
+            console.print(f"  report: {output}", style="dim")
+
+
+@cli.command(name="benchmark")
+@click.option(
+    "--repeats",
+    type=click.IntRange(min=1),
+    default=5,
+    show_default=True,
+    help="Number of timed serial and parallel samples.",
+)
+@click.option(
+    "--calls",
+    "calls_per_repeat",
+    type=click.IntRange(min=2),
+    default=4,
+    show_default=True,
+    help="Independent tool calls in each sample.",
+)
+@click.option(
+    "--delay",
+    "delay_seconds",
+    type=click.FloatRange(min=0),
+    default=0.02,
+    show_default=True,
+    help="Synthetic latency per tool call, in seconds.",
+)
+@click.option(
+    "--output",
+    type=click.Path(dir_okay=False, path_type=str),
+    help="Write the JSON report to this path.",
+)
+@click.option(
+    "--baseline",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    help="Compare the result with a previous JSON report.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Print the full JSON report.")
+def benchmark(
+    repeats,
+    calls_per_repeat,
+    delay_seconds,
+    output,
+    baseline,
+    as_json,
+):
+    """Benchmark local harness mechanics without calling a model."""
+    import json
+    from pathlib import Path
+
+    from .harness import compare_reports, run_harness_benchmark
+
+    report = run_harness_benchmark(
+        repeats=repeats,
+        calls_per_repeat=calls_per_repeat,
+        delay_seconds=delay_seconds,
+    )
+    payload = report.to_dict()
+    if baseline:
+        try:
+            baseline_payload = json.loads(Path(baseline).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise click.ClickException(f"Could not read baseline: {exc}") from exc
+        if not isinstance(baseline_payload, dict):
+            raise click.ClickException("Baseline must contain one JSON object.")
+        payload["baseline_delta"] = compare_reports(report, baseline_payload)
+
+    encoded = json.dumps(payload, indent=2, sort_keys=True)
+    if output:
+        try:
+            destination = Path(output)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(encoded + "\n")
+        except OSError as exc:
+            raise click.ClickException(f"Could not write benchmark report: {exc}") from exc
+
+    if as_json:
+        click.echo(encoded)
+        return
+
+    console.print("\n[bold]Local harness benchmark[/bold]", style=CYAN)
+    console.print(
+        f"  tool batch: {report.serial_seconds * 1000:.2f} ms serial → "
+        f"{report.parallel_seconds * 1000:.2f} ms parallel "
+        f"({report.speedup:.2f}×)"
+    )
+    console.print(
+        f"  hook dispatch: {report.hook_p50_ms:.3f} ms p50 / "
+        f"{report.hook_p95_ms:.3f} ms p95"
+    )
+    console.print(
+        f"  ordering: {'ok' if report.results_ordered else 'FAILED'} · "
+        f"tool errors: {report.tool_errors} · schema: {report.schema_bytes} bytes"
+    )
+    if output:
+        console.print(f"  report: {output}", style="dim")
+    if "baseline_delta" in payload:
+        delta = payload["baseline_delta"]
+        parallel_delta = delta.get("parallel_seconds_pct")
+        if parallel_delta is not None:
+            console.print(
+                f"  versus baseline: parallel latency {parallel_delta:+.1f}%",
+                style="dim",
+            )
+    console.print()
 
 
 @cli.command(name="init")

@@ -1,7 +1,6 @@
 """Provider-agnostic web_search: DuckDuckGo HTML parsing, formatting, gating."""
 
 import httpx
-import pytest
 
 from cascade.web.search import (
     SearchHit,
@@ -126,8 +125,8 @@ def test_web_search_blocked_under_readonly():
     assert verdict.decision == "deny"
 
 
-def test_web_fetch_still_asks_for_unknown_host():
+def test_web_fetch_still_requires_review_for_unknown_host():
     # Regression guard: the search fast-path must not leak into web_fetch.
     engine = PermissionEngine(posture="auto")
     verdict = engine.evaluate(None, "web_fetch", {"url": "https://random.example.com/x"})
-    assert verdict.decision == "ask"
+    assert verdict.decision == "review"

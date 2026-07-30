@@ -20,7 +20,6 @@ def test_run_context_creates_and_finishes_a_ledger_row():
         )
         ctx.start(workflow="solve", provider="openrouter")
         # A crash here would leave the row non-terminal -> marked interrupted.
-        rows = ledger.list_runs() if hasattr(ledger, "list_runs") else None
         ctx.finish(RunOutcome.SUCCEEDED)
 
         # A fresh ledger over the same DB marks nothing interrupted (row is

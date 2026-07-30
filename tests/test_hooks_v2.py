@@ -1,10 +1,15 @@
 """Tests for the v2 hook system: rich lifecycle events and Python module hooks."""
 
+import subprocess
+from types import SimpleNamespace
+
 import pytest
 
+import cascade.hooks.runner as hook_runner_module
+from cascade.commands import CommandHandler
 from cascade.hooks.events import HookEvent, EVENT_MAP
 from cascade.hooks.context import HookContext, HookResult
-from cascade.hooks.runner import HookDefinition, HookRunner
+from cascade.hooks.runner import HookDefinition, HookRunner, load_python_hook
 from cascade.hooks.loader import load_hooks_from_config
 from cascade.hooks.matchers import compile_matcher, matches_any
 
@@ -20,6 +25,10 @@ class TestHookEvents:
 
     def test_new_lifecycle_events(self):
         assert HookEvent.INPUT_RECEIVED == "input_received"
+        assert HookEvent.AGENT_START == "agent_start"
+        assert HookEvent.AGENT_END == "agent_end"
+        assert HookEvent.WORKFLOW_START == "workflow_start"
+        assert HookEvent.WORKFLOW_END == "workflow_end"
         assert HookEvent.CONTEXT_BUILD == "context_build"
         assert HookEvent.BEFORE_PROVIDER_REQUEST == "before_provider_request"
         assert HookEvent.TOOL_CALL == "tool_call"
@@ -86,6 +95,23 @@ class TestHookContext:
         env = ctx.to_env_dict()
         assert "CASCADE_PROMPT" not in env
         assert "CASCADE_PROMPT_LENGTH" in env
+
+    def test_structured_payload_contains_full_context(self):
+        ctx = HookContext(
+            event="tool_call",
+            agent_name="reviewer",
+            workflow="solve",
+            prompt="inspect this",
+            tool_name="run_command",
+            tool_input=(("command", "git status"),),
+            metadata=(("run_id", "abc"),),
+        )
+        payload = ctx.to_payload()
+        assert payload["prompt"] == "inspect this"
+        assert payload["agent_name"] == "reviewer"
+        assert payload["workflow"] == "solve"
+        assert payload["tool_input"] == {"command": "git status"}
+        assert payload["metadata"] == {"run_id": "abc"}
 
 
 class TestHookResult:
@@ -239,6 +265,96 @@ class TestHookEmit:
         )
         assert result is None
 
+    def test_emit_chains_transforms_in_priority_order(self):
+        seen = []
+
+        def first(ctx):
+            seen.append(ctx.prompt)
+            return HookResult(transformed_value=ctx.prompt + " one")
+
+        def second(ctx):
+            seen.append(ctx.prompt)
+            return HookResult(transformed_value=ctx.prompt + " two")
+
+        runner = HookRunner(hooks=(
+            HookDefinition(
+                name="first", event=HookEvent.INPUT_RECEIVED, handler=first, priority=1,
+            ),
+            HookDefinition(
+                name="second", event=HookEvent.INPUT_RECEIVED, handler=second, priority=2,
+            ),
+        ))
+        result = runner.emit(
+            HookEvent.INPUT_RECEIVED,
+            HookContext(event="input_received", prompt="start"),
+        )
+        assert seen == ["start", "start one"]
+        assert result is not None
+        assert result.transformed_value == "start one two"
+
+    def test_tool_hook_errors_fail_closed_by_default(self):
+        def broken(_ctx):
+            raise RuntimeError("policy unavailable")
+
+        runner = HookRunner(hooks=(
+            HookDefinition(name="policy", event=HookEvent.TOOL_CALL, handler=broken),
+        ))
+        result = runner.emit(
+            HookEvent.TOOL_CALL,
+            HookContext(event="tool_call", tool_name="run_command"),
+        )
+        assert result is not None
+        assert result.block is True
+        assert "policy unavailable" in result.reason
+
+    def test_recent_results_exposes_hook_diagnostics(self):
+        runner = HookRunner(hooks=(
+            HookDefinition(
+                name="observer",
+                event=HookEvent.BEFORE_ASK,
+                handler=lambda _ctx: None,
+            ),
+        ))
+        runner.emit(HookEvent.BEFORE_ASK, HookContext(event="before_ask"))
+        assert runner.recent_results[-1]["event"] == "before_ask"
+        assert runner.recent_results[-1]["name"] == "observer"
+
+    def test_recent_results_do_not_retain_transformed_payload(self):
+        secret = "do-not-retain"
+        runner = HookRunner(hooks=(
+            HookDefinition(
+                name="transformer",
+                event=HookEvent.INPUT_RECEIVED,
+                handler=lambda _ctx: HookResult(transformed_value=secret),
+            ),
+        ))
+
+        runner.emit(
+            HookEvent.INPUT_RECEIVED,
+            HookContext(event="input_received", prompt="hello"),
+        )
+
+        recent = runner.recent_results[-1]
+        assert "transformed_value" not in recent
+        assert secret not in str(recent)
+
+    def test_legacy_context_keeps_unknown_and_scalar_collision_as_metadata(self):
+        seen = []
+        runner = HookRunner(hooks=(
+            HookDefinition(
+                name="exit",
+                event=HookEvent.ON_EXIT,
+                handler=lambda ctx: seen.append(dict(ctx.metadata)),
+            ),
+        ))
+
+        runner.run_hooks(
+            HookEvent.ON_EXIT,
+            context={"messages": "3", "response_length": "42"},
+        )
+
+        assert seen == [{"messages": "3", "response_length": "42"}]
+
 
 class TestHookPriority:
     """Tests for hook execution ordering."""
@@ -278,6 +394,53 @@ class TestHookRunnerImmutability:
         assert new_runner.hook_count == 1
 
 
+class TestHookDiagnostics:
+    def test_hooks_command_shows_definitions_and_recent_outcomes(self):
+        runner = HookRunner(hooks=(
+            HookDefinition(
+                name="observer",
+                event=HookEvent.BEFORE_ASK,
+                handler=lambda _ctx: None,
+                priority=25,
+            ),
+        ))
+        runner.emit(HookEvent.BEFORE_ASK, HookContext(event="before_ask"))
+        app = SimpleNamespace(
+            cli_app=SimpleNamespace(hook_runner=runner),
+            notify=lambda _message: None,
+        )
+        handler = CommandHandler(app)
+        posted = []
+        handler._post_system = posted.append
+
+        handler._cmd_hooks([])
+
+        assert "1 registered" in posted[0]
+        assert "observer · before_ask · python · p25 · fail-open" in posted[0]
+        assert "[ok] before_ask · observer" in posted[0]
+
+
+class TestPythonHookLoading:
+    def test_tilde_path_expands_under_config_hook_directory(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        hooks_dir = home / ".config" / "cascade" / "hooks"
+        hooks_dir.mkdir(parents=True)
+        module = hooks_dir / "trim.py"
+        module.write_text(
+            "from cascade.hooks import HookResult\n"
+            "def hook(ctx):\n"
+            "    return HookResult(transformed_value=ctx.prompt.strip())\n"
+        )
+        monkeypatch.setenv("HOME", str(home))
+
+        handler = load_python_hook("~/.config/cascade/hooks/trim.py")
+
+        assert handler is not None
+        result = handler(HookContext(event="input_received", prompt=" hello "))
+        assert result is not None
+        assert result.transformed_value == "hello"
+
+
 class TestMixedHooks:
     """Tests for mixing shell and Python hooks."""
 
@@ -294,6 +457,103 @@ class TestMixedHooks:
         assert len(results) == 2
         assert results[0]["type"] == "shell"
         assert results[1]["type"] == "python"
+
+    def test_shell_hook_reads_json_stdin_and_transforms(self):
+        command = (
+            "python3 -c 'import json,sys; "
+            "p=json.load(sys.stdin); "
+            "print(json.dumps({\"transformed_value\": p[\"prompt\"] + \"!\"}))'"
+        )
+        runner = HookRunner(hooks=(
+            HookDefinition(
+                name="stdin",
+                event=HookEvent.INPUT_RECEIVED,
+                command=command,
+            ),
+        ))
+        result = runner.emit(
+            HookEvent.INPUT_RECEIVED,
+            HookContext(event="input_received", prompt="hello"),
+        )
+        assert result is not None
+        assert result.transformed_value == "hello!"
+
+    def test_shell_exit_two_blocks(self):
+        runner = HookRunner(hooks=(
+            HookDefinition(
+                name="deny",
+                event=HookEvent.TOOL_CALL,
+                command="echo forbidden >&2; exit 2",
+            ),
+        ))
+        result = runner.emit(
+            HookEvent.TOOL_CALL,
+            HookContext(event="tool_call", tool_name="run_command"),
+        )
+        assert result is not None
+        assert result.block is True
+        assert result.reason == "forbidden"
+
+    def test_failed_fail_open_hook_does_not_apply_transform(self):
+        runner = HookRunner(hooks=(
+            HookDefinition(
+                name="broken-transform",
+                event=HookEvent.INPUT_RECEIVED,
+                command=(
+                    "echo '{\"transformed_value\":\"untrusted\"}'; exit 1"
+                ),
+                fail_closed=False,
+            ),
+        ))
+
+        result = runner.emit(
+            HookEvent.INPUT_RECEIVED,
+            HookContext(event="input_received", prompt="original"),
+        )
+
+        assert result is None
+
+    def test_shell_timeout_kills_the_hook_process_group(self, monkeypatch):
+        class TimedOutProcess:
+            pid = 4321
+            returncode = -9
+
+            def __init__(self):
+                self.communications = 0
+
+            def communicate(self, input=None, timeout=None):
+                self.communications += 1
+                if self.communications == 1:
+                    raise subprocess.TimeoutExpired("hook", timeout)
+                return "", ""
+
+        process = TimedOutProcess()
+        killed = []
+        monkeypatch.setattr(
+            hook_runner_module.subprocess,
+            "Popen",
+            lambda *args, **kwargs: process,
+        )
+        monkeypatch.setattr(
+            hook_runner_module.os,
+            "killpg",
+            lambda pid, sig: killed.append((pid, sig)),
+        )
+        runner = HookRunner(hooks=(
+            HookDefinition(
+                name="slow-observer",
+                event=HookEvent.BEFORE_ASK,
+                command="ignored",
+                timeout=1,
+            ),
+        ))
+
+        results = runner.run_hooks(HookEvent.BEFORE_ASK)
+
+        assert results[0]["success"] is False
+        assert "timed out" in results[0]["output"]
+        assert killed == [(process.pid, hook_runner_module.signal.SIGKILL)]
+        assert process.communications == 2
 
 
 class TestLoaderV2:
@@ -394,6 +654,13 @@ class TestToolMatchers:
         assert matches_any(matchers, "Write", {"path": "/tmp/x"}) is True
         assert matches_any(matchers, "Bash", {"command": "git status"}) is True
         assert matches_any(matchers, "Bash", {"command": "npm install"}) is False
+
+    def test_claude_style_alias_matches_cascade_tool(self):
+        matcher = compile_matcher("Bash(git:*)")
+        assert matcher.matches("run_command", {"command": "git status"}) is True
+        assert matcher.matches("run_command", {"command": "npm test"}) is False
+        assert compile_matcher("Edit").matches("replace_in_file", {}) is True
+        assert compile_matcher("Grep").matches("search_files", {}) is True
 
 
 class TestToolFilterIntegration:

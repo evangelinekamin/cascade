@@ -14,11 +14,11 @@ import hashlib
 import os
 import subprocess
 import time
-from pathlib import Path
 from typing import Any
 
 from .base import BasePlugin
 from .registry import register_plugin
+from ..runtime import user_cache_path
 from ..tools.filters import apply_output_filter
 
 _MAX_OUTPUT_CHARS = 4000
@@ -26,15 +26,13 @@ _COMMAND_TIMEOUT = 120.0
 
 # tee: raw command output spills here so a filtered/truncated result
 # always has a recoverable full copy (rtk's bound-and-spill principle).
-_ARTIFACT_DIR = Path.home() / ".cache" / "cascade" / "command-output"
-
-
 def _spill_raw(command: str, raw: str) -> str:
     """Write full output to the artifact dir; return a recovery hint or ''."""
     try:
-        _ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+        artifact_dir = user_cache_path("command-output")
+        artifact_dir.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha1(f"{time.time_ns()}:{command}".encode()).hexdigest()[:10]
-        path = _ARTIFACT_DIR / f"{digest}.txt"
+        path = artifact_dir / f"{digest}.txt"
         path.write_text(f"$ {command}\n\n{raw}", errors="replace")
         return f"read {path}"
     except Exception:

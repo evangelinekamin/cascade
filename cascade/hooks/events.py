@@ -18,6 +18,8 @@ class HookEvent(str, Enum):
         session_start
         user sends prompt
           -> input_received (can transform prompt)
+          -> agent_start (named agent begins)
+          -> workflow_start (orchestration lane begins)
           -> before_ask (legacy compat)
           -> context_build (can inject/modify context)
           -> before_provider_request (inspect/modify messages)
@@ -25,6 +27,8 @@ class HookEvent(str, Enum):
               -> tool_call (can block tool)
               -> tool_result (can modify result)
           -> after_response (legacy compat)
+          -> agent_end (named agent finishes)
+          -> workflow_end (orchestration lane finishes)
           -> episode_generated (new episode created)
         provider/mode switches:
           -> provider_switch (model changed)
@@ -40,6 +44,12 @@ class HookEvent(str, Enum):
 
     # --- Input processing ---
     INPUT_RECEIVED = "input_received"
+
+    # --- Agent/orchestration lifecycle ---
+    AGENT_START = "agent_start"
+    AGENT_END = "agent_end"
+    WORKFLOW_START = "workflow_start"
+    WORKFLOW_END = "workflow_end"
 
     # --- Provider request lifecycle ---
     BEFORE_ASK = "before_ask"

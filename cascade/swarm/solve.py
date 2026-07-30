@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from ..providers.usage import Usage
+from ..runtime import portable_python_command
 from .lifecycle import (
     CancellationToken,
     RunCancelled,
@@ -247,7 +248,7 @@ def _test_command(app, root: Optional[Path] = None) -> str:
     """
     project = _project_verify_test(str(root) if root else None)
     if project:
-        return project
+        return portable_python_command(project)
 
     try:
         configured = (
@@ -265,9 +266,9 @@ def _test_command(app, root: Optional[Path] = None) -> str:
         eco_c = _command_ecosystem(configured)
         eco_d = _command_ecosystem(detected) if detected else ""
         if detected and eco_c and eco_d and eco_c != eco_d:
-            return detected
-        return configured
-    return detected or DEFAULT_TEST_CMD
+            return portable_python_command(detected)
+        return portable_python_command(configured)
+    return portable_python_command(detected or DEFAULT_TEST_CMD)
 
 
 # --- Anti-proxy verification classifier -----------------------------------------

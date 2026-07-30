@@ -4,8 +4,6 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
-
 from cascade.commands import CommandHandler
 from cascade.swarm.worktree import WorktreeManager
 

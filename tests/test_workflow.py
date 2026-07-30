@@ -1,5 +1,7 @@
 """Tests for workflow definitions and runner."""
 
+from types import SimpleNamespace
+
 import pytest
 from cascade.agents.schema import AgentDef
 from cascade.agents.workflow import (
@@ -8,6 +10,7 @@ from cascade.agents.workflow import (
     WorkflowRunner,
     load_workflows_from_dict,
 )
+from cascade.hooks import HookContext, HookDefinition, HookEvent, HookResult, HookRunner
 
 
 class TestWorkflowStep:
@@ -148,7 +151,7 @@ class TestWorkflowRunner:
         assert result == "review output"
         assert len(log) == 2
         assert log[1]["prompt"] == "Review:\nplan output"
-        assert log[1]["extra_context"] == "plan output"
+        assert log[1]["extra_context"] is None
         assert "[Plan]" in printed[0]
         assert "[Review]" in printed[1]
 
@@ -161,3 +164,64 @@ class TestWorkflowRunner:
         wr = WorkflowRunner(runner, agents)
         with pytest.raises(RuntimeError, match="unknown agent"):
             wr.run(wf, "go")
+
+    def test_lifecycle_hooks_can_transform_workflow_boundaries(self):
+        events = []
+
+        def on_start(ctx: HookContext):
+            events.append((ctx.event, ctx.workflow, ctx.prompt))
+            return HookResult(transformed_value="rewritten")
+
+        def on_end(ctx: HookContext):
+            events.append((ctx.event, ctx.workflow, ctx.response))
+            return HookResult(transformed_value=ctx.response + " checked")
+
+        hooks = HookRunner(hooks=(
+            HookDefinition(
+                name="start",
+                event=HookEvent.WORKFLOW_START,
+                handler=on_start,
+            ),
+            HookDefinition(
+                name="end",
+                event=HookEvent.WORKFLOW_END,
+                handler=on_end,
+            ),
+        ))
+        runner, agents, log = self._make_runner(["answer"])
+        runner._app = SimpleNamespace(hook_runner=hooks)
+        workflow = WorkflowDef(
+            name="review",
+            steps=(WorkflowStep(agent="planner"),),
+        )
+
+        result = WorkflowRunner(runner, agents).run(workflow, "original")
+
+        assert log[0]["prompt"] == "rewritten"
+        assert result == "answer checked"
+        assert events == [
+            ("workflow_start", "review", "original"),
+            ("workflow_end", "review", "answer"),
+        ]
+
+    def test_workflow_failure_emits_error_hook(self):
+        seen = []
+        hooks = HookRunner(hooks=(
+            HookDefinition(
+                name="errors",
+                event=HookEvent.ON_ERROR,
+                handler=lambda ctx: seen.append((ctx.workflow, ctx.error)),
+            ),
+        ))
+        runner, agents, _ = self._make_runner([])
+        runner._app = SimpleNamespace(hook_runner=hooks)
+        workflow = WorkflowDef(
+            name="broken",
+            steps=(WorkflowStep(agent="missing"),),
+        )
+
+        with pytest.raises(RuntimeError, match="unknown agent"):
+            WorkflowRunner(runner, agents).run(workflow, "go")
+
+        assert seen and seen[0][0] == "broken"
+        assert "unknown agent" in seen[0][1]

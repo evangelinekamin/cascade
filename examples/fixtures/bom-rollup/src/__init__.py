@@ -1,0 +1,1 @@
+"""PCB BOM evaluation fixture."""

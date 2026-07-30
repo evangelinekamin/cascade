@@ -5,7 +5,7 @@ registered chords to their action names, and that the matching
 ``action_*`` methods exist on MainScreen so the chords are not no-ops.
 """
 
-from cascade.keybindings import ChordManager, ChordState
+from cascade.keybindings import ChordState
 from cascade.screens.main import MainScreen
 
 

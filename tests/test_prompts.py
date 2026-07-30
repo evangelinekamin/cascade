@@ -29,25 +29,30 @@ class TestDefaultPrompt:
 
     def test_quality_gates_present(self):
         prompt = build_default_prompt(include_design_language=False)
-        assert "Immutability" in prompt
-        assert "800 lines" in prompt
+        assert "established architecture" in prompt
+        assert "requested outcome" in prompt
         assert "hardcoded secrets" in prompt
 
     def test_workflow_present(self):
         prompt = build_default_prompt(include_design_language=False)
-        assert "TDD" in prompt
-        assert "RED" in prompt
-        assert "subtasks" in prompt
+        assert "definition of done" in prompt
+        assert "genuinely independent" in prompt
+        assert "Verify the actual result" in prompt
 
     def test_tool_use_section(self):
         prompt = build_default_prompt(include_design_language=False)
-        assert "reflect" in prompt.lower()
+        assert "repeat the same failed action" in prompt.lower()
         assert "proactively" in prompt.lower()
 
     def test_conventions_present(self):
         prompt = build_default_prompt(include_design_language=False)
-        assert "conventional commits" in prompt.lower()
+        assert "do not commit" in prompt.lower()
         assert "emojis" in prompt.lower()
+
+    def test_grounded_handoff_present(self):
+        prompt = build_default_prompt(include_design_language=False)
+        assert "remaining risk" in prompt
+        assert "do not invent busywork" in prompt
 
     def test_current_date_injected(self):
         prompt = build_default_prompt(

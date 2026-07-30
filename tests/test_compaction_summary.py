@@ -5,10 +5,7 @@ originals never destroyed, invalid summaries never injected, summaries never
 summarize themselves (previous summary merged as input), no-recap trailer.
 """
 
-import pytest
-
 from cascade.conversation import (
-    SUMMARY_MIN_CHARS,
     build_compaction_summary_prompt,
     state_messages_to_provider,
     summarize_for_compaction,

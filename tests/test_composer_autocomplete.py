@@ -5,6 +5,7 @@ from textual.app import App, ComposeResult
 
 from cascade.widgets.input_frame import InputFrame, ChatTextArea
 from cascade.widgets.autocomplete import AutocompleteDropdown
+from cascade.commands import get_matching_commands
 
 
 class _Harness(App):
@@ -17,6 +18,12 @@ class _Harness(App):
 
     def on_chat_text_area_submitted(self, event: ChatTextArea.Submitted) -> None:
         self.submitted.append(event.value)
+
+
+def test_empty_autocomplete_shows_only_memorable_everyday_commands():
+    names = {command.name for command in get_matching_commands("")}
+    assert {"status", "model", "context", "doctor", "export"} <= names
+    assert not {"pipeline", "fanout", "workflow", "compete"} & names
 
 
 @pytest.mark.asyncio

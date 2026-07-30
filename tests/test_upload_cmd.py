@@ -215,6 +215,7 @@ class TestConfigReloadCommand:
         cli_app.config = self._DummyConfig()
         cli_app._apply_detected_credentials = MagicMock()
         cli_app._build_prompt_pipeline = MagicMock(return_value="pipeline")
+        cli_app._build_permission_engine = MagicMock(return_value="permissions")
 
         def _init():
             cli_app.providers = {"new": MagicMock()}
@@ -236,6 +237,8 @@ class TestConfigReloadCommand:
 
         assert cli_app.credentials == ["cred"]
         cli_app._apply_detected_credentials.assert_called_once()
+        cli_app._build_permission_engine.assert_called_once()
+        assert cli_app.permission_engine == "permissions"
         cli_app._init_providers.assert_called_once()
         assert set(cli_app.providers.keys()) == {"new"}
         assert posted
@@ -252,13 +255,16 @@ class TestConfigReloadCommand:
         fresh_runner = MagicMock(name="fresh_runner")
         cli_app._build_hook_runner = MagicMock(return_value=fresh_runner)
         order = []
+        cli_app._build_permission_engine.side_effect = (
+            lambda: order.append("permissions") or "permissions"
+        )
         cli_app._build_hook_runner.side_effect = lambda: order.append("hooks") or fresh_runner
         cli_app._init_providers.side_effect = lambda: order.append("providers")
 
         handler._cmd_config(["reload"])
 
         assert cli_app.hook_runner is fresh_runner
-        assert order == ["hooks", "providers"]
+        assert order == ["permissions", "hooks", "providers"]
 
 
 class TestLoginCommand:

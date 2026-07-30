@@ -5,7 +5,6 @@ A Node project used to inherit the global python `pytest` default and die with
 manifests, and honors a global command only when it's the same ecosystem.
 """
 
-from pathlib import Path
 from types import SimpleNamespace
 
 from cascade.swarm.solve import (
@@ -14,6 +13,7 @@ from cascade.swarm.solve import (
     _project_verify_test,
     _test_command,
 )
+from cascade.runtime import portable_python_command
 
 
 def _app(test_cmd=""):
@@ -76,4 +76,24 @@ def test_project_cascade_yaml_wins(tmp_path):
 
 def test_unknown_project_falls_back_to_default(tmp_path):
     assert _detect_test_command(tmp_path) is None
-    assert _test_command(_app(), root=tmp_path) == DEFAULT_TEST_CMD
+    assert _test_command(_app(), root=tmp_path) == portable_python_command(
+        DEFAULT_TEST_CMD
+    )
+
+
+def test_missing_python_alias_uses_the_running_interpreter(tmp_path, monkeypatch):
+    monkeypatch.setattr("cascade.runtime.shutil.which", lambda _name: None)
+    (tmp_path / "pyproject.toml").write_text("[project]")
+    command = _test_command(_app("python -m pytest -x -q"), root=tmp_path)
+    assert command.endswith(" -m pytest -x -q")
+    assert not command.startswith("python ")
+
+
+def test_missing_python_alias_prefers_project_visible_python3(monkeypatch):
+    monkeypatch.setattr(
+        "cascade.runtime.shutil.which",
+        lambda name: "/usr/bin/python3" if name == "python3" else None,
+    )
+    assert portable_python_command("python -m pytest -q") == (
+        "/usr/bin/python3 -m pytest -q"
+    )

@@ -76,6 +76,10 @@ class CascadeTUI(App):
         self.state = CascadeState()
         self.db = HistoryDB()
         self.run_ledger = RunLedger(self.db.path)
+        if self.cli_app is not None:
+            # The routing layer lives on CascadeCore, while the durable journal
+            # belongs to the TUI. Share the read-only feedback/receipt handle.
+            self.cli_app.run_ledger = self.run_ledger
         self.recovered_run_count = self.run_ledger.mark_interrupted()
         self._db_session: dict | None = None
         self._branching_session: BranchingSession | None = None
@@ -383,7 +387,8 @@ class CascadeTUI(App):
         if self._db_session is None:
             return
         try:
-            chat_roles = lambda m: m.role != "system"
+            def chat_roles(message):
+                return message.role != "system"
             compacted_chat = [
                 m for m in self.state.messages
                 if m.metadata.get("compacted") and chat_roles(m)

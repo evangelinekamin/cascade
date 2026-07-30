@@ -1,7 +1,5 @@
 """ChatTextArea multiline composer: submit, newline, history, value compat."""
 
-import pytest
-
 from cascade.widgets.input_frame import ChatTextArea
 
 

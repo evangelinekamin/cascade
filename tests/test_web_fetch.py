@@ -3,7 +3,7 @@
 import httpx
 import pytest
 
-from cascade.tools.permissions import PermissionEngine
+from cascade.tools.permissions import PermissionEngine, ReviewDecision
 from cascade.tools.schema import callable_to_tool_def
 from cascade.web import url_safety
 from cascade.web.fetch import fetch_url
@@ -57,6 +57,22 @@ class TestSSRF:
 
 
 class TestFetchPipeline:
+    @pytest.fixture(autouse=True)
+    def _public_dns(self, monkeypatch):
+        monkeypatch.setattr(
+            url_safety.socket,
+            "getaddrinfo",
+            lambda *_args, **_kwargs: [
+                (
+                    url_safety.socket.AF_INET,
+                    url_safety.socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("93.184.216.34", 0),
+                )
+            ],
+        )
+
     def test_blocks_ssrf_before_network(self):
         result = fetch_url("http://169.254.169.254/")
         assert not result.ok
@@ -121,22 +137,24 @@ class TestFetchPermissions:
         assert v.decision == "allow"
         assert v.rule == "docs-allowlist"
 
-    def test_unknown_host_asks(self):
+    def test_unknown_host_requires_review(self):
         eng = self._engine()
         v = eng.evaluate(_fetch_tool(), "web_fetch", {"url": "https://random.example/x"})
-        assert v.decision == "ask"
+        assert v.decision == "review"
         assert v.rule == "network"
 
-    def test_always_grant_is_host_scoped(self):
+    def test_unknown_host_is_reviewed_each_time(self):
         eng = self._engine()
-        eng.ask_handler = lambda t, a, v: "always"
+        reviews = []
+        eng.review_handler = lambda review: (
+            reviews.append(review),
+            ReviewDecision(True, "public documentation"),
+        )[1]
         v1 = eng.resolve(_fetch_tool(), "web_fetch", {"url": "https://blog.example/post-1"})
         assert v1.decision == "allow"
-        # A different page on the same host is now covered without asking
-        eng.ask_handler = lambda *a: (_ for _ in ()).throw(AssertionError("asked again"))
-        v2 = eng.evaluate(_fetch_tool(), "web_fetch", {"url": "https://blog.example/post-2"})
+        v2 = eng.resolve(_fetch_tool(), "web_fetch", {"url": "https://blog.example/post-2"})
         assert v2.decision == "allow"
-        assert v2.rule == "session-grant"
+        assert len(reviews) == 2
 
     def test_domain_allow_rule(self):
         eng = self._engine(allow=("web_fetch(internal.corp)",))

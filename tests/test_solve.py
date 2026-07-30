@@ -16,6 +16,7 @@ from cascade.swarm.solve import (
     run_verified_task,
     worker_guidance_for,
 )
+from cascade.runtime import portable_python_command
 
 
 def _fake_app(test_cmd=None):
@@ -33,7 +34,7 @@ def test_test_command_prefers_config():
 
 
 def test_test_command_falls_back_to_default():
-    assert _test_command(_fake_app()) == DEFAULT_TEST_CMD
+    assert _test_command(_fake_app()) == portable_python_command(DEFAULT_TEST_CMD)
 
 
 def test_test_command_prefers_project_local_cascade_yml(tmp_path, monkeypatch):

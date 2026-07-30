@@ -551,6 +551,88 @@ class RunLedger:
             ).fetchone()
         return self._decode_run(row) if row is not None else None
 
+    def list_runs(
+        self,
+        *,
+        session_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return newest runs, optionally restricted to one session."""
+        safe_limit = max(1, min(int(limit), 1000))
+        with self._lock:
+            if session_id is None:
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM orchestration_runs
+                    ORDER BY created_at DESC LIMIT ?
+                    """,
+                    (safe_limit,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM orchestration_runs
+                    WHERE session_id = ?
+                    ORDER BY created_at DESC LIMIT ?
+                    """,
+                    (session_id, safe_limit),
+                ).fetchall()
+        return [self._decode_run(row) for row in rows]
+
+    def merge_metadata(self, run_id: str, patch: dict[str, Any]) -> None:
+        """Merge JSON metadata without discarding fields written by another phase."""
+        if not patch:
+            return
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT metadata FROM orchestration_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                metadata = json.loads(row["metadata"])
+            except (TypeError, json.JSONDecodeError):
+                metadata = {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata.update(patch)
+            self._conn.execute(
+                """
+                UPDATE orchestration_runs
+                SET metadata = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (json.dumps(metadata), _now(), run_id),
+            )
+            self._conn.commit()
+
+    def routing_summary(self, *, limit: int = 100) -> dict[str, dict[str, int]]:
+        """Aggregate recent terminal outcomes for weak routing tie-breakers."""
+        runs = self.list_runs(limit=limit)
+        summary: dict[str, dict[str, int]] = {}
+        terminal = {
+            RunStatus.SUCCEEDED.value,
+            RunStatus.PARTIAL.value,
+            RunStatus.FAILED.value,
+            RunStatus.BLOCKED.value,
+            RunStatus.CANCELLED.value,
+            RunStatus.INTERRUPTED.value,
+        }
+        for run in runs:
+            workflow = str(run.get("workflow") or "")
+            status = str(run.get("status") or "")
+            if not workflow or workflow == "routing" or status not in terminal:
+                continue
+            bucket = summary.setdefault(
+                workflow, {"runs": 0, "succeeded": 0, "failed": 0}
+            )
+            bucket["runs"] += 1
+            if status == RunStatus.SUCCEEDED.value:
+                bucket["succeeded"] += 1
+            elif status != RunStatus.PARTIAL.value:
+                bucket["failed"] += 1
+        return summary
+
     def list_tasks(self, run_id: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
@@ -700,6 +782,14 @@ class RunContext:
         if self.ledger is not None and cost:
             self.ledger.add_cost(self.id, cost)
 
+    def annotate(self, **metadata: Any) -> None:
+        """Attach explainability/receipt fields to this run."""
+        if self.ledger is not None:
+            self.ledger.merge_metadata(
+                self.id,
+                {key: value for key, value in metadata.items() if value is not None},
+            )
+
     def cancel(self, reason: str = "cancelled by user") -> bool:
         first = self.token.cancel(reason)
         with self._lock:
@@ -732,8 +822,9 @@ class RunContext:
                     "status": _OUTCOME_TO_STATUS[outcome],
                     "finished_at": _now(),
                     "error": error,
-                    "metadata": metadata,
                 }
+                if metadata:
+                    self.ledger.merge_metadata(self.id, metadata)
                 if worktree_path:
                     fields["worktree_path"] = worktree_path
                 if input_tokens is not None:

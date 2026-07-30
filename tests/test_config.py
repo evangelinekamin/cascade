@@ -387,6 +387,47 @@ def test_memory_config_invalid_values_are_sanitized():
         assert "summary_provider" not in cfg
 
 
+def test_permission_config_defaults_to_popup_free_auto():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = ConfigManager(str(Path(tmpdir) / "config.yaml"))
+
+        cfg = manager.get_permissions_config()
+
+        assert cfg["posture"] == "auto"
+        assert cfg["reviewer"] == {
+            "enabled": True,
+            "provider": "",
+            "model": "",
+            "timeout": 10.0,
+        }
+
+
+def test_permission_config_accepts_yolo_and_sanitizes_reviewer():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        manager = ConfigManager(str(Path(tmpdir) / "config.yaml"))
+        manager.data["permissions"] = {
+            "posture": "YOLO",
+            "allow": "not-a-list",
+            "reviewer": {
+                "enabled": 0,
+                "provider": 123,
+                "model": None,
+                "timeout": 999,
+            },
+        }
+
+        cfg = manager.get_permissions_config()
+
+        assert cfg["posture"] == "yolo"
+        assert cfg["allow"] == []
+        assert cfg["reviewer"] == {
+            "enabled": False,
+            "provider": "123",
+            "model": "",
+            "timeout": 60.0,
+        }
+
+
 def test_orchestration_defaults_use_cerebras_through_openrouter():
     with tempfile.TemporaryDirectory() as tmpdir:
         manager = ConfigManager(str(Path(tmpdir) / "config.yaml"))

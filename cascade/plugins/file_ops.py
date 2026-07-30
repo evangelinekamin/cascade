@@ -7,20 +7,19 @@ from typing import Any
 
 from .base import BasePlugin
 from .registry import register_plugin
+from ..runtime import user_cache_path
 
 # A single read must not flood the context. Bound the default read the way the
 # exec/web tools bound theirs, spilling the full file so nothing is lost.
 _MAX_READ_LINES = 2000
 _MAX_READ_CHARS = 50_000
-_READ_ARTIFACT_DIR = Path.home() / ".cache" / "cascade" / "file-reads"
-
-
 def _spill_read(path: str, text: str) -> str:
     """Write the full file to the artifact dir; return its path or ''."""
     try:
-        _READ_ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+        artifact_dir = user_cache_path("file-reads")
+        artifact_dir.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha1(f"{time.time_ns()}:{path}".encode()).hexdigest()[:10]
-        out = _READ_ARTIFACT_DIR / f"{digest}.txt"
+        out = artifact_dir / f"{digest}.txt"
         out.write_text(text, errors="replace")
         return str(out)
     except Exception:

@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 from cascade.agents.schema import AgentDef
 from cascade.agents.runner import AgentRunner
+from cascade.hooks import HookDefinition, HookEvent, HookResult, HookRunner
 from cascade.providers.base import ProviderConfig
 
 
@@ -57,6 +58,7 @@ def _make_app(
     app.providers = {provider_name: provider}
     app.config.get_default_provider.return_value = provider_name
     app.tool_registry = tools or {}
+    app.hook_runner = None
 
     # Real PromptPipeline for system prompt tests
     from cascade.prompts.layers import PromptPipeline
@@ -118,6 +120,7 @@ class TestAgentRunner:
         app.providers = {"gemini": prov}
         app.config.get_default_provider.return_value = "gemini"
         app.tool_registry = {}
+        app.hook_runner = None
         from cascade.prompts.layers import PromptPipeline
         app.prompt_pipeline = PromptPipeline()
         return app, prov
@@ -156,6 +159,17 @@ class TestAgentRunner:
         clone = _FakeProvider.instances[-1]
         assert clone.hook_runner is sentinel_hooks
         assert clone.permission_engine is sentinel_perms
+
+    def test_max_tokens_override_uses_clone(self):
+        app, prov = self._fake_app()
+        runner = AgentRunner(app)
+
+        runner.run(AgentDef(name="test", max_tokens=8192), "hello")
+
+        clone = _FakeProvider.instances[-1]
+        assert clone is not prov
+        assert clone.config.max_tokens == 8192
+        assert prov.config.max_tokens is None
 
     def test_provider_exception_propagates(self):
         app, prov = self._fake_app(model="original")
@@ -207,6 +221,7 @@ class TestAgentRunner:
         app.providers = {"gemini": prov}
         app.config.get_default_provider.return_value = "gemini"
         app.tool_registry = {}
+        app.hook_runner = None
         from cascade.prompts.layers import PromptPipeline
         app.prompt_pipeline = PromptPipeline()
 
@@ -225,3 +240,66 @@ class TestAgentRunner:
         system = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("system")
         assert system is not None
         assert "You are a helpful agent." in system
+
+    def test_named_agent_lifecycle_hooks_transform_and_observe(self):
+        app, prov = _make_app()
+        seen = []
+
+        def start(ctx):
+            seen.append((ctx.event, ctx.agent_name, ctx.prompt))
+            return HookResult(transformed_value=ctx.prompt + " rewritten")
+
+        def after(ctx):
+            seen.append((ctx.event, ctx.agent_name, ctx.response))
+
+        def end(ctx):
+            seen.append((ctx.event, ctx.agent_name, ctx.response))
+            return HookResult(transformed_value=ctx.response + " polished")
+
+        app.hook_runner = HookRunner(hooks=(
+            HookDefinition(
+                name="start",
+                event=HookEvent.AGENT_START,
+                handler=start,
+            ),
+            HookDefinition(
+                name="after",
+                event=HookEvent.AFTER_RESPONSE,
+                handler=after,
+            ),
+            HookDefinition(
+                name="end",
+                event=HookEvent.AGENT_END,
+                handler=end,
+            ),
+        ))
+        prov.ask_single.side_effect = lambda prompt, _system=None: f"response:{prompt}"
+
+        result = AgentRunner(app).run(AgentDef(name="reviewer"), "inspect")
+
+        assert result == "response:inspect rewritten polished"
+        assert [event for event, _agent, _value in seen] == [
+            "agent_start",
+            "after_response",
+            "agent_end",
+        ]
+        assert all(agent == "reviewer" for _event, agent, _value in seen)
+
+    def test_named_agent_errors_emit_on_error(self):
+        app, prov = _make_app()
+        errors = []
+        app.hook_runner = HookRunner(hooks=(
+            HookDefinition(
+                name="errors",
+                event=HookEvent.ON_ERROR,
+                handler=lambda ctx: errors.append(
+                    (ctx.agent_name, ctx.workflow, ctx.error)
+                ),
+            ),
+        ))
+        prov.ask_single.side_effect = RuntimeError("agent exploded")
+
+        with pytest.raises(RuntimeError, match="agent exploded"):
+            AgentRunner(app).run(AgentDef(name="reviewer"), "inspect")
+
+        assert errors == [("reviewer", "agent", "agent exploded")]

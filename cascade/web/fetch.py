@@ -17,19 +17,18 @@ import hashlib
 import re
 import time
 from html.parser import HTMLParser
-from pathlib import Path
 from typing import Optional
 
 import httpx
 
 from .url_safety import (
     contains_secret,
-    is_safe_url,
     normalize_url,
     resolve_redirect,
     same_origin,
     url_safety_error,
 )
+from ..runtime import user_cache_path
 
 _MAX_BYTES = 10 * 1024 * 1024          # hard stream cap
 _MAX_REDIRECTS = 5
@@ -39,9 +38,6 @@ _USER_AGENT = "cascade-web-fetch/1.0"
 # Head+tail budget when returning to the model; the full text is on disk.
 _HEAD_CHARS = 6_000
 _TAIL_CHARS = 2_000
-
-_FETCH_DIR = Path.home() / ".cache" / "cascade" / "web-fetch"
-
 
 class _TextExtractor(HTMLParser):
     """Stdlib fallback: strip scripts/styles, keep visible text + link text."""
@@ -95,9 +91,10 @@ def _html_to_markdown(html: str, url: str) -> str:
 
 def _spill(url: str, text: str) -> Optional[str]:
     try:
-        _FETCH_DIR.mkdir(parents=True, exist_ok=True)
+        fetch_dir = user_cache_path("web-fetch")
+        fetch_dir.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha1(f"{time.time_ns()}:{url}".encode()).hexdigest()[:10]
-        path = _FETCH_DIR / f"{digest}.md"
+        path = fetch_dir / f"{digest}.md"
         path.write_text(f"<!-- {url} -->\n\n{text}", errors="replace")
         return str(path)
     except Exception:

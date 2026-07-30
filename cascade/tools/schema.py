@@ -5,8 +5,9 @@ that providers need for native function calling.
 """
 
 import inspect
+import types
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, get_type_hints
+from typing import Any, Callable, Literal, Optional, Union, get_args, get_origin, get_type_hints
 
 
 _TYPE_MAP = {
@@ -56,21 +57,35 @@ def _annotation_to_schema(annotation: Any) -> dict:
     if annotation is inspect.Parameter.empty or annotation is None:
         return {"type": "string"}
 
-    schema = _TYPE_MAP.get(annotation)
-    if schema:
-        return dict(schema)
+    base_schema = _TYPE_MAP.get(annotation)
+    if base_schema:
+        return dict(base_schema)
 
-    # Handle Optional[X] (Union[X, None])
-    origin = getattr(annotation, "__origin__", None)
-    args = getattr(annotation, "__args__", ())
+    origin = get_origin(annotation)
+    args = get_args(annotation)
 
-    if origin is type(None):
-        return {"type": "string"}
+    if origin is Literal:
+        values = list(args)
+        literal_schema: dict[str, Any] = {"enum": values}
+        if values and all(isinstance(value, str) for value in values):
+            literal_schema["type"] = "string"
+        elif values and all(isinstance(value, bool) for value in values):
+            literal_schema["type"] = "boolean"
+        elif values and all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in values
+        ):
+            literal_schema["type"] = "integer"
+        elif values and all(isinstance(value, (int, float)) for value in values):
+            literal_schema["type"] = "number"
+        return literal_schema
 
-    # typing.Optional[X] is Union[X, None]
-    if origin is not None and len(args) == 2 and type(None) in args:
-        inner = [a for a in args if a is not type(None)][0]
-        return _annotation_to_schema(inner)
+    # Optional[X] and general unions, including PEP 604's ``X | Y``.
+    if origin in (Union, types.UnionType):
+        non_null = [arg for arg in args if arg is not type(None)]
+        if len(non_null) == 1:
+            return _annotation_to_schema(non_null[0])
+        return {"anyOf": [_annotation_to_schema(arg) for arg in non_null]}
 
     # list[X]
     if origin is list and args:
@@ -140,6 +155,7 @@ def callable_to_tool_def(
     parameters = {
         "type": "object",
         "properties": properties,
+        "additionalProperties": False,
     }
     if required:
         parameters["required"] = required

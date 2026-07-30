@@ -85,6 +85,21 @@ def test_does_not_use_cli_proxy_for_standard_api_key():
     assert provider._use_cli_proxy is False
 
 
+def test_focused_workspace_respects_xdg_cache_home(tmp_path):
+    with patch.dict(
+        "os.environ",
+        {
+            "CASCADE_CODEX_WORKSPACE_ROOT": "",
+            "XDG_CACHE_HOME": str(tmp_path),
+        },
+        clear=False,
+    ):
+        root = OpenAIProvider._focused_workspace_root()
+
+    assert root == tmp_path / "cascade" / "codex-workspaces"
+    assert root.is_dir()
+
+
 def test_stream_cli_parses_agent_message_and_usage():
     """Codex JSONL output should yield assistant text and capture usage."""
 
@@ -209,6 +224,30 @@ def test_cli_proxy_keeps_repo_workspace_for_agentic_requests(tmp_path):
     assert "temporary focused workspace" not in captured["prompt"]
 
 
+def test_cli_permission_postures_force_no_prompt_policy():
+    from cascade.tools.permissions import PermissionEngine
+
+    with patch("cascade.providers.openai_provider.shutil.which", return_value="/usr/bin/codex"):
+        provider = OpenAIProvider(
+            ProviderConfig(api_key="eyJ.a.b", model="gpt-5.3-codex"),
+        )
+
+    provider.permission_engine = PermissionEngine(posture="auto")
+    auto = provider._build_cli_cmd("work", "/repo", "repo-write")
+    assert 'approval_policy="never"' in auto
+    assert "workspace-write" in auto
+
+    provider.permission_engine.posture = "safe"
+    safe = provider._build_cli_cmd("work", "/repo", "repo-write")
+    assert 'approval_policy="never"' in safe
+    assert "read-only" in safe
+
+    provider.permission_engine.posture = "yolo"
+    yolo = provider._build_cli_cmd("work", "/repo", "repo-write")
+    assert "--dangerously-bypass-approvals-and-sandbox" in yolo
+    assert 'approval_policy="never"' not in yolo
+
+
 def test_cli_proxy_reuses_codex_session_for_repeated_focused_workspace_requests(tmp_path):
     source_file = tmp_path / "frontend" / "src" / "lib" / "api.ts"
     source_file.parent.mkdir(parents=True)
@@ -316,7 +355,9 @@ def test_resume_prompt_keeps_full_replay_when_synthetic_context_present(tmp_path
             ProviderConfig(api_key="eyJ.a.b", model="gpt-5.3-codex"),
         )
 
-    provider._codex_sessions["focused:dummy:none"] = "thread-123"
+    provider._codex_sessions[
+        "focused:dummy:none:permissions=auto"
+    ] = "thread-123"
 
     @contextmanager
     def _fake_workspace(_messages, _system):

@@ -1,8 +1,6 @@
 """/init also initializes a git repo so /solve can branch worktrees."""
 
 import subprocess
-from pathlib import Path
-
 import pytest
 
 from cascade.agents.init import run_init, _ensure_git_repo
@@ -38,7 +36,7 @@ def test_ensure_git_repo_is_idempotent(tmp_path):
 
 
 def test_ensure_git_repo_empty_dir_gets_empty_commit(tmp_path):
-    lines = _ensure_git_repo(tmp_path)
+    _ensure_git_repo(tmp_path)
     assert (tmp_path / ".git").is_dir()
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True,

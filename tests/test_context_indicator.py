@@ -175,7 +175,6 @@ class TestSummaryBreaker:
         assert screen._summary_failures == 0
 
     def test_success_resets_failure_count_and_uses_fast_model(self):
-        seen = {}
         screen = self._screen()
 
         def ok(prompt):

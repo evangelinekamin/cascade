@@ -137,7 +137,28 @@ class GeminiProvider(BaseProvider):
             os.getenv("CASCADE_GEMINI_ACTIVITY", default_activity).lower()
             not in ("0", "false", "no", "off")
         )
+        self._cli_help_text: Optional[str] = None
         self._approval_mode_supported: Optional[bool] = None
+        self._skip_trust_supported: Optional[bool] = None
+
+    def _cli_help(self) -> str:
+        """Load Gemini CLI capability text once per provider instance."""
+        if self._cli_help_text is not None:
+            return self._cli_help_text
+        help_text = "--approval-mode --skip-trust"
+        if self._gemini_bin:
+            try:
+                import subprocess
+
+                out = subprocess.run(
+                    [self._gemini_bin, "--help"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                help_text = out.stdout + out.stderr
+            except Exception:
+                pass
+        self._cli_help_text = help_text
+        return help_text
 
     def _supports_approval_mode(self) -> bool:
         """Whether this gemini CLI advertises --approval-mode (version-gated).
@@ -148,19 +169,16 @@ class GeminiProvider(BaseProvider):
         """
         if self._approval_mode_supported is not None:
             return self._approval_mode_supported
-        supported = True
-        if self._gemini_bin:
-            try:
-                import subprocess
-
-                out = subprocess.run(
-                    [self._gemini_bin, "--help"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                supported = "--approval-mode" in (out.stdout + out.stderr)
-            except Exception:
-                supported = True
+        supported = "--approval-mode" in self._cli_help()
         self._approval_mode_supported = supported
+        return supported
+
+    def _supports_skip_trust(self) -> bool:
+        """Whether this Gemini build can suppress workspace-trust UI."""
+        if self._skip_trust_supported is not None:
+            return self._skip_trust_supported
+        supported = "--skip-trust" in self._cli_help()
+        self._skip_trust_supported = supported
         return supported
 
     def get_fallback_model(self) -> Optional[str]:
@@ -207,17 +225,18 @@ class GeminiProvider(BaseProvider):
             if condensed:
                 full_prompt = f"System instructions:\n{condensed}\n\n{full_prompt}"
 
-        # Non-interactive gemini CLI previously ran with NO approval flag,
-        # leaving its tools in default-deny limbo. Map the posture: auto
-        # gets yolo; safe and readonly get the prompting default (which,
-        # non-interactively, means tools requiring approval are declined).
+        # `-p` must never fall back to an approval dialog. Gemini does not
+        # expose a Claude-style model classifier, so auto uses its sandboxed
+        # yolo lane; safe auto-approves edits but denies any remaining
+        # non-interactive confirmation; readonly is plan mode.
         posture = getattr(
             getattr(self, "permission_engine", None), "posture", "auto",
         )
         approval = {
             "auto": "yolo",
-            "safe": "default",
-            "readonly": "default",
+            "yolo": "yolo",
+            "safe": "auto_edit",
+            "readonly": "plan",
         }.get(posture, "yolo")
         cmd = [
             self._gemini_bin, "-p", full_prompt,
@@ -225,8 +244,14 @@ class GeminiProvider(BaseProvider):
         ]
         # --approval-mode is version-gated; only pass it when this gemini
         # build advertises it, so an older CLI is not broken outright.
-        if approval != "default" and self._supports_approval_mode():
+        if self._supports_approval_mode():
             cmd.extend(["--approval-mode", approval])
+        if posture == "auto":
+            # Current Gemini also enables a sandbox implicitly for yolo, but
+            # keep Cascade's auto boundary explicit and stable across versions.
+            cmd.append("--sandbox")
+        if self._supports_skip_trust():
+            cmd.append("--skip-trust")
         cmd.extend(["--include-directories", workdir])
         if self.config.model:
             cmd.extend(["--model", self.config.model])
@@ -327,13 +352,21 @@ class GeminiProvider(BaseProvider):
         self._last_usage = None
         self._last_round_usage = None
 
-        from ..tools.executor import ToolExecutor
-        from ..tools.permissions import PermissionAbort
+        from ..tools.executor import ConcurrentToolExecutor
+        from ..tools.permissions import (
+            PermissionAbort,
+            permission_context_from_messages,
+        )
 
-        executor = ToolExecutor(
+        executor = ConcurrentToolExecutor(
             tools,
             hook_runner=self.hook_runner,
             permissions=self.permission_engine,
+            permission_context=permission_context_from_messages(
+                messages,
+                provider="gemini",
+                model=self.config.model,
+            ),
         )
 
         # Build Gemini function declarations
@@ -433,6 +466,84 @@ class GeminiProvider(BaseProvider):
             # its index is the current length. Reads dedup against it so an
             # elision of that entry can later invalidate them.
             response_index = len(contents)
+
+            batch_calls = [
+                (fc["name"], fc.get("args", {}))
+                for fc in function_calls
+            ]
+            batch_keys = [
+                _read_dedup_key(tool_name, tool_args)
+                for tool_name, tool_args in batch_calls
+            ]
+            concrete_keys = [key for key in batch_keys if key is not None]
+            can_batch = (
+                len(batch_calls) > 1
+                and all(
+                    (tool := executor.get_tool(tool_name)) is not None
+                    and tool.concurrency_safe
+                    for tool_name, _tool_args in batch_calls
+                )
+                and not any(key in seen_reads for key in concrete_keys)
+                and len(concrete_keys) == len(set(concrete_keys))
+            )
+            if can_batch:
+                for tool_name, tool_args in batch_calls:
+                    if on_tool_event:
+                        on_tool_event(ToolEvent(
+                            kind="tool_start",
+                            tool_name=tool_name,
+                            round_num=round_num,
+                            max_rounds=max_rounds,
+                            tool_input=tool_args,
+                        ))
+                try:
+                    batch_results = executor.execute_batch(batch_calls)
+                except PermissionAbort as exc:
+                    return (
+                        "".join(text_parts) + f"\n\n[stopped: {exc}]"
+                    ).strip(), tool_log
+
+                response_parts = []
+                for fc, tool_args, dedup_key, result in zip(
+                    function_calls,
+                    (call[1] for call in batch_calls),
+                    batch_keys,
+                    batch_results,
+                ):
+                    self.raise_if_cancelled()
+                    tool_name = fc["name"]
+                    if dedup_key is not None:
+                        seen_reads[dedup_key] = response_index
+                    else:
+                        edited = _invalidates_read(tool_name, tool_args)
+                        if edited is not None and seen_reads:
+                            seen_reads = {
+                                key: idx
+                                for key, idx in seen_reads.items()
+                                if key[1] != edited
+                            }
+                    tool_log.append({
+                        "tool": tool_name,
+                        "input": tool_args,
+                        "output": result,
+                    })
+                    if on_tool_event:
+                        on_tool_event(ToolEvent(
+                            kind="tool_done",
+                            tool_name=tool_name,
+                            round_num=round_num,
+                            max_rounds=max_rounds,
+                            tool_input=tool_args,
+                            tool_output=result,
+                        ))
+                    response_parts.append({
+                        "functionResponse": {
+                            "name": tool_name,
+                            "response": {"result": result},
+                        }
+                    })
+                contents.append({"role": "user", "parts": response_parts})
+                continue
 
             # Execute each function call
             response_parts = []

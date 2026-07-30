@@ -6,6 +6,8 @@ tool definitions and handle tool_use/tool_result round trips.
 
 import itertools
 import json
+import threading
+import time
 from unittest.mock import patch, MagicMock
 
 import httpx
@@ -23,6 +25,35 @@ def _make_tools():
 
     return {
         "echo": callable_to_tool_def("echo", echo, "Echo tool"),
+    }
+
+
+class _ParallelProbe:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def read(self, tag: str) -> str:
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(0.04)
+            return tag
+        finally:
+            with self.lock:
+                self.active -= 1
+
+
+def _make_parallel_tools(probe: _ParallelProbe):
+    return {
+        "read_item": callable_to_tool_def(
+            "read_item",
+            probe.read,
+            "Read one independent item.",
+            read_only=True,
+        ),
     }
 
 
@@ -183,6 +214,51 @@ class TestClaudeToolCalling:
         assert log[0]["tool"] == "echo"
         assert log[0]["input"] == {"message": "hello"}
 
+    def test_independent_tool_uses_execute_in_parallel(self):
+        from cascade.providers.claude import ClaudeProvider
+
+        prov = ClaudeProvider(_make_config())
+        probe = _ParallelProbe()
+        tool_response = MagicMock()
+        tool_response.json.return_value = {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "a",
+                    "name": "read_item",
+                    "input": {"tag": "one"},
+                },
+                {
+                    "type": "tool_use",
+                    "id": "b",
+                    "name": "read_item",
+                    "input": {"tag": "two"},
+                },
+            ],
+            "stop_reason": "tool_use",
+        }
+        tool_response.raise_for_status = MagicMock()
+        final_response = MagicMock()
+        final_response.json.return_value = {
+            "content": [{"type": "text", "text": "done"}],
+            "stop_reason": "end_turn",
+        }
+        final_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            prov.client,
+            "post",
+            side_effect=[tool_response, final_response],
+        ):
+            result, log = prov.ask_with_tools(
+                _msgs("read both"),
+                _make_parallel_tools(probe),
+            )
+
+        assert result == "done"
+        assert [entry["input"]["tag"] for entry in log] == ["one", "two"]
+        assert probe.max_active >= 2
+
 
 class TestGeminiToolCalling:
     """Test Gemini provider tool-calling format."""
@@ -259,6 +335,49 @@ class TestGeminiToolCalling:
         assert len(log) == 1
         assert log[0]["tool"] == "echo"
 
+    def test_independent_function_calls_execute_in_parallel(self):
+        from cascade.providers.gemini import GeminiProvider
+
+        prov = GeminiProvider(_make_config())
+        probe = _ParallelProbe()
+        call_response = MagicMock()
+        call_response.json.return_value = {
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"functionCall": {
+                            "name": "read_item",
+                            "args": {"tag": "one"},
+                        }},
+                        {"functionCall": {
+                            "name": "read_item",
+                            "args": {"tag": "two"},
+                        }},
+                    ],
+                },
+            }],
+        }
+        call_response.raise_for_status = MagicMock()
+        final_response = MagicMock()
+        final_response.json.return_value = {
+            "candidates": [{"content": {"parts": [{"text": "done"}]}}],
+        }
+        final_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            prov.client,
+            "post",
+            side_effect=[call_response, final_response],
+        ):
+            result, log = prov.ask_with_tools(
+                _msgs("read both"),
+                _make_parallel_tools(probe),
+            )
+
+        assert result == "done"
+        assert [entry["input"]["tag"] for entry in log] == ["one", "two"]
+        assert probe.max_active >= 2
+
 
 class TestOpenAIToolCalling:
     """Test OpenAI provider tool-calling format."""
@@ -293,6 +412,54 @@ class TestOpenAIToolCalling:
 
         assert result == "OK"
         assert prov.last_usage == Usage(input=7, output=2)
+
+    def test_independent_tool_calls_execute_in_parallel(self):
+        from cascade.providers.openai_provider import OpenAIProvider
+
+        prov = OpenAIProvider(_make_config())
+        probe = _ParallelProbe()
+        tool_response = MagicMock()
+        tool_response.json.return_value = {
+            "usage": {"prompt_tokens": 2, "completion_tokens": 2},
+            "choices": [{
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "a",
+                            "function": {
+                                "name": "read_item",
+                                "arguments": '{"tag":"one"}',
+                            },
+                        },
+                        {
+                            "id": "b",
+                            "function": {
+                                "name": "read_item",
+                                "arguments": '{"tag":"two"}',
+                            },
+                        },
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+        tool_response.raise_for_status = MagicMock()
+        final_response = _text_response("done")
+
+        with patch.object(
+            prov.client,
+            "post",
+            side_effect=[tool_response, final_response],
+        ):
+            result, log = prov.ask_with_tools(
+                _msgs("read both"),
+                _make_parallel_tools(probe),
+            )
+
+        assert result == "done"
+        assert [entry["input"]["tag"] for entry in log] == ["one", "two"]
+        assert probe.max_active >= 2
 
 
 class TestToolLoopExhaustion:

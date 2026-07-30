@@ -247,6 +247,44 @@ def _repair_json(raw: str) -> Optional[dict]:
     return value if isinstance(value, dict) else None
 
 
+def _parallel_call_records(tool_calls, executor, seen_reads, doom_sig):
+    """Decode a round that is safe to execute as one concurrent batch.
+
+    Any malformed, repeated, de-duplicated, unknown, or unsafe call falls back
+    to the established sequential path, which preserves its richer recovery
+    and loop-guard behavior.
+    """
+    if len(tool_calls) < 2:
+        return None
+    records = []
+    batch_keys = set()
+    signatures = set()
+    for tool_call in tool_calls:
+        function = tool_call.get("function", {})
+        tool_name = function.get("name", "")
+        raw_args = function.get("arguments", "") or "{}"
+        try:
+            tool_args = json.loads(raw_args)
+        except json.JSONDecodeError:
+            tool_args = _repair_json(raw_args)
+        if not isinstance(tool_args, dict):
+            return None
+        tool = executor.get_tool(tool_name)
+        if tool is None or not tool.concurrency_safe:
+            return None
+        signature = (tool_name, json.dumps(tool_args, sort_keys=True, default=str))
+        if signature == doom_sig or signature in signatures:
+            return None
+        signatures.add(signature)
+        dedup_key = _read_dedup_key(tool_name, tool_args)
+        if dedup_key is not None:
+            if dedup_key in seen_reads or dedup_key in batch_keys:
+                return None
+            batch_keys.add(dedup_key)
+        records.append((tool_call, tool_name, tool_args, dedup_key, signature))
+    return records
+
+
 def _edit_run_target(tool_name: str, tool_args: dict) -> Optional[tuple[str, str]]:
     """Classify a call for the edit-run cycle guard.
 
@@ -355,9 +393,19 @@ def openai_ask_with_tools(
     Returns:
         Tuple of (final_text_response, tool_calls_log).
     """
-    from ..tools.executor import ToolExecutor
+    from ..tools.executor import ConcurrentToolExecutor
+    from ..tools.permissions import permission_context_from_messages
 
-    executor = ToolExecutor(tools, hook_runner=hook_runner, permissions=permissions)
+    executor = ConcurrentToolExecutor(
+        tools,
+        hook_runner=hook_runner,
+        permissions=permissions,
+        permission_context=permission_context_from_messages(
+            messages,
+            provider="openai-compatible",
+            model=model,
+        ),
+    )
 
     # Build OpenAI tool definitions
     tool_defs = [
@@ -503,8 +551,6 @@ def openai_ask_with_tools(
             raise RuntimeError(_api_error_text(choice_error))
 
         message = choices[0].get("message", {})
-        finish_reason = choices[0].get("finish_reason", "stop")
-
         tool_calls = message.get("tool_calls", [])
         content = message.get("content", "") or ""
 
@@ -544,6 +590,77 @@ def openai_ask_with_tools(
 
         # Append the assistant message (must include tool_calls)
         api_messages.append(message)
+
+        parallel_records = _parallel_call_records(
+            tool_calls, executor, seen_reads, doom_sig,
+        )
+        if parallel_records is not None:
+            batch_calls = []
+            for _tc, tool_name, tool_args, _dedup_key, signature in parallel_records:
+                doom_streak, doom_sig = 0, signature
+                target = _edit_run_target(tool_name, tool_args)
+                if target is not None:
+                    kind, key = target
+                    counts = edit_counts if kind == "edit" else run_counts
+                    counts[key] = counts.get(key, 0) + 1
+                    stuck_file = _hottest_over(edit_counts, _EDIT_RUN_THRESHOLD)
+                    if stuck_file and _hottest_over(run_counts, _EDIT_RUN_THRESHOLD):
+                        _finalize_usage()
+                        note = (
+                            f"[stalled: edit-run cycle on {stuck_file} without "
+                            f"progress -- handing off.]"
+                        )
+                        return (content if content.strip() else note), tool_log
+                if on_tool_event:
+                    on_tool_event(ToolEvent(
+                        kind="tool_start",
+                        tool_name=tool_name,
+                        round_num=round_num,
+                        max_rounds=max_rounds,
+                        tool_input=tool_args,
+                    ))
+                batch_calls.append((tool_name, tool_args))
+
+            try:
+                batch_results = executor.execute_batch(batch_calls)
+            except PermissionAbort as exc:
+                _finalize_usage()
+                note = f"\n\n[stopped: {exc}]"
+                return (content + note).strip(), tool_log
+
+            for record, result in zip(parallel_records, batch_results):
+                tool_call, tool_name, tool_args, dedup_key, _signature = record
+                _checkpoint()
+                if dedup_key is not None:
+                    seen_reads[dedup_key] = tool_call["id"]
+                else:
+                    edited = _invalidates_read(tool_name, tool_args)
+                    if edited is not None and seen_reads:
+                        seen_reads = {
+                            key: call_id
+                            for key, call_id in seen_reads.items()
+                            if key[1] != edited
+                        }
+                tool_log.append({
+                    "tool": tool_name,
+                    "input": tool_args,
+                    "output": result,
+                })
+                if on_tool_event:
+                    on_tool_event(ToolEvent(
+                        kind="tool_done",
+                        tool_name=tool_name,
+                        round_num=round_num,
+                        max_rounds=max_rounds,
+                        tool_input=tool_args,
+                        tool_output=result,
+                    ))
+                api_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": result,
+                })
+            continue
 
         # Execute each tool call
         for tc in tool_calls:

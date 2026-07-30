@@ -184,7 +184,10 @@ def test_list_sessions_for_cwd_newest_first(db):
 
 def test_relative_time_buckets():
     now = datetime(2026, 7, 24, 12, 0, 0, tzinfo=timezone.utc)
-    mk = lambda **kw: (now - timedelta(**kw)).isoformat()
+
+    def mk(**kw):
+        return (now - timedelta(**kw)).isoformat()
+
     assert _relative_time(mk(seconds=5), now) == "just now"
     assert _relative_time(mk(minutes=3), now) == "3m ago"
     assert _relative_time(mk(hours=5), now) == "5h ago"

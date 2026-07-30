@@ -1,7 +1,8 @@
 """Tests for MainScreen helper behavior."""
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from cascade.hooks import HookResult
 from cascade.screens.main import MainScreen, summarize_user_prompt
 from cascade.swarm.lifecycle import RunContext
 
@@ -67,6 +68,39 @@ def test_terminal_run_dispatch_releases_only_the_matching_active_run():
 
     assert seen == ["done"]
     assert screen._active_run is None
+
+
+def test_input_hook_completion_dispatches_transformed_prompt():
+    screen = MainScreen()
+    screen._input_hook_pending = True
+    screen._dispatch_ready_prompt = MagicMock()
+
+    screen._finish_input_hook(
+        "original",
+        HookResult(transformed_value="rewritten"),
+        "",
+    )
+
+    assert screen._input_hook_pending is False
+    screen._dispatch_ready_prompt.assert_called_once_with("rewritten")
+
+
+def test_input_hook_completion_releases_queue_after_block():
+    screen = MainScreen()
+    screen._input_hook_pending = True
+    screen._post_system_message = MagicMock()
+    screen._set_input_locked = MagicMock()
+    screen._dispatch_ready_prompt = MagicMock()
+
+    screen._finish_input_hook(
+        "original",
+        HookResult(block=True, reason="policy"),
+        "",
+    )
+
+    screen._dispatch_ready_prompt.assert_not_called()
+    screen._set_input_locked.assert_called_once_with(False)
+    assert "policy" in screen._post_system_message.call_args.args[0]
 
 
 # -- Ctrl+C interrupt / clear-input / confirm-exit state machine --------------

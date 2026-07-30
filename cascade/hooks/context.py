@@ -35,8 +35,11 @@ class HookContext:
     event: str
     provider: str = ""
     mode: str = ""
+    agent_name: str = ""
+    workflow: str = ""
     prompt: str = ""
     response: str = ""
+    error: str = ""
     messages: tuple[dict, ...] = ()
     system_prompt: str = ""
     tool_name: str = ""
@@ -46,6 +49,33 @@ class HookContext:
     episode_id: str = ""
     session_id: str = ""
     metadata: tuple = ()  # tuple of (key, value) pairs
+
+    def to_payload(self) -> dict[str, Any]:
+        """Return the structured JSON payload supplied to subprocess hooks.
+
+        Unlike environment variables, stdin can safely carry full prompt, tool,
+        and response content without shell interpolation.  The payload mirrors
+        the Python hook context so either hook type can make the same decision.
+        """
+        return {
+            "event": self.event,
+            "provider": self.provider,
+            "mode": self.mode,
+            "agent_name": self.agent_name,
+            "workflow": self.workflow,
+            "prompt": self.prompt,
+            "response": self.response,
+            "error": self.error,
+            "messages": [dict(message) for message in self.messages],
+            "system_prompt": self.system_prompt,
+            "tool_name": self.tool_name,
+            "tool_input": dict(self.tool_input),
+            "tool_output": self.tool_output,
+            "tool_log": [dict(entry) for entry in self.tool_log],
+            "episode_id": self.episode_id,
+            "session_id": self.session_id,
+            "metadata": dict(self.metadata),
+        }
 
     def to_env_dict(self) -> dict[str, str]:
         """Convert to CASCADE_* environment variables for shell hooks.
@@ -58,11 +88,17 @@ class HookContext:
             env["CASCADE_PROVIDER"] = self.provider
         if self.mode:
             env["CASCADE_MODE"] = self.mode
+        if self.agent_name:
+            env["CASCADE_AGENT"] = self.agent_name
+        if self.workflow:
+            env["CASCADE_WORKFLOW"] = self.workflow
         if self.prompt:
             # Only pass length, not content (avoids shell injection surface)
             env["CASCADE_PROMPT_LENGTH"] = str(len(self.prompt))
         if self.response:
             env["CASCADE_RESPONSE_LENGTH"] = str(len(self.response))
+        if self.error:
+            env["CASCADE_ERROR_LENGTH"] = str(len(self.error))
         if self.tool_name:
             env["CASCADE_TOOL_NAME"] = self.tool_name
         if self.tool_log:

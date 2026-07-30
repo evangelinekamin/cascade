@@ -1,7 +1,5 @@
 """read_file is bounded + pageable so one read can't flood the context."""
 
-from pathlib import Path
-
 from cascade.plugins.file_ops import (
     FileOpsPlugin,
     _MAX_READ_LINES,
@@ -21,7 +19,7 @@ def test_large_file_truncated_with_spill_notice(tmp_path):
     out = FileOpsPlugin.read_file(str(p))
     assert "line 0" in out                 # head kept
     assert "line 4999" not in out          # tail dropped
-    assert f"of 5000" in out               # total reported
+    assert "of 5000" in out                # total reported
     assert "offset/limit" in out           # paging hint present
     # The full file was spilled and is recoverable.
     assert "file-reads" in out

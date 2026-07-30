@@ -87,7 +87,7 @@ def _timeline_marker(ts: float, prev_ts: float, force: bool) -> str:
 if TYPE_CHECKING:
     from .providers.usage import Usage
     from .state import ChatMessage
-    from .providers.base import BaseProvider, Message
+    from .providers.base import Message
 
 
 def _injectable_episodes(
@@ -654,38 +654,3 @@ def compact_messages_with_episodes(
         if not msg.metadata.get("compacted")
     ]
     return compact_to_episodes(active_messages, keep_recent=keep_recent)
-
-
-def compact_messages(
-    messages: list["Message"],
-    provider: "BaseProvider",
-    keep_recent: int = 6,
-) -> list["Message"]:
-    """Legacy compaction: summarize older messages via model call.
-
-    Kept as fallback when episode-based compaction is not available.
-    Prefer compact_messages_with_episodes() for new code.
-    """
-    if len(messages) <= keep_recent:
-        return list(messages)
-
-    old_messages = messages[:-keep_recent]
-    recent_messages = messages[-keep_recent:]
-
-    transcript = "\n".join(
-        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m.get('content', '')[:1000]}"
-        for m in old_messages
-    )
-
-    summary = provider.ask_single(
-        "Summarize this conversation for continuation. Be concise but preserve "
-        "key decisions, file paths, code changes, and open tasks:\n\n" + transcript,
-        system="You produce compact engineering handoff summaries. Under 800 words.",
-    )
-
-    compacted: list[dict] = [
-        {"role": "user", "content": f"[Conversation summary]\n{summary}"},
-        {"role": "assistant", "content": "Understood, I have the context. Continuing."},
-    ]
-    compacted.extend(recent_messages)
-    return compacted

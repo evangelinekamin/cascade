@@ -7,6 +7,8 @@ import subprocess
 import shlex
 from typing import Optional, Callable, TYPE_CHECKING
 
+from ..runtime import portable_python_command
+
 if TYPE_CHECKING:
     from ..cli import CascadeCore
 
@@ -18,7 +20,7 @@ def _run_cmd(cmd: str, timeout: int = 120) -> tuple[str, int]:
     """
     try:
         result = subprocess.run(
-            cmd,
+            portable_python_command(cmd),
             shell=True,
             capture_output=True,
             text=True,

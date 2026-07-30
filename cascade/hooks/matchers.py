@@ -16,6 +16,19 @@ from dataclasses import dataclass
 from typing import Any
 
 
+_PORTABLE_TOOL_ALIASES = {
+    "run_command": "Bash",
+    "read_file": "Read",
+    "write_file": "Write",
+    "append_file": "Write",
+    "replace_in_file": "Edit",
+    "list_files": "Glob",
+    "search_files": "Grep",
+    "web_fetch": "WebFetch",
+    "web_search": "WebSearch",
+}
+
+
 @dataclass(frozen=True)
 class ToolMatcher:
     """Compiled matcher for a single tool pattern."""
@@ -26,7 +39,11 @@ class ToolMatcher:
 
     def matches(self, tool_name: str, arguments: dict[str, Any] | None = None) -> bool:
         """Check if a tool call matches this pattern."""
-        if not fnmatch.fnmatch(tool_name, self.tool_pattern):
+        portable_name = _PORTABLE_TOOL_ALIASES.get(tool_name, tool_name)
+        if not (
+            fnmatch.fnmatch(tool_name, self.tool_pattern)
+            or fnmatch.fnmatch(portable_name, self.tool_pattern)
+        ):
             return False
 
         if not self.arg_pattern:

@@ -3,6 +3,8 @@
 import json
 import threading
 import time
+from types import SimpleNamespace
+from typing import Literal
 
 
 from cascade.tools.schema import callable_to_tool_def, _annotation_to_schema
@@ -39,6 +41,15 @@ class TestAnnotationToSchema:
     def test_none_fallback(self):
         assert _annotation_to_schema(None) == {"type": "string"}
 
+    def test_literal_becomes_enum(self):
+        assert _annotation_to_schema(Literal["fast", "safe"]) == {
+            "enum": ["fast", "safe"],
+            "type": "string",
+        }
+
+    def test_pep604_optional_uses_inner_type(self):
+        assert _annotation_to_schema(int | None) == {"type": "integer"}
+
 
 class TestCallableToToolDef:
     """Tests for converting callables to ToolDef."""
@@ -53,6 +64,7 @@ class TestCallableToToolDef:
         assert td.description == "Say hello."
         assert td.parameters["properties"]["name"]["type"] == "string"
         assert "name" in td.parameters["required"]
+        assert td.parameters["additionalProperties"] is False
 
     def test_multiple_params(self):
         def add(a: int, b: int) -> int:
@@ -155,6 +167,32 @@ class TestToolExecutor:
         assert executor.has_tool("greet") is True
         assert executor.has_tool("missing") is False
 
+    def test_coerces_unambiguous_scalar_arguments(self):
+        def repeat(count: int, loud: bool = False) -> str:
+            return f"{count}:{loud}"
+
+        executor = ToolExecutor({
+            "repeat": callable_to_tool_def("repeat", repeat),
+        })
+        result = json.loads(executor.execute(
+            "repeat", {"count": "3", "loud": "true"},
+        ))
+        assert result["result"] == "3:True"
+
+    def test_rejects_unexpected_arguments_before_handler(self):
+        called = []
+
+        def greet(name: str) -> str:
+            called.append(name)
+            return name
+
+        executor = ToolExecutor({"greet": callable_to_tool_def("greet", greet)})
+        result = json.loads(executor.execute(
+            "greet", {"name": "Eve", "invented": "value"},
+        ))
+        assert "unexpected invented" in result["error"]
+        assert called == []
+
 
 class TestToolExecutorWithHooks:
     """Tests for ToolExecutor with hook lifecycle integration."""
@@ -240,7 +278,26 @@ class TestToolExecutorWithHooks:
         executor = self._make_executor_with_hooks([
             HookDefinition(name="crash", event=HookEvent.TOOL_CALL, handler=crasher),
         ])
-        # Hook error is non-fatal (emit returns None on error), tool runs normally
+        # Pre-tool hooks fail closed by default: a broken safety gate must not
+        # silently allow the operation.
+        result = json.loads(executor.execute("greet", {"name": "World"}))
+        assert "blocked" in result["error"].lower()
+        assert "Hook exploded" in result["error"]
+
+    def test_hook_error_can_explicitly_fail_open(self):
+        from cascade.hooks import HookDefinition, HookEvent
+
+        def crasher(ctx):
+            raise RuntimeError("Hook exploded")
+
+        executor = self._make_executor_with_hooks([
+            HookDefinition(
+                name="crash",
+                event=HookEvent.TOOL_CALL,
+                handler=crasher,
+                fail_closed=False,
+            ),
+        ])
         result = json.loads(executor.execute("greet", {"name": "World"}))
         assert result["result"] == "Hello, World!"
 
@@ -255,6 +312,118 @@ class TestToolExecutorWithHooks:
         ])
         result = json.loads(executor.execute("greet", {"name": "World"}))
         assert result["result"] == "Hello, World!"
+
+    def test_argument_transforms_chain(self):
+        from cascade.hooks import HookDefinition, HookEvent, HookResult
+
+        def first(ctx):
+            args = dict(ctx.tool_input)
+            args["name"] += " one"
+            return HookResult(transformed_value=args)
+
+        def second(ctx):
+            args = dict(ctx.tool_input)
+            args["name"] += " two"
+            return HookResult(transformed_value=args)
+
+        executor = self._make_executor_with_hooks([
+            HookDefinition(
+                name="first", event=HookEvent.TOOL_CALL, handler=first, priority=1,
+            ),
+            HookDefinition(
+                name="second", event=HookEvent.TOOL_CALL, handler=second, priority=2,
+            ),
+        ])
+        result = json.loads(executor.execute("greet", {"name": "start"}))
+        assert result["result"] == "Hello, start one two!"
+
+    def test_result_hook_sees_handler_failures(self):
+        from cascade.hooks import HookDefinition, HookEvent, HookRunner
+
+        seen = []
+
+        def fail() -> str:
+            raise RuntimeError("boom")
+
+        def observe(ctx):
+            seen.append(ctx.tool_output)
+
+        executor = ToolExecutor(
+            {"fail": callable_to_tool_def("fail", fail)},
+            hook_runner=HookRunner(hooks=(
+                HookDefinition(
+                    name="audit", event=HookEvent.TOOL_RESULT, handler=observe,
+                ),
+            )),
+        )
+        result = json.loads(executor.execute("fail", {}))
+        assert "boom" in result["error"]
+        assert len(seen) == 1
+        assert "boom" in seen[0]
+
+    def test_unserializable_result_transform_fails_open(self):
+        from cascade.hooks import HookDefinition, HookEvent, HookResult, HookRunner
+
+        runner = HookRunner(hooks=(
+            HookDefinition(
+                name="bad-transform",
+                event=HookEvent.TOOL_RESULT,
+                handler=lambda _ctx: HookResult(transformed_value={"bad"}),
+            ),
+        ))
+
+        def greet(name: str) -> str:
+            return f"Hello, {name}!"
+
+        executor = ToolExecutor(
+            {"greet": callable_to_tool_def("greet", greet)},
+            hook_runner=runner,
+        )
+
+        result = json.loads(executor.execute("greet", {"name": "World"}))
+
+        assert result["result"] == "Hello, World!"
+
+    def test_transformed_arguments_are_permission_checked_again(self):
+        from cascade.hooks import HookDefinition, HookEvent, HookResult, HookRunner
+
+        class Permissions:
+            def __init__(self):
+                self.calls = []
+
+            def resolve(self, _tool, _name, arguments, context=None):
+                self.calls.append(dict(arguments))
+                if arguments["name"] == "forbidden":
+                    return SimpleNamespace(
+                        decision="deny", reason="transformed value", rule="deny-rule",
+                    )
+                return SimpleNamespace(decision="allow", reason="ok", rule="posture")
+
+        permissions = Permissions()
+        runner = HookRunner(hooks=(
+            HookDefinition(
+                name="rewrite",
+                event=HookEvent.TOOL_CALL,
+                handler=lambda _ctx: HookResult(
+                    transformed_value={"name": "forbidden"},
+                ),
+            ),
+        ))
+
+        def greet(name: str) -> str:
+            return name
+
+        executor = ToolExecutor(
+            {"greet": callable_to_tool_def("greet", greet)},
+            hook_runner=runner,
+            permissions=permissions,
+        )
+        result = json.loads(executor.execute("greet", {"name": "allowed"}))
+        assert "not permitted" in result["error"]
+        assert permissions.calls == [
+            {"name": "allowed"},
+            {"name": "forbidden"},
+        ]
 
 
 class TestReflection:
@@ -392,6 +561,34 @@ class TestConcurrentToolExecutor:
 
         assert self._results(results) == ["a", "b", "c"]
         # At least two read-only calls were inside the tool at the same time.
+        assert probe.max_active >= 2
+
+    def test_mutable_concurrent_calls_with_overlapping_paths_are_waves(self):
+        probe = _ConcurrencyProbe(hold=0.03)
+
+        def update(path: str, tag: str) -> str:
+            return probe.run(f"{path}:{tag}")
+
+        tools = {
+            "update": callable_to_tool_def("update", update, concurrent=True),
+        }
+        executor = ConcurrentToolExecutor(tools)
+
+        same_path = executor.execute_batch([
+            ("update", {"path": "src/a.py", "tag": "one"}),
+            ("update", {"path": "src/a.py", "tag": "two"}),
+        ])
+
+        assert self._results(same_path) == ["src/a.py:one", "src/a.py:two"]
+        assert probe.max_active == 1
+
+        probe.max_active = 0
+        disjoint = executor.execute_batch([
+            ("update", {"path": "src/a.py", "tag": "one"}),
+            ("update", {"path": "tests/b.py", "tag": "two"}),
+        ])
+
+        assert self._results(disjoint) == ["src/a.py:one", "tests/b.py:two"]
         assert probe.max_active >= 2
 
     def test_unsafe_calls_are_serialised(self):

@@ -7,6 +7,7 @@ import cascade.swarm.auto as auto
 from textual.message_pump import active_app
 
 from cascade.providers.base import ProviderConfig
+from cascade.hooks import HookDefinition, HookEvent, HookResult, HookRunner
 from cascade.screens.main import MainScreen
 from cascade.swarm.auto import RouteDecision, WorkflowKind
 from cascade.swarm.outcome import RunOutcome
@@ -246,6 +247,17 @@ def test_local_router_is_mode_aware():
     assert auto._local_route("review the auth module", "plan").workflow == WorkflowKind.RECON
 
 
+def test_complex_edit_prompt_defers_to_model_for_automatic_fanout_or_pipeline():
+    assert auto._local_route(
+        "implement the provider fixes across every provider and add independent tests",
+        "build",
+    ) is None
+    assert auto._local_route(
+        "build the API and then update its dependent client",
+        "build",
+    ) is None
+
+
 def test_recon_lane_exposes_only_read_only_tools():
     app, _original = _app()
     decision = RouteDecision(WorkflowKind.RECON, "inspect", 0.9)
@@ -354,6 +366,82 @@ def test_focused_solve_forwards_conversation_context(monkeypatch):
     )
 
     assert called.call_args.kwargs["context"] == "codex: CTX_REFERENT list of errors"
+
+
+def test_automatic_workflow_lifecycle_hooks_wrap_lane(monkeypatch):
+    app, _original = _app()
+    observed = []
+    app.hook_runner = HookRunner(hooks=(
+        HookDefinition(
+            name="start",
+            event=HookEvent.WORKFLOW_START,
+            handler=lambda ctx: (
+                observed.append((ctx.event, ctx.workflow, ctx.prompt))
+                or HookResult(transformed_value=ctx.prompt + " rewritten")
+            ),
+        ),
+        HookDefinition(
+            name="end",
+            event=HookEvent.WORKFLOW_END,
+            handler=lambda ctx: (
+                observed.append((ctx.event, ctx.workflow, ctx.response))
+                or HookResult(transformed_value=ctx.response + "\nHOOKED")
+            ),
+        ),
+    ))
+    solve_result = SimpleNamespace(
+        outcome=RunOutcome.SUCCEEDED,
+        iterations=1,
+        provider="openai",
+        models_used=("bulk",),
+        error="",
+        diff_stat="",
+        changed_files=(),
+        worktree_path="/tmp/wt",
+        input_tokens=0,
+        output_tokens=0,
+    )
+    called = MagicMock(return_value=solve_result)
+    monkeypatch.setattr(auto, "run_solve", called)
+
+    result = auto.execute_auto(
+        app,
+        "fix it",
+        "openai",
+        RouteDecision(WorkflowKind.SOLVE, "edit", 0.8),
+    )
+
+    assert called.call_args.args[1] == "fix it rewritten"
+    assert result.text.endswith("HOOKED")
+    assert [item[0] for item in observed] == [
+        "workflow_start",
+        "workflow_end",
+    ]
+    assert all(item[1] == "solve" for item in observed)
+
+
+def test_automatic_workflow_start_hook_can_block_lane(monkeypatch):
+    app, _original = _app()
+    app.hook_runner = HookRunner(hooks=(
+        HookDefinition(
+            name="policy",
+            event=HookEvent.WORKFLOW_START,
+            handler=lambda _ctx: HookResult(block=True, reason="maintenance"),
+        ),
+    ))
+    called = MagicMock()
+    monkeypatch.setattr(auto, "run_solve", called)
+
+    result = auto.execute_auto(
+        app,
+        "fix it",
+        "openai",
+        RouteDecision(WorkflowKind.SOLVE, "edit", 0.8),
+    )
+
+    assert result.outcome == RunOutcome.BLOCKED
+    assert "maintenance" in result.text
+    called.assert_not_called()
 
 
 def test_fast_solve_starts_on_fast_model_then_escalates_to_active_frontier(monkeypatch):

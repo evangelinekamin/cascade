@@ -1,6 +1,7 @@
 """Tests for auto-copy clipboard confirmation formatting."""
 
 from cascade.app import CascadeTUI
+from cascade.widgets.status_bar import StatusBar
 
 _msg = CascadeTUI._copied_message
 
@@ -18,8 +19,6 @@ def test_copied_message_thousands_separator():
 
 
 # -- StatusBar bottom-right flash (copy confirmation / exit hint) --------------
-
-from cascade.widgets.status_bar import StatusBar
 
 
 def test_status_bar_flash_message_renders_in_the_corner():

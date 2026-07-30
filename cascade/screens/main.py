@@ -26,7 +26,7 @@ from ..widgets.message import (
 from ..widgets.input_frame import InputFrame, ChatTextArea
 from ..widgets.status_bar import StatusBar
 from ..widgets.stream_message import StreamMessage
-from ..widgets.tool_call import ToolCallWidget, render_tool_widget, append_tool_activity
+from ..widgets.tool_call import append_tool_activity
 from ..theme import PALETTE, MODE_CYCLE, MODES, get_provider_theme
 from ..commands import CommandHandler
 from ..hooks import HookContext, HookEvent
@@ -98,6 +98,8 @@ class MainScreen(Screen):
         self._activity_provider = None
         self._last_seen_activity = None
         self._active_run: RunContext | None = None
+        self._last_route_decision = None
+        self._input_hook_pending = False
         self._exit_armed = False
         self._exit_timer = None
         # Type-ahead: prompts submitted while work is running wait here (FIFO)
@@ -283,9 +285,6 @@ class MainScreen(Screen):
             cfg = cli_app.config.get_memory_config()
             self._memory_policy = str(cfg.get("cross_model_memory", "summary"))
             self._compaction_summary_enabled = bool(cfg.get("compaction_summary", True))
-            engine = getattr(cli_app, "permission_engine", None)
-            if engine is not None:
-                engine.ask_handler = self._ask_permission
         recovered = int(getattr(self.app, "recovered_run_count", 0) or 0)
         if recovered:
             noun = "run" if recovered == 1 else "runs"
@@ -337,7 +336,11 @@ class MainScreen(Screen):
 
     def _is_busy(self) -> bool:
         """True when a chat turn OR a slash-command lane is in flight."""
-        if self.app.state.is_thinking or self._active_run is not None:
+        if (
+            self._input_hook_pending
+            or self.app.state.is_thinking
+            or self._active_run is not None
+        ):
             return True
         handler = self._cmd_handler
         return bool(handler is not None and handler.is_busy())
@@ -350,24 +353,69 @@ class MainScreen(Screen):
             self._cmd_handler.handle(prompt)
             return
 
-        # Fire INPUT_RECEIVED hook (can transform prompt)
+        # INPUT_RECEIVED may invoke a subprocess. Keep it off Textual's event
+        # thread so a slow policy hook cannot freeze rendering or keyboard input.
         cli_app = getattr(self.app, "cli_app", None)
-        if cli_app is not None:
-            hook_result = cli_app.hook_runner.emit(
-                HookEvent.INPUT_RECEIVED,
-                HookContext(
-                    event=HookEvent.INPUT_RECEIVED.value,
-                    prompt=prompt,
-                    provider=self._active_provider,
-                    mode=self._mode,
-                ),
-            )
-            if hook_result is not None:
-                if hook_result.block:
-                    return
-                if hook_result.transformed_value is not None:
-                    prompt = hook_result.transformed_value
+        runner = getattr(cli_app, "hook_runner", None) if cli_app is not None else None
+        if runner is None or not runner.hooks_for_event(HookEvent.INPUT_RECEIVED):
+            self._dispatch_ready_prompt(prompt)
+            return
 
+        self._input_hook_pending = True
+
+        def _worker() -> None:
+            try:
+                hook_result = runner.emit(
+                    HookEvent.INPUT_RECEIVED,
+                    HookContext(
+                        event=HookEvent.INPUT_RECEIVED.value,
+                        prompt=prompt,
+                        provider=self._active_provider,
+                        mode=self._mode,
+                    ),
+                )
+                self.app.call_from_thread(
+                    self._finish_input_hook,
+                    prompt,
+                    hook_result,
+                    "",
+                )
+            except Exception as exc:
+                self.app.call_from_thread(
+                    self._finish_input_hook,
+                    prompt,
+                    None,
+                    str(exc),
+                )
+
+        self.run_worker(_worker, thread=True, exclusive=False)
+
+    def _finish_input_hook(self, prompt: str, hook_result, error: str) -> None:
+        """Resume prompt dispatch on the UI thread after hook preflight."""
+        self._input_hook_pending = False
+        if error:
+            self._post_system_message(f"Input hook failed: {error}")
+            self._set_input_locked(False)
+            return
+        if hook_result is not None:
+            if hook_result.block:
+                self._post_system_message(
+                    f"Input blocked by hook: {hook_result.reason or 'no reason provided'}"
+                )
+                self._set_input_locked(False)
+                return
+            if hook_result.transformed_value is not None:
+                if not isinstance(hook_result.transformed_value, str):
+                    self._post_system_message(
+                        "Input hook returned an invalid prompt (expected text)."
+                    )
+                    self._set_input_locked(False)
+                    return
+                prompt = hook_result.transformed_value
+        self._dispatch_ready_prompt(prompt)
+
+    def _dispatch_ready_prompt(self, prompt: str) -> None:
+        """Record and start a prompt after hook preflight has completed."""
         # Hide welcome header on first real message
         if self._header_visible:
             self._header_visible = False
@@ -551,13 +599,19 @@ class MainScreen(Screen):
                 system_prompt=final_system or "",
             ),
         )
-        if ctx_hook and ctx_hook.transformed_value is not None:
-            final_system = str(ctx_hook.transformed_value)
+        if ctx_hook is not None:
+            if ctx_hook.block:
+                error = f"Context blocked by hook: {ctx_hook.reason}"
+                run.finish(RunOutcome.BLOCKED, error=error)
+                _call(self._on_stream_error, error, terminal=True)
+                return
+            if ctx_hook.transformed_value is not None:
+                final_system = str(ctx_hook.transformed_value)
 
         # Build conversation history from state, injecting episodes
         from ..conversation import (
             state_messages_to_provider, should_compact,
-            compact_messages, compact_messages_with_episodes,
+            compact_messages_with_episodes,
         )
         from ..episodes import prune_live_episodes
 
@@ -649,10 +703,16 @@ class MainScreen(Screen):
         )
 
         # Run BEFORE_ASK hooks (legacy)
-        cli_app.hook_runner.run_hooks(HookEvent.BEFORE_ASK, context={
+        before_results = cli_app.hook_runner.run_hooks(HookEvent.BEFORE_ASK, context={
             "prompt": prompt,
             "provider": provider_name,
         })
+        blocked = next((result for result in before_results if result.get("blocked")), None)
+        if blocked is not None:
+            error = f"Request blocked by hook: {blocked.get('output', '')}"
+            run.finish(RunOutcome.BLOCKED, error=error)
+            _call(self._on_stream_error, error, terminal=True)
+            return
 
         # Fire BEFORE_PROVIDER_REQUEST (can inspect/modify messages)
         req_hook = cli_app.hook_runner.emit(
@@ -670,6 +730,17 @@ class MainScreen(Screen):
             run.finish(RunOutcome.BLOCKED, error=error)
             _call(self._on_stream_error, error, terminal=True)
             return
+        if req_hook and req_hook.transformed_value is not None:
+            transformed = req_hook.transformed_value
+            if not (
+                isinstance(transformed, (list, tuple))
+                and all(isinstance(message, dict) for message in transformed)
+            ):
+                error = "Request hook returned invalid messages (expected a list of objects)"
+                run.finish(RunOutcome.BLOCKED, error=error)
+                _call(self._on_stream_error, error, terminal=True)
+                return
+            messages = [dict(message) for message in transformed]
 
         # Normal prompts in configured modes can be routed to a
         # capability-constrained workflow. This is intentionally after request
@@ -689,6 +760,16 @@ class MainScreen(Screen):
             run.checkpoint()
             run.add_tokens(decision.input_tokens, decision.output_tokens)
             run.add_cost(decision.cost)
+            self._last_route_decision = decision
+            run.annotate(
+                route=decision.workflow.value,
+                route_reason=decision.reason,
+                route_confidence=decision.confidence,
+                router_provider=decision.router_provider,
+                router_model=decision.router_model,
+                worker_tier=decision.worker_tier,
+                history_hint=decision.history_hint,
+            )
             if decision.workflow != WorkflowKind.CHAT:
                 # The focused lane runs the bare prompt in a fresh worktree, so a
                 # referential request ("fix the errors codex found") needs the
@@ -808,6 +889,15 @@ class MainScreen(Screen):
                     episode_id=episode.id,
                 ),
             )
+            live_run.annotate(
+                execution_provider=result.execution_provider,
+                changed_files=list(result.changed_files),
+                diff_stat=result.diff_stat,
+                verification_kind=result.verification_kind,
+                iterations=result.iterations,
+                tokens_by_provider=[list(item) for item in result.tokens_by_provider],
+                cost_by_provider=[list(item) for item in result.cost_by_provider],
+            )
             live_run.finish(
                 result.outcome,
                 input_tokens=result.input_tokens,
@@ -826,20 +916,33 @@ class MainScreen(Screen):
                 result.tokens_by_provider,
                 terminal=True,
             )
-            cli_app.hook_runner.run_hooks(
+            cli_app.hook_runner.emit(
                 HookEvent.AFTER_RESPONSE,
-                context={
-                    "response_length": str(len(response_text)),
-                    "provider": provider_name,
-                    "tool_calls": "orchestrated",
-                    "workflow": decision.workflow.value,
-                    "outcome": result.outcome.value,
-                },
+                HookContext(
+                    event=HookEvent.AFTER_RESPONSE.value,
+                    provider=provider_name,
+                    response=response_text,
+                    metadata=(
+                        ("tool_calls", "orchestrated"),
+                        ("workflow", decision.workflow.value),
+                        ("outcome", result.outcome.value),
+                    ),
+                ),
             )
         except RunCancelled as exc:
             live_run.finish(RunOutcome.CANCELLED, error=str(exc))
         except Exception as exc:
             live_run.finish(RunOutcome.FAILED, error=str(exc))
+            cli_app.hook_runner.emit(
+                HookEvent.ON_ERROR,
+                HookContext(
+                    event=HookEvent.ON_ERROR.value,
+                    provider=provider_name,
+                    prompt=prompt,
+                    error=str(exc),
+                    metadata=(("workflow", decision.workflow.value),),
+                ),
+            )
             self._emit_for_run(
                 run, self._on_stream_error, str(exc), terminal=True,
             )
@@ -918,11 +1021,15 @@ class MainScreen(Screen):
                 terminal=True,
             )
 
-            cli_app.hook_runner.run_hooks(HookEvent.AFTER_RESPONSE, context={
-                "response_length": str(len(response_text)),
-                "provider": provider_name,
-                "tool_calls": "0",
-            })
+            cli_app.hook_runner.emit(
+                HookEvent.AFTER_RESPONSE,
+                HookContext(
+                    event=HookEvent.AFTER_RESPONSE.value,
+                    provider=provider_name,
+                    prompt=prompt,
+                    response=response_text,
+                ),
+            )
 
         except RunCancelled as exc:
             usage = prov.last_usage or Usage()
@@ -934,6 +1041,16 @@ class MainScreen(Screen):
             live_run.add_tokens(usage.prompt_total, usage.output)
             live_run.add_cost(usage.cost or 0.0)
             live_run.finish(RunOutcome.FAILED, error=str(e))
+            cli_app.hook_runner.emit(
+                HookEvent.ON_ERROR,
+                HookContext(
+                    event=HookEvent.ON_ERROR.value,
+                    provider=provider_name,
+                    prompt=prompt,
+                    error=str(e),
+                    metadata=(("workflow", "chat"),),
+                ),
+            )
             self._emit_for_run(run, self._on_stream_error, str(e), terminal=True)
 
     @staticmethod
@@ -1057,11 +1174,16 @@ class MainScreen(Screen):
                 terminal=True,
             )
 
-            cli_app.hook_runner.run_hooks(HookEvent.AFTER_RESPONSE, context={
-                "response_length": str(len(response_text)),
-                "provider": provider_name,
-                "tool_calls": str(len(tool_log)),
-            })
+            cli_app.hook_runner.emit(
+                HookEvent.AFTER_RESPONSE,
+                HookContext(
+                    event=HookEvent.AFTER_RESPONSE.value,
+                    provider=provider_name,
+                    prompt=prompt,
+                    response=response_text,
+                    tool_log=tuple(dict(entry) for entry in tool_log),
+                ),
+            )
 
         except RunCancelled as exc:
             usage = prov.last_usage or Usage()
@@ -1073,6 +1195,16 @@ class MainScreen(Screen):
             live_run.add_tokens(usage.prompt_total, usage.output)
             live_run.add_cost(usage.cost or 0.0)
             live_run.finish(RunOutcome.FAILED, error=str(e))
+            cli_app.hook_runner.emit(
+                HookEvent.ON_ERROR,
+                HookContext(
+                    event=HookEvent.ON_ERROR.value,
+                    provider=provider_name,
+                    prompt=prompt,
+                    error=str(e),
+                    metadata=(("workflow", "chat-tools"),),
+                ),
+            )
             self._emit_for_run(run, self._on_stream_error, str(e), terminal=True)
 
     def _generate_compaction_summary(
@@ -1136,58 +1268,6 @@ class MainScreen(Screen):
         else:
             self._summary_failures = 0
         return summary
-
-    def _ask_permission(self, tool_name: str, arguments: dict, verdict) -> str:
-        """Resolve an "ask" verdict by prompting the user.
-
-        Called from a worker thread inside the tool loop; blocks that
-        worker until the modal resolves (timeout denies). Never call on
-        the UI thread -- the guard below turns that into a deny rather
-        than a deadlock.
-        """
-        import threading
-
-        from .permission import PermissionScreen
-
-        result: dict = {}
-        done = threading.Event()
-        screen_ref: dict = {}
-
-        def _show() -> None:
-            def _resolved(answer) -> None:
-                result["answer"] = answer or "deny"
-                done.set()
-
-            try:
-                screen_ref["screen"] = PermissionScreen(
-                    tool_name, arguments, verdict.reason,
-                )
-                self.app.push_screen(screen_ref["screen"], _resolved)
-            except Exception:
-                result["answer"] = "deny"
-                done.set()
-
-        try:
-            self.app.call_from_thread(_show)
-        except Exception:
-            return "deny"
-        if not done.wait(timeout=120.0):
-            # Timed out waiting for the user: dismiss the modal so it does
-            # not linger on the screen stack after we return deny.
-            def _dismiss() -> None:
-                scr = screen_ref.get("screen")
-                if scr is not None and scr.is_running:
-                    try:
-                        scr.dismiss("deny")
-                    except Exception:
-                        pass
-
-            try:
-                self.app.call_from_thread(_dismiss)
-            except Exception:
-                pass
-            return "deny"
-        return result.get("answer", "deny")
 
     def _post_compaction_note(self, text: str) -> None:
         """Mount a dim one-line separator noting a compaction event."""

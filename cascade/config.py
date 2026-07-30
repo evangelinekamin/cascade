@@ -151,14 +151,30 @@ class ConfigManager:
                 "summary_max_chars": 1800,
             },
             "hooks": [],
+            "permissions": {
+                # Popup-free by design: routine work runs immediately and
+                # ambiguous actions are classified by a fresh tool-less model.
+                "posture": "auto",
+                "allow": [],
+                "deny": [],
+                # Compatibility name: entries here force background review.
+                "ask": [],
+                "reviewer": {
+                    "enabled": True,
+                    # Empty values reuse the orchestration/default direct API.
+                    "provider": "",
+                    "model": "",
+                    "timeout": 10.0,
+                },
+            },
             "tools": {
                 "reflection": True,
                 "file_ops": True,
                 # Shell + web for direct-API chat models. On by default now
                 # that the permission engine gates every call (auto posture:
-                # transparent commands auto-approve, the rest ask; web_search
-                # auto-approves, web_fetch asks per host). Set to false to
-                # disable a lane entirely regardless of posture.
+                # transparent commands auto-approve, the rest are reviewed;
+                # web_search auto-approves, web_fetch is reviewed per host).
+                # Set to false to disable a lane entirely regardless of posture.
                 "exec": True,
                 "web": True,
             },
@@ -451,27 +467,45 @@ class ConfigManager:
         return self.data.get("hooks", [])
 
     def get_permissions_config(self) -> Dict[str, Any]:
-        """Permission engine configuration: posture + rule lists.
+        """Popup-free permission broker configuration.
 
-        Project-level .cascade/permissions.yaml (same shape) overlays this
-        in CascadeCore; lists concatenate, project posture wins.
+        Project-level policy is merged conservatively by CascadeCore: checked-in
+        configuration may tighten policy but cannot enable yolo or add allows.
         """
         defaults: Dict[str, Any] = {
             "posture": "auto",
             "allow": [],
             "deny": [],
             "ask": [],
+            "reviewer": {
+                "enabled": True,
+                "provider": "",
+                "model": "",
+                "timeout": 10.0,
+            },
         }
         config = self.data.get("permissions", {})
         merged = {**defaults, **(config or {})}
         posture = str(merged.get("posture", "auto")).lower()
-        if posture not in ("auto", "safe", "readonly"):
-            # Fail closed: a typo must not silently open full auto.
-            posture = "safe"
+        if posture not in ("auto", "yolo", "safe", "readonly"):
+            posture = "auto"
         merged["posture"] = posture
         for key in ("allow", "deny", "ask"):
             value = merged.get(key)
             merged[key] = [str(v) for v in value] if isinstance(value, list) else []
+        raw_reviewer = merged.get("reviewer")
+        reviewer = dict(defaults["reviewer"])
+        if isinstance(raw_reviewer, dict):
+            reviewer.update(raw_reviewer)
+        reviewer["enabled"] = bool(reviewer.get("enabled", True))
+        reviewer["provider"] = str(reviewer.get("provider") or "")
+        reviewer["model"] = str(reviewer.get("model") or "")
+        try:
+            timeout = float(reviewer.get("timeout", 10.0))
+        except (TypeError, ValueError):
+            timeout = 10.0
+        reviewer["timeout"] = min(max(timeout, 0.1), 60.0)
+        merged["reviewer"] = reviewer
         return merged
 
     def get_tools_config(self) -> Dict[str, bool]:

@@ -46,6 +46,7 @@ class RouteDecision:
     input_tokens: int = 0
     output_tokens: int = 0
     cost: float = 0.0
+    history_hint: str = ""
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,12 @@ class AutoResult:
     # provider. (provider, input_tokens, output_tokens) and (provider, cost).
     tokens_by_provider: tuple[tuple[str, int, int], ...] = ()
     cost_by_provider: tuple[tuple[str, float], ...] = ()
+    worktree_path: str = ""
+    changed_files: tuple[str, ...] = ()
+    diff_stat: str = ""
+    iterations: int = 0
+    verification_kind: str = ""
+    models_used: tuple[str, ...] = ()
 
 
 ProgressCallback = Optional[Callable[[str, str], None]]
@@ -86,8 +93,9 @@ _RECON_VERIFY_SYSTEM = (
 
 
 _ROUTER_SYSTEM = """\
-You route software-assistant requests. Choose the smallest workflow that can
-complete the request safely:
+You route software-assistant requests. Ordinary prose is the primary interface:
+the user should not need to know or remember workflow commands. Choose the
+smallest workflow that can complete the whole request safely:
 
 - chat: conversation, ideation, or a question that needs no repository access.
 - recon: read/search/trace/review the repository without changing any file.
@@ -95,9 +103,10 @@ complete the request safely:
 - pipeline: multiple dependent code changes that must build on one another.
 - fanout: multiple genuinely independent code changes with disjoint file ownership.
 
-Prefer solve over pipeline when uncertain. Choose fanout only when independence is
-explicit and credible; parallelism is not a goal by itself. Never infer a code edit
-from a request that only asks for an explanation or review.
+Choose pipeline when the deliverables depend on earlier investigation or edits.
+Choose fanout when two or more substantial deliverables have credible disjoint
+file ownership and can be verified independently. Prefer solve when coordination
+would add no value. Never infer a code edit from explanation or review alone.
 
 Also choose worker_tier:
 - fast: a tiny, localized, low-blast-radius solve that tests can verify; this may use
@@ -137,6 +146,16 @@ _ROUTE_SCHEMA = {
 
 _FAST_EDIT_RE = re.compile(
     r"\b(typo|one[- ]line|tiny|small localized|formatting only)\b",
+    re.IGNORECASE,
+)
+_COMPLEX_EDIT_RE = re.compile(
+    r"(?:"
+    r"\b(?:across|throughout|end[- ]to[- ]end|multiple|several|all of|"
+    r"work through|full pass|whole project|each provider|every provider|"
+    r"independent|in parallel|fan out|subagents?)\b"
+    r"|(?:^|\n)\s*(?:[-*]|\d+[.)])\s+"
+    r"|\b(?:and then|followed by|after that)\b"
+    r")",
     re.IGNORECASE,
 )
 # Precision-first LOCAL router -- a handful of ALLOWLIST rules that fire only on
@@ -269,6 +288,25 @@ def _safe_fallback(reason: str) -> RouteDecision:
         router_provider="fallback",
     )
 
+def _routing_history_hint(app) -> str:
+    """A compact, anonymous tie-breaker derived from this installation's runs."""
+    ledger = getattr(app, "run_ledger", None)
+    if ledger is None:
+        return ""
+    try:
+        summary = ledger.routing_summary(limit=100)
+    except Exception:
+        return ""
+    parts = []
+    for workflow in ("solve", "pipeline", "fanout"):
+        bucket = summary.get(workflow)
+        if not bucket or bucket.get("runs", 0) < 3:
+            continue
+        runs = int(bucket["runs"])
+        succeeded = int(bucket["succeeded"])
+        parts.append(f"{workflow} {succeeded}/{runs} succeeded")
+    return "; ".join(parts)
+
 
 def _local_route(prompt: str, mode: str) -> Optional[RouteDecision]:
     """A zero-cost first tier: a confident decision only on an unambiguous
@@ -299,7 +337,11 @@ def _local_route(prompt: str, mode: str) -> Optional[RouteDecision]:
         return _decide(WorkflowKind.CHAT, "a bare greeting")
     if _RECON_ALLOW_RE.match(text):
         return _decide(WorkflowKind.RECON, "imperative repository inspection")
-    if mode not in ("plan", "design") and _SOLVE_ALLOW_RE.match(text):
+    if (
+        mode not in ("plan", "design")
+        and _SOLVE_ALLOW_RE.match(text)
+        and not _COMPLEX_EDIT_RE.search(text)
+    ):
         tier = "fast" if _FAST_EDIT_RE.search(text) else "bulk"
         return _decide(WorkflowKind.SOLVE, "imperative edit command", tier)
     return None
@@ -316,6 +358,7 @@ def select_workflow(
     if cancel_token is not None:
         cancel_token.checkpoint()
     config = app.config.get_orchestration_config()
+    history_hint = _routing_history_hint(app)
     if config.get("local_router", True):
         local = _local_route(prompt, mode)
         if local is not None:
@@ -333,6 +376,11 @@ def select_workflow(
 
     try:
         request = f"Current Cascade mode: {mode}\n\nUser request:\n{prompt}"
+        if history_hint:
+            request += (
+                "\n\nRecent local outcomes (weak tie-breaker only; never override "
+                f"the request): {history_hint}"
+            )
         cancellation_scope = getattr(router, "cancellation_scope", None)
         scope = (
             cancellation_scope(cancel_token)
@@ -376,6 +424,7 @@ def select_workflow(
             input_tokens=usage.prompt_total,
             output_tokens=usage.output,
             cost=cost,
+            history_hint=history_hint,
         )
     except RunCancelled:
         raise
@@ -531,6 +580,134 @@ def _auto_breakdowns(
 
 
 def execute_auto(
+    app,
+    prompt: str,
+    active_provider: str,
+    decision: RouteDecision,
+    *,
+    mode: str = "",
+    context: str = "",
+    on_progress: ProgressCallback = None,
+    on_tool_event=None,
+    cancel_token: Optional[CancellationToken] = None,
+    run_context: Optional[RunContext] = None,
+) -> AutoResult:
+    """Run an automatic lane with one consistent orchestration hook envelope."""
+    from ..hooks import HookContext, HookEvent
+
+    runner = getattr(app, "hook_runner", None)
+    if runner is None:
+        return _execute_auto_impl(
+            app,
+            prompt,
+            active_provider,
+            decision,
+            mode=mode,
+            context=context,
+            on_progress=on_progress,
+            on_tool_event=on_tool_event,
+            cancel_token=cancel_token,
+            run_context=run_context,
+        )
+
+    start = runner.emit(
+        HookEvent.WORKFLOW_START,
+        HookContext(
+            event=HookEvent.WORKFLOW_START.value,
+            provider=active_provider,
+            mode=mode,
+            workflow=decision.workflow.value,
+            prompt=prompt,
+        ),
+    )
+    if start is not None:
+        if start.block:
+            return AutoResult(
+                decision=decision,
+                outcome=RunOutcome.BLOCKED,
+                text=f"Workflow blocked by hook: {start.reason}",
+                execution_provider=active_provider,
+                input_tokens=decision.input_tokens,
+                output_tokens=decision.output_tokens,
+                cost=decision.cost,
+            )
+        if start.transformed_value is not None:
+            if not isinstance(start.transformed_value, str):
+                return AutoResult(
+                    decision=decision,
+                    outcome=RunOutcome.BLOCKED,
+                    text="Workflow hook returned an invalid prompt (expected text)",
+                    execution_provider=active_provider,
+                    input_tokens=decision.input_tokens,
+                    output_tokens=decision.output_tokens,
+                    cost=decision.cost,
+                )
+            prompt = start.transformed_value
+
+    try:
+        result = _execute_auto_impl(
+            app,
+            prompt,
+            active_provider,
+            decision,
+            mode=mode,
+            context=context,
+            on_progress=on_progress,
+            on_tool_event=on_tool_event,
+            cancel_token=cancel_token,
+            run_context=run_context,
+        )
+    except Exception as exc:
+        runner.emit(
+            HookEvent.ON_ERROR,
+            HookContext(
+                event=HookEvent.ON_ERROR.value,
+                provider=active_provider,
+                mode=mode,
+                workflow=decision.workflow.value,
+                prompt=prompt,
+                error=str(exc),
+            ),
+        )
+        raise
+
+    end = runner.emit(
+        HookEvent.WORKFLOW_END,
+        HookContext(
+            event=HookEvent.WORKFLOW_END.value,
+            provider=result.execution_provider,
+            mode=mode,
+            workflow=decision.workflow.value,
+            prompt=prompt,
+            response=result.text,
+            metadata=(
+                ("outcome", result.outcome.value),
+                ("input_tokens", result.input_tokens),
+                ("output_tokens", result.output_tokens),
+                ("cost", result.cost),
+            ),
+        ),
+    )
+    if end is not None:
+        if end.block:
+            return replace(
+                result,
+                outcome=RunOutcome.BLOCKED,
+                text=f"Workflow result blocked by hook: {end.reason}",
+            )
+        if end.transformed_value is not None:
+            if isinstance(end.transformed_value, str):
+                result = replace(result, text=end.transformed_value)
+            else:
+                result = replace(
+                    result,
+                    outcome=RunOutcome.BLOCKED,
+                    text="Workflow end hook returned an invalid response (expected text)",
+                )
+    return result
+
+
+def _execute_auto_impl(
     app,
     prompt: str,
     active_provider: str,
@@ -701,6 +878,7 @@ def execute_auto(
                 route_in + usage.prompt_total,
                 route_out + usage.output,
                 route_cost + execution_cost,
+                models_used=(str(provider.config.model),),
             )
         except Exception as exc:
             if token is not None:
@@ -779,6 +957,12 @@ def execute_auto(
             route_cost + result_cost,
             tokens_bd,
             cost_bd,
+            worktree_path=result.worktree_path,
+            changed_files=tuple(getattr(result, "changed_files", ()) or ()),
+            diff_stat=getattr(result, "diff_stat", ""),
+            iterations=getattr(result, "iterations", 0),
+            verification_kind=getattr(result, "verification_kind", ""),
+            models_used=tuple(getattr(result, "models_used", ()) or ()),
         )
 
     if decision.workflow == WorkflowKind.PIPELINE:
@@ -803,6 +987,16 @@ def execute_auto(
             route_cost + result_cost,
             tokens_bd,
             cost_bd,
+            worktree_path=result.worktree_path,
+            changed_files=tuple(getattr(result, "changed_files", ()) or ()),
+            diff_stat=getattr(result, "diff_stat", ""),
+            iterations=sum(getattr(step, "iterations", 0) for step in result.steps),
+            verification_kind=getattr(result, "verification_kind", ""),
+            models_used=tuple(
+                model
+                for step in result.steps
+                for model in (getattr(step, "models_used", ()) or ())
+            ),
         )
 
     if decision.workflow == WorkflowKind.FANOUT:
@@ -851,6 +1045,18 @@ def execute_auto(
                 route_cost + blocked_cost + pipeline_cost,
                 tokens_bd,
                 cost_bd,
+                worktree_path=pipeline.worktree_path,
+                changed_files=tuple(getattr(pipeline, "changed_files", ()) or ()),
+                diff_stat=getattr(pipeline, "diff_stat", ""),
+                iterations=sum(
+                    getattr(step, "iterations", 0) for step in pipeline.steps
+                ),
+                verification_kind=getattr(pipeline, "verification_kind", ""),
+                models_used=tuple(
+                    model
+                    for step in pipeline.steps
+                    for model in (getattr(step, "models_used", ()) or ())
+                ),
             )
         result_cost = float(getattr(result, "cost", 0.0) or 0.0)
         tokens_bd, cost_bd = _auto_breakdowns(decision, result)
@@ -864,6 +1070,16 @@ def execute_auto(
             route_cost + result_cost,
             tokens_bd,
             cost_bd,
+            worktree_path=result.worktree_path,
+            changed_files=tuple(getattr(result, "changed_files", ()) or ()),
+            diff_stat=getattr(result, "diff_stat", ""),
+            iterations=sum(getattr(sub, "iterations", 0) for sub in result.subs),
+            verification_kind=getattr(result, "verification_kind", ""),
+            models_used=tuple(
+                model
+                for sub in result.subs
+                for model in (getattr(sub, "models_used", ()) or ())
+            ),
         )
 
     raise ValueError("execute_auto cannot execute the chat route")

@@ -114,6 +114,39 @@ def test_cancel_marks_open_tasks_and_invokes_registered_cleanup(tmp_path):
     ledger.close()
 
 
+def test_route_metadata_and_recent_outcomes_support_receipts_and_feedback(tmp_path):
+    ledger = RunLedger(str(tmp_path / "history.db"))
+    for index, outcome in enumerate((
+        RunOutcome.SUCCEEDED,
+        RunOutcome.SUCCEEDED,
+        RunOutcome.FAILED,
+    )):
+        run = RunContext(
+            objective=f"solve {index}",
+            workflow="routing",
+            session_id="session-feedback",
+            ledger=ledger,
+        )
+        run.annotate(
+            route="solve",
+            route_reason="focused edit",
+            route_confidence=0.9,
+        )
+        run.start(workflow="solve")
+        run.finish(outcome, metadata={"verification_kind": "test-suite"})
+
+    recent = ledger.list_runs(session_id="session-feedback")
+    assert len(recent) == 3
+    assert recent[0]["metadata"]["route_reason"] == "focused edit"
+    assert recent[0]["metadata"]["verification_kind"] == "test-suite"
+    assert ledger.routing_summary()["solve"] == {
+        "runs": 3,
+        "succeeded": 2,
+        "failed": 1,
+    }
+    ledger.close()
+
+
 def test_cancellable_shell_terminates_a_running_process_promptly(tmp_path):
     token = CancellationToken()
     result = {}

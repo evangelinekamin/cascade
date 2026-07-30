@@ -1,17 +1,18 @@
 """Permission verdict engine: the always-present gate on tool execution.
 
 Design (from the Claude Code / Codex / rtk research, tuned for a
-default-AUTO posture): safety comes from structure, not from prompting
-the user about everything. Evaluation order is the load-bearing
-property — deny and sacred checks run BEFORE any auto-allow, so no
-posture, rule, or mode can silently touch credentials, cascade's own
-config, or run structurally dangerous shell.
+default-AUTO posture): safety comes from structure and background review,
+not permission popups. Evaluation order is the load-bearing property:
+explicit denies and the root/home deletion circuit breaker run before any
+automatic approval.
 
 Postures:
 - "auto"     (default): reads, workspace writes, and TRANSPARENT shell
-  auto-approve; sacred paths, catastrophic shell, and opaque shell ask;
-  everything is recorded in the audit trail so autonomy stays inspectable.
-- "safe":    reads auto-approve; every mutation asks.
+  auto-approve; ambiguous actions receive a tool-less background review.
+- "yolo":    everything except explicit denies and the root/home deletion
+  circuit breaker runs immediately, without background review.
+- "safe":    compatibility posture: reads auto-approve and every mutation is
+  background-reviewed. It never opens a prompt.
 - "readonly": reads auto-approve; every mutation denies.
 
 Threat model and residual risk (be honest -- default-auto trades some
@@ -20,15 +21,14 @@ catastrophic-command list, (b) sacred-path access by any tool, (c) shell
 whose intent is not textually transparent (inline code, expansion-built
 command words), and (d) writes outside the workspace. A shell blocklist
 can NEVER be complete against an adversary -- shell is Turing-complete --
-so the opaque-shell rule is the real structural defense: cascade refuses
-to auto-approve what it cannot understand rather than pretending to
-enumerate every dangerous form. What still auto-approves under "auto":
+so the opaque-shell rule is the real structural defense: Cascade reviews
+what it cannot understand rather than pretending to enumerate every
+dangerous form. What still auto-approves under "auto":
 transparent, in-workspace, non-catastrophic commands, some of which
 could be mildly destructive (a plain `mv`/`truncate` of a project file).
-That is the accepted cost of a default-auto posture; switch to "safe" to
-gate every mutation. CLI-proxy providers run their own tools in a
-subprocess cascade cannot gate -- the floors apply to the direct-API
-providers (Eve's post-08/05 daily drivers), not proxy tool calls.
+That is the accepted cost of a default-auto posture. CLI-proxy providers
+run their own tools in a subprocess Cascade cannot interpose on, so their
+native no-prompt mode and sandbox form the corresponding boundary.
 
 Rule grammar (config/permissions.yaml allow/deny/ask lists):
 - "tool_name"             — whole tool
@@ -46,7 +46,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import Any, Callable, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .schema import ToolDef
@@ -59,13 +59,13 @@ class PermissionAbort(Exception):
 
 @dataclass(frozen=True)
 class Verdict:
-    decision: str  # "allow" | "ask" | "deny"
+    decision: str  # "allow" | "review" | "deny"
     reason: str
     rule: str = ""
 
 
-# Paths no posture may touch without an explicit ask — evaluated before
-# any auto-allow, immune to allow rules.
+# Paths that require background review in auto mode. Explicit deny rules still
+# outrank review, while yolo intentionally bypasses this list.
 SACRED_PATTERNS = (
     "/.git/",
     "/.cascade/",
@@ -302,6 +302,117 @@ def _dangerous_shell(command: str) -> Optional[str]:
     return None
 
 
+def _root_or_home_deletion(command: str) -> Optional[str]:
+    """Catch catastrophic recursive deletion even in yolo mode."""
+    home = Path.home().resolve()
+
+    def _is_root_or_home(target: str) -> bool:
+        original = target.strip("'\"")
+        raw = original.rstrip("/") or "/"
+        broad_roots = {
+            "/", "/*", "/.*", "/{*,.*}",
+            "~", "~/*", "~/.*", "~/{*,.*}",
+            "$HOME", "$HOME/*", "$HOME/.*", "$HOME/{*,.*}",
+            "${HOME}", "${HOME}/*", "${HOME}/.*", "${HOME}/{*,.*}",
+            str(home), f"{home}/*", f"{home}/.*", f"{home}/{{*,.*}}",
+        }
+        if original in broad_roots or raw in {"~", "$HOME", "${HOME}"}:
+            return True
+        # A wildcard/brace directly below root or home is effectively a broad
+        # deletion of that anchor even though the literal target is not equal
+        # to the anchor (`/[!.]*`, `~/D*`, `${HOME}/{*,.*}`).
+        for anchor in ("/", "~", "$HOME", "${HOME}", str(home)):
+            prefix = anchor if anchor == "/" else anchor + "/"
+            if not original.startswith(prefix):
+                continue
+            leaf = original[len(prefix):].rstrip("/")
+            if leaf and "/" not in leaf and any(char in leaf for char in "*?[{"):
+                return True
+        try:
+            return Path(raw).expanduser().resolve() in {Path("/"), home}
+        except (OSError, ValueError):
+            return False
+
+    wrappers = {"sudo", "doas", "command", "env", "nohup", "xargs"}
+    options_with_values = {
+        "-u", "--user", "-g", "--group", "-h", "--host",
+        "-p", "--prompt", "-C", "--chdir", "-R", "--chroot",
+        "-a", "--arg-file", "-E", "--eof", "-I", "--replace",
+        "-L", "--max-lines", "-n", "--max-args", "-P", "--max-procs",
+        "-s", "--max-chars",
+    }
+
+    def _command_index(tokens: list[str]) -> int:
+        """Skip common execution wrappers without treating plain arguments
+        (for example `echo rm -rf /`) as commands."""
+        index = 0
+        while index < len(tokens):
+            name = tokens[index].rsplit("/", 1)[-1]
+            if name not in wrappers:
+                return index
+            index += 1
+            while index < len(tokens):
+                token = tokens[index]
+                if token == "--":
+                    index += 1
+                    break
+                if name == "env" and "=" in token and not token.startswith("-"):
+                    index += 1
+                    continue
+                if not token.startswith("-"):
+                    break
+                option = token.split("=", 1)[0]
+                index += 1
+                if option in options_with_values and "=" not in token:
+                    index += 1
+        return index
+
+    def _scan(text: str, depth: int = 0) -> bool:
+        for segment in _shell_segments(text):
+            tokens = _shell_tokens(segment)
+            if not tokens:
+                continue
+            index = _command_index(tokens)
+            if index >= len(tokens):
+                continue
+            command_name = tokens[index].rsplit("/", 1)[-1]
+            tail = tokens[index + 1:]
+            if command_name in {"rm", "rmdir"}:
+                recursive = command_name == "rmdir" or any(
+                    option in {"--recursive", "--force"}
+                    or (
+                        option.startswith("-")
+                        and any(flag in option[1:] for flag in ("r", "R", "f"))
+                    )
+                    for option in tail
+                )
+                targets = [item for item in tail if not item.startswith("-")]
+                if recursive and any(_is_root_or_home(item) for item in targets):
+                    return True
+            if (
+                command_name == "find"
+                and any(option in {"-delete", "-exec"} for option in tail)
+            ):
+                roots = [item for item in tail if not item.startswith("-")]
+                if roots and _is_root_or_home(roots[0]):
+                    return True
+            # `sh -c 'rm -rf /'` keeps the destructive command inside one
+            # quoted argv item. Inspect that script once as well.
+            if (
+                depth == 0
+                and command_name in {"sh", "bash", "zsh", "ksh", "dash", "fish"}
+                and "-c" in tail
+            ):
+                script_index = tail.index("-c") + 1
+                if script_index < len(tail) and _scan(tail[script_index], depth + 1):
+                    return True
+        return False
+
+    if _scan(command):
+        return "recursive deletion of filesystem root/home"
+    return None
+
+
 def _shell_segments(command: str) -> list[str]:
     """Split a compound command; every segment must pass independently."""
     return [seg.strip() for seg in _SHELL_SPLIT.split(command) if seg.strip()]
@@ -371,40 +482,75 @@ def _opaque_shell_reason(command: str) -> Optional[str]:
     return None
 
 
-# Verdict tiers that stay refused even in an unattended worktree lane: a worktree
-# is a git checkout on the real filesystem, not a sandbox, so system-wide
-# destruction (curl|sh, rm -rf ~) and secret exfiltration (~/.ssh, .env) must
-# never auto-run just because there is no one to answer a prompt.
-_UNATTENDED_FLOORS = ("sacred", "never-auto")
+@dataclass(frozen=True)
+class PermissionContext:
+    """Trusted request context captured before tool results are appended."""
+
+    objective: str = ""
+    provider: str = ""
+    model: str = ""
+    mode: str = ""
 
 
-def unattended_ask_handler(tool_name: str, arguments: dict, verdict: "Verdict") -> str:
-    """Auto-approve resolver for isolated worktree lanes (competition/solve/fanout).
+@dataclass(frozen=True)
+class PermissionReview:
+    """One ambiguous action sent to the background safety reviewer."""
 
-    These lanes run with no user to answer a modal, so a routine ask (running
-    tests, an opaque interpreter, an out-of-workspace scratch write, a package
-    fetch) is approved and the run proceeds without a popup. The two
-    non-bypassable catastrophic floors are refused instead of run.
-    """
-    if verdict.rule in _UNATTENDED_FLOORS:
-        return "deny"
-    return "allow"
+    tool_name: str
+    arguments: dict[str, Any]
+    reason: str
+    rule: str
+    workspace_root: str
+    context: PermissionContext = PermissionContext()
+
+
+@dataclass(frozen=True)
+class ReviewDecision:
+    """Normalized result from a tool-less background reviewer."""
+
+    allow: bool
+    reason: str
+
+
+ReviewHandler = Callable[[PermissionReview], ReviewDecision]
+
+
+def permission_context_from_messages(
+    messages: list[dict],
+    *,
+    provider: str = "",
+    model: str = "",
+    mode: str = "",
+) -> PermissionContext:
+    """Capture the latest user objective without including tool results."""
+    objective = ""
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            objective = content.strip()[:6000]
+            break
+    return PermissionContext(
+        objective=objective,
+        provider=provider,
+        model=model,
+        mode=mode,
+    )
 
 
 class PermissionEngine:
-    """Evaluate tool calls against rules, sacred paths, and posture.
-
-    One instance is shared by every tool loop (wired onto providers by
-    CascadeCore, like hook_runner). ``ask_handler`` resolves "ask"
-    verdicts interactively; when None (headless lanes), asks become
-    structured denials with deny-and-continue escalation bounds.
-    """
+    """Resolve tool actions without ever requiring interactive approval."""
 
     @staticmethod
     def normalize_posture(posture: object) -> str:
-        """Coerce a posture value, failing CLOSED (to safe) on anything odd."""
+        """Coerce a posture value, failing closed to auto on anything odd."""
         value = str(posture or "").lower()
-        return value if value in ("auto", "safe", "readonly") else "safe"
+        return (
+            value
+            if value in ("auto", "yolo", "safe", "readonly")
+            else "auto"
+        )
 
     def __init__(
         self,
@@ -414,18 +560,21 @@ class PermissionEngine:
         ask: tuple[str, ...] = (),
         workspace_root: Optional[str] = None,
         audit_limit: int = 200,
+        review_handler: Optional[ReviewHandler] = None,
     ) -> None:
         self._posture = self.normalize_posture(posture)
         self._allow = tuple(filter(None, (parse_rule(r) for r in allow)))
         self._deny = tuple(filter(None, (parse_rule(r) for r in deny)))
         self._ask = tuple(filter(None, (parse_rule(r) for r in ask)))
         self._workspace_root = Path(workspace_root or ".").expanduser().resolve()
-        self._session_grants: set[str] = set()
-        self.ask_handler: Optional[Callable[[str, dict, Verdict], str]] = None
+        self.review_handler = review_handler
         # deque(maxlen) append is atomic under the GIL and self-bounds, so
         # parallel lanes cannot race an append against a reslice.
         self.audit: deque = deque(maxlen=audit_limit)
         self._lock = threading.Lock()
+        # Tool handlers may overlap, but reviews mutate shared counters and can
+        # make provider calls. Keep that boundary single-file.
+        self._resolution_lock = threading.RLock()
         self.consecutive_denials = 0
         self.total_denials = 0
 
@@ -435,12 +584,9 @@ class PermissionEngine:
 
     @posture.setter
     def posture(self, value: object) -> None:
-        # A posture switch revokes prior session grants and resets the
-        # escalation counters, so "always allow" from a looser posture can
-        # never outrank a newly-restrictive one.
+        # A posture switch resets denial escalation for the new policy.
         self._posture = self.normalize_posture(value)
         with self._lock:
-            self._session_grants.clear()
             self.consecutive_denials = 0
             self.total_denials = 0
 
@@ -449,7 +595,7 @@ class PermissionEngine:
 
         Worktree lanes get one of these (root = the worktree) so in-worktree
         writes auto-approve while the sacred/dangerous floors still catch
-        escapes; each lane's counters/grants/audit are its own, so concurrent
+        escapes; each lane's counters/audit are its own, so concurrent
         lanes cannot poison one another or the chat loop.
         """
         clone = PermissionEngine(
@@ -460,32 +606,12 @@ class PermissionEngine:
         clone._allow = self._allow
         clone._deny = self._deny
         clone._ask = self._ask
-        clone.ask_handler = self.ask_handler
+        clone.review_handler = self.review_handler
         return clone
 
     def for_unattended_workspace(self, workspace_root: str) -> "PermissionEngine":
-        """A worktree-scoped engine that auto-approves routine asks (no prompts).
-
-        Same scoping as ``for_workspace`` but with an auto-approve resolver in
-        place of the inherited interactive one: isolated lanes (competition,
-        solve, fanout) have no user to answer a modal, so routine asks are
-        approved and only the non-bypassable catastrophic floors are refused.
-        """
-        clone = self.for_workspace(workspace_root)
-        clone.ask_handler = unattended_ask_handler
-        return clone
-
-    # -- rule store -----------------------------------------------------
-
-    def grant_session(self, tool_name: str, primary_arg: str = "") -> None:
-        """User chose "always allow (this session)" for this shape."""
-        with self._lock:
-            self._session_grants.add(self._grant_key(tool_name, primary_arg))
-
-    @staticmethod
-    def _grant_key(tool_name: str, primary_arg: str) -> str:
-        head = primary_arg.split()[0] if primary_arg else ""
-        return f"{tool_name}:{head}"
+        """Return a popup-free worktree-scoped engine for autonomous lanes."""
+        return self.for_workspace(workspace_root)
 
     # -- evaluation -----------------------------------------------------
 
@@ -495,8 +621,8 @@ class PermissionEngine:
         tool_name: str,
         arguments: dict,
     ) -> Verdict:
-        """Pure verdict: deny > sacred > never-auto shell > ask rules >
-        session grants > posture auto-allow > allow rules > posture default."""
+        """Pure verdict: deny > circuit breaker > review rules >
+        posture auto-allow > allow rules > posture default."""
         primary = _primary_arg(tool_name, arguments)
 
         for rule in self._deny:
@@ -505,78 +631,91 @@ class PermissionEngine:
 
         is_fetch = tool_name in ("web_fetch", "web_search") or "url" in arguments
         is_shell = "command" in arguments and isinstance(arguments.get("command"), str)
+        if is_shell and (circuit_reason := _root_or_home_deletion(primary)):
+            return Verdict("deny", circuit_reason, "circuit-breaker")
+        if self._posture == "yolo":
+            return Verdict("allow", "yolo posture", "yolo")
 
-        # Sacred paths are immune to posture and rank above every auto-allow,
-        # INCLUDING read-only auto-allow: reading ~/.ssh/id_rsa or .env is
-        # exfiltration. Checked for every filesystem-touching tool (fetch is
-        # URLs, not paths, and is gated separately below).
+        # Secret/config paths require review before read-only auto-approval.
         if not is_fetch:
             if is_shell:
                 sacred_hit = _command_hits_sacred(primary)
             else:
                 sacred_hit = _path_hits_sacred(primary)
             if sacred_hit:
-                return Verdict("ask", f"touches sacred path ({sacred_hit})", "sacred")
+                return Verdict(
+                    "review", f"touches protected path ({sacred_hit})", "sacred",
+                )
+
+        # Readonly is a hard posture, not a default that an allow rule or
+        # dangerous-shell review can accidentally override.
+        if self._posture == "readonly" and (
+            is_fetch or is_shell or self._is_write_tool(tool)
+        ):
+            reason = (
+                "readonly posture blocks network egress"
+                if is_fetch
+                else "readonly posture blocks mutations"
+            )
+            return Verdict("deny", reason, "posture")
 
         # Network egress: gated separately from filesystem writes (it is the
         # primary exfiltration lever). Auto-approve only preapproved
-        # read-only docs domains; every other host asks once.
+        # read-only docs domains; every other host receives review.
         if is_fetch:
             for rule in self._ask:
                 if rule.matches(tool_name, primary):
-                    return Verdict("ask", f"ask rule {rule.tool}", "ask-rule")
+                    return Verdict("review", f"review rule {rule.tool}", "ask-rule")
             # web_search contacts a single fixed search endpoint, not a
             # user-controlled host: the only thing leaving the machine is the
             # query text. Strictly safer than web_fetch's arbitrary-host GET --
             # auto-approve unless the posture forbids all egress.
             if tool_name == "web_search":
-                if self.posture == "readonly":
-                    return Verdict("deny", "readonly posture blocks network egress", "posture")
                 return Verdict("allow", "web search (fixed endpoint)", "web-search")
             host = _url_host(primary)
-            if self._grant_key(tool_name, host) in self._session_grants:
-                return Verdict("allow", "host granted this session", "session-grant")
             for rule in self._allow:
                 if rule.matches(tool_name, primary) or rule.matches(tool_name, host):
                     return Verdict("allow", f"allow rule {rule.tool}", "allow-rule")
             if host and any(host == d or host.endswith("." + d) for d in PREAPPROVED_FETCH_DOMAINS):
                 return Verdict("allow", f"preapproved docs domain ({host})", "docs-allowlist")
-            if self.posture == "readonly":
-                return Verdict("deny", "readonly posture blocks network egress", "posture")
-            return Verdict("ask", f"fetch from {host or 'unknown host'}", "network")
+            return Verdict(
+                "review", f"fetch from {host or 'unknown host'}", "network",
+            )
 
-        # -- shell floors (below deny/sacred, ABOVE ask/grant/allow rules) --
-        # These are non-bypassable: an allow rule or session grant must not
-        # re-enable catastrophic or opaque shell.
+        # Ambiguous shell actions reach the background reviewer before broad
+        # allow rules can re-enable them.
         if is_shell:
             for candidate in [primary, *_shell_segments(primary)]:
                 if danger := _dangerous_shell(candidate):
                     return Verdict(
-                        "ask", f"dangerous shell construct ({danger})", "never-auto",
+                        "review",
+                        f"dangerous shell construct ({danger})",
+                        "never-auto",
                     )
                 if _RM_RELATIVE_BROAD.search(candidate):
                     return Verdict(
-                        "ask", "recursive rm on '.'/'..'/glob", "never-auto",
+                        "review", "recursive rm on '.'/'..'/glob", "never-auto",
                     )
             # Opaque and out-of-workspace shell writes are floors too, so a
-            # loose allow rule / "always" grant cannot re-open inline-code RCE
-            # or an out-of-workspace write. (Only meaningful under auto; safe/
-            # readonly ask/deny all shell mutations at the posture branch.)
+            # loose allow rule cannot re-open inline-code RCE or an
+            # out-of-workspace write. (Only meaningful under auto; safe and
+            # readonly review/deny shell mutations at the posture branch.)
             if self._posture == "auto":
                 if reason := _opaque_shell_reason(primary):
-                    return Verdict("ask", f"opaque shell ({reason})", "opaque-shell")
+                    return Verdict(
+                        "review", f"opaque shell ({reason})", "opaque-shell",
+                    )
                 for target in _redirect_targets(primary):
                     if not self._in_workspace(target):
                         return Verdict(
-                            "ask", f"shell write outside workspace ({target})", "workspace",
+                            "review",
+                            f"shell write outside workspace ({target})",
+                            "workspace",
                         )
 
         for rule in self._ask:
             if rule.matches(tool_name, primary):
-                return Verdict("ask", f"ask rule {rule.tool}", "ask-rule")
-
-        if self._grant_key(tool_name, primary) in self._session_grants:
-            return Verdict("allow", "granted for this session", "session-grant")
+                return Verdict("review", f"review rule {rule.tool}", "ask-rule")
 
         if tool is not None and tool.is_read_only:
             return Verdict("allow", "read-only tool", "read-only")
@@ -587,13 +726,11 @@ class PermissionEngine:
 
         is_write = self._is_write_tool(tool)
 
-        if self._posture == "readonly":
-            if is_write or is_shell:
-                return Verdict("deny", "readonly posture blocks mutations", "posture")
-            return Verdict("allow", "readonly posture allows reads", "posture")
         if self._posture == "safe":
             if is_write or is_shell:
-                return Verdict("ask", "safe posture asks for mutations", "posture")
+                return Verdict(
+                    "review", "safe posture reviews mutations", "posture",
+                )
             return Verdict("allow", "safe posture allows reads", "posture")
 
         # posture == "auto": file writes must stay in the workspace (shell was
@@ -601,7 +738,9 @@ class PermissionEngine:
         if is_write and not is_shell:
             path = arguments.get("path") or arguments.get("file_path") or ""
             if isinstance(path, str) and path and not self._in_workspace(path):
-                return Verdict("ask", f"write outside workspace ({path})", "workspace")
+                return Verdict(
+                    "review", f"write outside workspace ({path})", "workspace",
+                )
         return Verdict("allow", "auto posture", "posture")
 
     @staticmethod
@@ -619,75 +758,85 @@ class PermissionEngine:
         root = self._workspace_root
         return resolved == root or root in resolved.parents
 
-    # -- resolution (ask handling, escalation, audit) -------------------
+    # -- resolution (background review, escalation, audit) ---------------
 
     def resolve(
         self,
         tool: Optional["ToolDef"],
         tool_name: str,
         arguments: dict,
+        context: Optional[PermissionContext] = None,
     ) -> Verdict:
-        """Evaluate and fully resolve: asks go to the handler or become
-        structured denials with escalation bounds. Records the audit trail."""
+        """Resolve an action to allow/deny; this method never prompts."""
+        with self._resolution_lock:
+            return self._resolve_locked(
+                tool,
+                tool_name,
+                arguments,
+                context or PermissionContext(),
+            )
+
+    def _resolve_locked(
+        self,
+        tool: Optional["ToolDef"],
+        tool_name: str,
+        arguments: dict,
+        context: PermissionContext,
+    ) -> Verdict:
+        """Resolve one verdict while the background-review gate is held."""
         verdict = self.evaluate(tool, tool_name, arguments)
         primary = _primary_arg(tool_name, arguments)
 
-        # Session grants for fetch are keyed by host, not the full URL, so
-        # "always allow docs.foo.com" covers every page on that host.
-        grant_arg = _url_host(primary) if verdict.rule == "network" else primary
-
-        user_approved = False
-        if verdict.decision == "ask":
-            if self.ask_handler is not None:
-                answer = "deny"
+        reviewed_allow = False
+        if verdict.decision == "review":
+            review = PermissionReview(
+                tool_name=tool_name,
+                arguments=dict(arguments),
+                reason=verdict.reason,
+                rule=verdict.rule,
+                workspace_root=str(self._workspace_root),
+                context=context,
+            )
+            decision = None
+            if self.review_handler is not None:
                 try:
-                    answer = self.ask_handler(tool_name, arguments, verdict)
+                    decision = self.review_handler(review)
                 except Exception:
-                    answer = "deny"
-                if answer == "always" and self._is_grantable(verdict.rule):
-                    self.grant_session(tool_name, grant_arg)
-                    verdict = Verdict("allow", "approved (always this session)", verdict.rule)
-                    user_approved = True
-                elif answer in ("allow", "always"):
-                    # "always" on a non-grantable tier (sacred/never-auto/
-                    # opaque/ask rule) approves this one call only.
-                    verdict = Verdict("allow", "approved by user", verdict.rule)
-                    user_approved = True
-                else:
-                    verdict = self._deny_and_escalate(
-                        verdict, f"not approved: {verdict.reason}",
-                    )
+                    decision = None
+            if isinstance(decision, ReviewDecision) and decision.allow:
+                verdict = Verdict(
+                    "allow",
+                    f"background review approved: {decision.reason}",
+                    verdict.rule,
+                )
+                reviewed_allow = True
             else:
+                reason = (
+                    decision.reason
+                    if isinstance(decision, ReviewDecision) and decision.reason
+                    else "background reviewer unavailable"
+                )
                 verdict = self._deny_and_escalate(
                     verdict,
-                    f"{verdict.reason} — blocked in unattended mode; "
-                    "choose a safer approach",
+                    f"{verdict.reason} — blocked by background review: {reason}",
                 )
+        elif verdict.decision == "deny":
+            # Hard policy denials are just as capable of trapping an agent in
+            # a retry loop as reviewer denials, so they share the same bound.
+            verdict = self._deny_and_escalate(verdict, verdict.reason)
 
-        # Only a genuine user approval clears the consecutive streak, so a
+        # Only a reviewed approval clears the consecutive streak, so a
         # compromised agent cannot alternate auto-allowed reads/writes to
         # keep the escalation counter pinned at zero forever.
-        if user_approved:
+        if reviewed_allow:
             with self._lock:
                 self.consecutive_denials = 0
 
         self._record(tool_name, primary, verdict)
         return verdict
 
-    @staticmethod
-    def _is_grantable(rule: str) -> bool:
-        """Whether an 'always' grant is allowed for this verdict's tier.
-
-        Structural tiers (sacred paths, dangerous shell, explicit ask rules)
-        are never blanket-granted -- only per-host fetch and posture-level
-        asks are."""
-        return rule in ("network", "posture", "workspace")
-
     def _deny_and_escalate(self, verdict: "Verdict", reason: str) -> "Verdict":
-        """Turn an unapproved ask into a deny, counting toward escalation.
-
-        Interactive denials count too, so a model cannot re-raise the same
-        ask every round for unbounded modal fatigue."""
+        """Count a blocked action and bound agent retries."""
         with self._lock:
             self.consecutive_denials += 1
             self.total_denials += 1
@@ -703,10 +852,6 @@ class PermissionEngine:
                 "escalation",
             )
         return Verdict("deny", reason, verdict.rule)
-
-    def clear_session_grants(self) -> None:
-        with self._lock:
-            self._session_grants.clear()
 
     def _record(self, tool_name: str, primary: str, verdict: Verdict) -> None:
         self.audit.append((tool_name, primary[:80], verdict.decision, verdict.rule))

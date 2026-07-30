@@ -1,0 +1,131 @@
+# Deterministic, execution-graded tasks derived from real project patterns.
+# Every fixture starts red and is copied into an isolated temporary Git repo.
+tasks:
+  - id: parser-regression
+    source: cascade
+    fixture: ./fixtures/parser-regression
+    prompt: Fix the quoted-field parser regression and add a focused regression test.
+    verify:
+      - python3 -m pytest -q
+    expected_files:
+      - src/parser.py
+    timeout: 600
+
+  - id: independent-endpoints
+    source: cascade
+    fixture: ./fixtures/service
+    prompt: >-
+      Add independent endpoints: /health returns (200, {"status": "ok"}) and
+      /version returns (200, {"version": "1.0.0"}). Preserve the 404 fallback.
+    verify:
+      - python3 -m pytest -q
+      - python3 -m compileall -q src
+    timeout: 900
+
+  - id: pagination-boundaries
+    source: localqwen/bug_fix_pagination
+    fixture: ./fixtures/pagination
+    prompt: >-
+      Fix paginate so exact multiples, partial final pages, and empty
+      collections report the correct total_pages. Reject page < 1 or
+      page_size < 1 with ValueError. Preserve the result shape.
+    verify:
+      - python3 -m pytest -q
+    expected_files:
+      - src/pagination.py
+    timeout: 600
+
+  - id: ibkr-flex-helpers
+    source: localqwen/aqua_ibkr_parser
+    fixture: ./fixtures/flex-helpers
+    prompt: >-
+      Implement the three IBKR Flex helpers in src/flex_helpers.py:
+      transient-error classification, forgiving numeric parsing, and
+      first-present non-empty attribute selection. Keep the public signatures.
+    verify:
+      - python3 -m pytest -q
+    expected_files:
+      - src/flex_helpers.py
+    timeout: 600
+
+  - id: pcb-bom-rollup
+    source: github/evangelinekamin/Etchant
+    fixture: ./fixtures/bom-rollup
+    prompt: >-
+      Implement deterministic JLCPCB BOM rollup. Exclude DNP or missing-LCSC
+      components, group only identical LCSC/value/footprint triples, use natural
+      reference ordering, and sort output rows by LCSC then value and footprint.
+    verify:
+      - python3 -m pytest -q
+    expected_files:
+      - src/bom.py
+    timeout: 600
+
+  - id: resilient-retry-policy
+    source: github/evangelinekamin/twitter-mcp
+    fixture: ./fixtures/retry-policy
+    prompt: >-
+      Implement retry_delays. Retry 408, 429, and 5xx statuses with capped
+      exponential delays; stop on success or any other status. Support any
+      iterable and validate that base_seconds is positive and cap_seconds is
+      at least base_seconds.
+    verify:
+      - python3 -m pytest -q
+    expected_files:
+      - src/retry.py
+    timeout: 600
+
+  - id: search-cache-lru-ttl
+    source: localqwen/scarlett_search_cache
+    fixture: ./fixtures/scarlett-search-cache
+    prompt: >-
+      Implement the missing SearchCache get/put/sweep methods and deterministic
+      normalize_cache_key in services/search_cache.py. Preserve the supplied
+      API, statistics, monotonic-clock behavior, TTL semantics, and LRU order.
+    verify:
+      - python3 -m pytest -q
+    expected_files:
+      - services/search_cache.py
+    timeout: 900
+
+  - id: fashion-query-decomposer
+    source: localqwen/scarlett_query_decomposer
+    fixture: ./fixtures/scarlett-query-decomposer
+    prompt: >-
+      Implement decompose_query and decompose_queries in
+      services/query_decomposer.py. Use the supplied anchors/modifier tables and
+      helpers to produce deterministic retailer-friendly queries while
+      preserving colors, silhouettes, and useful fallbacks.
+    verify:
+      - python3 -m pytest -q
+    expected_files:
+      - services/query_decomposer.py
+    timeout: 900
+
+  - id: style-quiz-vector-update
+    source: localqwen/scarlett_quiz_session
+    fixture: ./fixtures/scarlett-quiz-session
+    prompt: >-
+      Implement the three missing style-vector algorithms in
+      services/quiz_session.py: compute_style_dna, update_profile, and
+      cosine_similarity. Follow the supplied constants, category weights,
+      clamping, uncertainty, and zero-vector behavior exactly.
+    verify:
+      - python3 -m pytest -q
+    expected_files:
+      - services/quiz_session.py
+    timeout: 900
+
+  - id: product-translation-cache
+    source: localqwen/scarlett_product_translation
+    fixture: ./fixtures/scarlett-product-translation
+    prompt: >-
+      Implement every missing cache and translation function in
+      services/product_translation.py. Preserve the bounded LRU behavior,
+      CJK detection, async model-call contracts, tolerant JSON parsing,
+      stable input ordering, caching, and fail-open original-text fallbacks.
+    verify:
+      - python3 -m pytest -q
+    expected_files:
+      - services/product_translation.py
+    timeout: 900

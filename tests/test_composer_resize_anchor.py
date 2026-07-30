@@ -14,7 +14,6 @@ import pytest
 
 from cascade.app import CascadeTUI
 from cascade.history import HistoryDB
-from cascade.screens.main import MainScreen
 from cascade.widgets.input_frame import ChatTextArea
 from cascade.widgets.message import ChatHistory, MessageWidget
 

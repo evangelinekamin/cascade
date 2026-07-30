@@ -9,16 +9,22 @@ Shell hooks receive CASCADE_* environment variables (backward compat).
 
 import importlib
 import importlib.util
+import json
+import logging
 import os
+import signal
 import subprocess
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, fields, replace
 from typing import Any, Callable, Optional
 
 from .events import HookEvent
 from .context import HookContext, HookResult
 from .matchers import ToolMatcher
 
+
+logger = logging.getLogger("cascade.hooks")
 
 # Re-export HookEvent for backward compatibility
 __all__ = ["HookEvent", "HookDefinition", "HookRunner"]
@@ -44,10 +50,19 @@ class HookDefinition:
     enabled: bool = True
     priority: int = 100  # lower = runs first
     tool_filter: Optional[ToolMatcher] = None  # CC-style tool matcher
+    # None selects the safe event default: TOOL_CALL fails closed while
+    # observational hooks fail open. Set explicitly to override that policy.
+    fail_closed: Optional[bool] = None
 
     @property
     def is_python_hook(self) -> bool:
         return self.handler is not None
+
+    @property
+    def effective_fail_closed(self) -> bool:
+        if self.fail_closed is not None:
+            return self.fail_closed
+        return self.event == HookEvent.TOOL_CALL
 
     def matches_tool(self, tool_name: str, arguments: dict | None = None) -> bool:
         """Check if this hook applies to the given tool call.
@@ -70,10 +85,16 @@ class HookRunner:
     def __init__(self, hooks: tuple[HookDefinition, ...] = (), *, enabled: bool = True):
         self._hooks = hooks
         self.enabled = enabled
+        self._recent_results: deque[dict] = deque(maxlen=100)
 
     @property
     def hook_count(self) -> int:
         return len(self._hooks)
+
+    @property
+    def recent_results(self) -> tuple[dict, ...]:
+        """Recent hook outcomes for diagnostics and UI surfaces."""
+        return tuple(dict(result) for result in self._recent_results)
 
     def add_hook(self, hook: HookDefinition) -> "HookRunner":
         """Return a new runner with the hook added. Immutable."""
@@ -120,38 +141,49 @@ class HookRunner:
             List of result dicts with keys: name, success, output, duration,
             and optionally 'blocked' and 'transformed_value'.
         """
-        hooks = self.hooks_for_event(event)
+        # Build hook context if not provided
+        if hook_context is None:
+            hook_context = self._context_from_legacy(event, context or {})
+
+        tool_args = dict(hook_context.tool_input) if hook_context.tool_input else None
+        hooks = self.hooks_for_event(
+            event,
+            tool_name=hook_context.tool_name,
+            tool_args=tool_args,
+        )
         if not hooks:
             return []
 
-        # Build hook context if not provided
-        if hook_context is None:
-            hook_context = HookContext(
-                event=event.value,
-                **(context or {}),
-            )
-
-        # Build env dict for shell hooks
-        env = dict(os.environ)
-        env.update(hook_context.to_env_dict())
-        # Also merge legacy context dict
-        if context:
-            for key, value in context.items():
-                env_key = f"CASCADE_{key.upper()}"
-                env[env_key] = str(value)
-
         results = []
+        current_context = hook_context
         for hook in hooks:
+            env = dict(os.environ)
+            env.update(current_context.to_env_dict())
+            # Also merge legacy context dict.
+            if context:
+                for key, value in context.items():
+                    env_key = f"CASCADE_{key.upper()}"
+                    env[env_key] = str(value)
             if hook.is_python_hook:
-                result = self._run_python_hook(hook, hook_context)
+                result = self._run_python_hook(hook, self._copy_context(current_context))
             else:
-                result = self._run_shell_hook(hook, env)
+                result = self._run_shell_hook(hook, env, current_context)
 
+            failed = not result.get("success")
+            if failed and hook.effective_fail_closed:
+                result["blocked"] = True
             results.append(result)
+            self._record_result(event, result)
 
             # If a hook blocked, stop processing remaining hooks
             if result.get("blocked"):
                 break
+            if failed:
+                continue
+            if result.get("transformed_value") is not None:
+                current_context = self._context_after_transform(
+                    event, current_context, result["transformed_value"],
+                )
 
         return results
 
@@ -160,10 +192,10 @@ class HookRunner:
         event: HookEvent,
         hook_context: HookContext,
     ) -> Optional[HookResult]:
-        """Emit an event and return the first blocking/transforming result.
+        """Emit an event, stopping on a block and chaining transformations.
 
-        This is the preferred API for new code. Returns None if no hook
-        blocked or transformed.
+        This is the preferred API for new code. Returns the final transform,
+        the first block, or None when every hook passes through.
         """
         # Extract tool info from context for pattern matching
         tool_name = hook_context.tool_name
@@ -172,32 +204,55 @@ class HookRunner:
         if not hooks:
             return None
 
-        env = dict(os.environ)
-        env.update(hook_context.to_env_dict())
-
+        current_context = hook_context
+        transformed = False
+        transformed_value: Any = None
         for hook in hooks:
+            env = dict(os.environ)
+            env.update(current_context.to_env_dict())
             if hook.is_python_hook:
-                result_dict = self._run_python_hook(hook, hook_context)
+                result_dict = self._run_python_hook(
+                    hook, self._copy_context(current_context),
+                )
             else:
-                result_dict = self._run_shell_hook(hook, env)
+                result_dict = self._run_shell_hook(hook, env, current_context)
+
+            failed = not result_dict.get("success")
+            if failed and hook.effective_fail_closed:
+                result_dict["blocked"] = True
+            self._record_result(event, result_dict)
 
             if result_dict.get("blocked"):
                 return HookResult(
                     block=True,
-                    reason=result_dict.get("output", ""),
+                    reason=(
+                        result_dict.get("output")
+                        or f"Hook '{hook.name}' failed"
+                    ),
                 )
+            if failed:
+                continue
             if result_dict.get("transformed_value") is not None:
-                return HookResult(
-                    transformed_value=result_dict["transformed_value"],
+                transformed = True
+                transformed_value = result_dict["transformed_value"]
+                current_context = self._context_after_transform(
+                    event, current_context, transformed_value,
                 )
 
-        return None
+        return (
+            HookResult(transformed_value=transformed_value)
+            if transformed
+            else None
+        )
 
     def _run_python_hook(self, hook: HookDefinition, ctx: HookContext) -> dict:
         """Execute a Python module hook."""
         start = time.monotonic()
         try:
-            result = hook.handler(ctx)
+            handler = hook.handler
+            if handler is None:
+                raise RuntimeError("Python hook has no handler")
+            result = handler(ctx)
             duration = time.monotonic() - start
 
             output: dict[str, Any] = {
@@ -219,6 +274,7 @@ class HookRunner:
 
         except Exception as e:
             duration = time.monotonic() - start
+            logger.warning("Python hook %s failed: %s", hook.name, e)
             return {
                 "name": hook.name,
                 "success": False,
@@ -227,29 +283,82 @@ class HookRunner:
                 "type": "python",
             }
 
-    def _run_shell_hook(self, hook: HookDefinition, env: dict) -> dict:
-        """Execute a shell command hook."""
+    def _run_shell_hook(
+        self,
+        hook: HookDefinition,
+        env: dict,
+        ctx: HookContext,
+    ) -> dict:
+        """Execute a shell hook with structured context on stdin.
+
+        Environment variables remain for compatibility. New hooks should read
+        the JSON payload from stdin and may return a JSON control object:
+        ``{"block": true, "reason": "..."}`` or
+        ``{"transformed_value": ...}``.
+        """
         start = time.monotonic()
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 hook.command,
                 shell=True,
-                capture_output=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=hook.timeout,
                 env=env,
+                start_new_session=os.name == "posix",
             )
+            payload = json.dumps(ctx.to_payload(), default=str)
+            try:
+                stdout_raw, stderr_raw = proc.communicate(
+                    input=payload,
+                    timeout=hook.timeout,
+                )
+            except subprocess.TimeoutExpired:
+                if os.name == "posix":
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    proc.kill()
+                proc.communicate()
+                raise
             duration = time.monotonic() - start
-            return {
+            stdout = stdout_raw.strip()
+            stderr = stderr_raw.strip()
+            control = self._parse_shell_control(stdout)
+            output = stdout or stderr
+            result = {
                 "name": hook.name,
                 "success": proc.returncode == 0,
-                "output": proc.stdout.strip() or proc.stderr.strip(),
+                "output": output,
                 "return_code": proc.returncode,
                 "duration": round(duration, 3),
                 "type": "shell",
             }
+            if control is not None:
+                if control.get("blocked"):
+                    result["blocked"] = True
+                    result["output"] = control.get("reason") or output
+                if "transformed_value" in control:
+                    result["transformed_value"] = control["transformed_value"]
+            # Exit 2 is the conventional blocking status used by coding-agent
+            # hook systems. Preserve stderr/stdout as the reason.
+            if proc.returncode == 2:
+                result["blocked"] = True
+                result["output"] = stderr or stdout or f"Hook '{hook.name}' blocked the event"
+            if proc.returncode != 0:
+                logger.warning(
+                    "Shell hook %s exited %s: %s",
+                    hook.name,
+                    proc.returncode,
+                    stderr or stdout,
+                )
+            return result
         except subprocess.TimeoutExpired:
             duration = time.monotonic() - start
+            logger.warning("Shell hook %s timed out after %ss", hook.name, hook.timeout)
             return {
                 "name": hook.name,
                 "success": False,
@@ -260,6 +369,7 @@ class HookRunner:
             }
         except Exception as e:
             duration = time.monotonic() - start
+            logger.warning("Shell hook %s failed: %s", hook.name, e)
             return {
                 "name": hook.name,
                 "success": False,
@@ -268,6 +378,130 @@ class HookRunner:
                 "duration": round(duration, 3),
                 "type": "shell",
             }
+
+    @staticmethod
+    def _parse_shell_control(output: str) -> Optional[dict[str, Any]]:
+        """Normalize supported subprocess-hook JSON control shapes."""
+        if not output:
+            return None
+        try:
+            value = json.loads(output)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(value, dict):
+            return None
+
+        decision = str(value.get("decision") or value.get("action") or "").lower()
+        blocked = (
+            value.get("block") is True
+            or value.get("cancel") is True
+            or decision in {"block", "deny", "cancel"}
+        )
+        result: dict[str, Any] = {}
+        if blocked:
+            result["blocked"] = True
+            result["reason"] = str(
+                value.get("reason")
+                or value.get("message")
+                or value.get("errorMessage")
+                or ""
+            )
+
+        if "transformed_value" in value:
+            result["transformed_value"] = value["transformed_value"]
+        elif "overrideInput" in value:
+            result["transformed_value"] = value["overrideInput"]
+        elif "contextModification" in value:
+            result["transformed_value"] = value["contextModification"]
+        elif "context" in value:
+            result["transformed_value"] = value["context"]
+        return result or None
+
+    @staticmethod
+    def _copy_context(ctx: HookContext) -> HookContext:
+        """Give each Python hook fresh containers, matching the public contract."""
+        return replace(
+            ctx,
+            messages=tuple(dict(message) for message in ctx.messages),
+            tool_input=tuple(ctx.tool_input),
+            tool_log=tuple(dict(entry) for entry in ctx.tool_log),
+            metadata=tuple(ctx.metadata),
+        )
+
+    @staticmethod
+    def _context_after_transform(
+        event: HookEvent,
+        ctx: HookContext,
+        value: Any,
+    ) -> HookContext:
+        """Make the next transformer observe the previous transform."""
+        if event in {
+            HookEvent.INPUT_RECEIVED,
+            HookEvent.AGENT_START,
+            HookEvent.WORKFLOW_START,
+        }:
+            return replace(ctx, prompt=value if isinstance(value, str) else str(value))
+        if event == HookEvent.CONTEXT_BUILD:
+            return replace(ctx, system_prompt=value if isinstance(value, str) else str(value))
+        if event == HookEvent.BEFORE_PROVIDER_REQUEST and isinstance(value, (list, tuple)):
+            messages = tuple(dict(message) for message in value if isinstance(message, dict))
+            return replace(ctx, messages=messages)
+        if event == HookEvent.TOOL_CALL and isinstance(value, dict):
+            return replace(ctx, tool_input=tuple(value.items()))
+        if event == HookEvent.TOOL_RESULT:
+            return replace(ctx, tool_output=value if isinstance(value, str) else str(value))
+        if event in {HookEvent.AGENT_END, HookEvent.WORKFLOW_END}:
+            return replace(ctx, response=value if isinstance(value, str) else str(value))
+        return ctx
+
+    @staticmethod
+    def _context_from_legacy(event: HookEvent, context: dict[str, Any]) -> HookContext:
+        """Convert the old env-var context without passing unknown kwargs."""
+        field_names = {field.name for field in fields(HookContext)}
+        tuple_fields = {"messages", "tool_input", "tool_log", "metadata"}
+        known: dict[str, Any] = {}
+        metadata_value = context.get("metadata")
+        if isinstance(metadata_value, dict):
+            metadata = list(metadata_value.items())
+        elif isinstance(metadata_value, (list, tuple)):
+            metadata = list(metadata_value)
+        else:
+            metadata = []
+        for key, value in context.items():
+            if key in {"event", "metadata"}:
+                continue
+            if key not in field_names:
+                continue
+            if key in tuple_fields:
+                if isinstance(value, (list, tuple)):
+                    known[key] = tuple(value)
+            elif isinstance(value, str):
+                known[key] = value
+        metadata.extend(
+            (key, value)
+            for key, value in context.items()
+            if key not in known and key not in {"event", "metadata"}
+        )
+        return HookContext(event=event.value, metadata=tuple(metadata), **known)
+
+    def _record_result(self, event: HookEvent, result: dict) -> None:
+        # Diagnostics should stay bounded and must not retain transformed
+        # prompts, messages, tool arguments, or results. Shell-hook stdout may
+        # itself be the JSON transform, so replace it with a marker.
+        output = result.get("output", "")
+        if "transformed_value" in result and not result.get("blocked"):
+            output = "[transform returned]"
+        recorded = {
+            "event": event.value,
+            "name": result.get("name", ""),
+            "success": bool(result.get("success")),
+            "blocked": bool(result.get("blocked")),
+            "output": str(output)[:500],
+            "return_code": result.get("return_code"),
+            "duration": result.get("duration", 0),
+            "type": result.get("type", ""),
+        }
+        self._recent_results.append(recorded)
 
     def describe(self) -> list[dict]:
         """Return a summary of all hooks for display."""
@@ -280,6 +514,8 @@ class HookRunner:
                 "timeout": h.timeout,
                 "type": "python" if h.is_python_hook else "shell",
                 "priority": h.priority,
+                "fail_closed": h.effective_fail_closed,
+                "if": h.tool_filter.raw if h.tool_filter is not None else "",
             }
             for h in self._hooks
         ]
@@ -316,7 +552,7 @@ def load_python_hook(module_path: str) -> Optional[Callable]:
     try:
         if module_path.endswith(".py"):
             # Validate path is under an allowed directory
-            resolved = Path(module_path).resolve()
+            resolved = Path(module_path).expanduser().resolve()
             allowed = _allowed_hook_dirs()
             if not any(
                 resolved == d or resolved.is_relative_to(d)

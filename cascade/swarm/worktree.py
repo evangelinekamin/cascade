@@ -74,6 +74,7 @@ class WorktreeManager:
     def capture_snapshot(self, worktree_path: str) -> WorktreeSnapshot:
         """Collect git status and a clipped diff from the worktree."""
         baseline_ref = self._baseline_refs.get(worktree_path, "HEAD")
+        self._discard_untracked_generated_artifacts(worktree_path, baseline_ref)
         self._git(["add", "-N", "."], cwd=worktree_path, check=False)
         status = self._git(["status", "--short"], cwd=worktree_path, check=False)
         diff_stat = self._git(["diff", "--stat", baseline_ref], cwd=worktree_path, check=False)
@@ -94,6 +95,7 @@ class WorktreeManager:
         passing ones onto a fresh integration worktree.
         """
         baseline_ref = self._baseline_refs.get(worktree_path, "HEAD")
+        self._discard_untracked_generated_artifacts(worktree_path, baseline_ref)
         self._git(["add", "-N", "."], cwd=worktree_path, check=False)
         return self._git(["diff", "--binary", baseline_ref], cwd=worktree_path, check=False)
 
@@ -277,6 +279,68 @@ class WorktreeManager:
             if path:
                 files.append(path)
         return files
+
+    @staticmethod
+    def _is_generated_artifact(path: str) -> bool:
+        """Whether an untracked path is execution debris, never a deliverable."""
+        parsed = Path(path)
+        cache_dirs = {
+            "__pycache__",
+            ".pytest_cache",
+            ".mypy_cache",
+            ".ruff_cache",
+            ".tox",
+            ".nox",
+        }
+        return (
+            any(part in cache_dirs for part in parsed.parts)
+            or parsed.suffix in {".pyc", ".pyo"}
+            or parsed.name in {".coverage", ".DS_Store"}
+        )
+
+    def _discard_untracked_generated_artifacts(
+        self,
+        worktree_path: str,
+        baseline_ref: str,
+    ) -> None:
+        """Remove generated files absent from baseline, including intent-to-add."""
+        baseline_raw = self._git(
+            ["ls-tree", "-r", "--name-only", "-z", baseline_ref],
+            cwd=worktree_path,
+            check=False,
+        )
+        baseline_files = {entry for entry in baseline_raw.split("\0") if entry}
+        status = self._git(
+            ["status", "--short", "--untracked-files=all"],
+            cwd=worktree_path,
+            check=False,
+        )
+        root = Path(worktree_path)
+        parents: set[Path] = set()
+        for relative in self._parse_changed_files(status):
+            if relative in baseline_files or not self._is_generated_artifact(relative):
+                continue
+            target = root / relative
+            try:
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink(missing_ok=True)
+                parents.update(parent for parent in target.parents if parent != root)
+            except OSError:
+                continue
+            # An earlier `git add -N` may have made this path intent-to-add.
+            # Reset just that non-baseline path so it cannot survive in the diff.
+            self._git(
+                ["reset", "-q", baseline_ref, "--", relative],
+                cwd=worktree_path,
+                check=False,
+            )
+        for parent in sorted(parents, key=lambda path: len(path.parts), reverse=True):
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
 
     def _clip_text(self, text: str) -> str:
         if len(text) <= self.diff_excerpt_chars:
